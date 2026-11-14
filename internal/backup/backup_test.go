@@ -88,4 +88,18 @@ func TestExportPreviewRestore(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dstData, "User", "config.yml")); err == nil {
 		t.Fatal("unrequested section should not be restored")
 	}
+
+	// An empty region is a valid target: the package may carry no Work files,
+	// and the restore must still create Work instead of failing on a missing
+	// staging folder.
+	emptyPkg, err := Export(ExportOptions{Sections: []string{"work"}, Password: "correct horse", App: "test"})
+	if err != nil {
+		t.Fatalf("export empty work: %v", err)
+	}
+	if _, err := Apply(emptyPkg.Path, "correct horse", []string{"work"}); err != nil {
+		t.Fatalf("apply empty work: %v", err)
+	}
+	if st, err := os.Stat(filepath.Join(dstData, "Work")); err != nil || !st.IsDir() {
+		t.Fatalf("empty Work not restored: %v", err)
+	}
 }

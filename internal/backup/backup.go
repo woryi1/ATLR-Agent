@@ -546,23 +546,39 @@ func Apply(pkgPath, password string, wanted []string) (ApplyResult, error) {
 		sec, _ := SectionByID(id)
 		live := filepath.Join(dataDir, sec.Region)
 		staged := live + ".restore-tmp"
+		old := live + ".restore-old"
 		if err := os.RemoveAll(staged); err != nil {
 			return ApplyResult{}, err
 		}
+		if err := os.RemoveAll(old); err != nil {
+			return ApplyResult{}, err
+		}
+		// extractRegion always creates the destination, even when the package
+		// carries no files for this region (an empty Work folder is a valid
+		// restore target).
 		n, err := extractRegion(zipPath, sec.Region, staged)
 		if err != nil {
 			_ = os.RemoveAll(staged)
 			return ApplyResult{}, fmt.Errorf("backup: 写入 %s 失败：%w", sec.Label, err)
 		}
-		// Extraction succeeded: replace the live folder in one step.
-		if err := os.RemoveAll(live); err != nil {
-			_ = os.RemoveAll(staged)
-			return ApplyResult{}, fmt.Errorf("backup: 清除旧 %s 失败：%w", sec.Label, err)
+		// Move the live folder aside instead of deleting it, so a failed swap
+		// can put it back without any data loss.
+		hadLive := false
+		if _, statErr := os.Stat(live); statErr == nil {
+			if err := os.Rename(live, old); err != nil {
+				_ = os.RemoveAll(staged)
+				return ApplyResult{}, fmt.Errorf("backup: 暂存旧 %s 失败：%w", sec.Label, err)
+			}
+			hadLive = true
 		}
 		if err := os.Rename(staged, live); err != nil {
+			if hadLive {
+				_ = os.Rename(old, live)
+			}
 			_ = os.RemoveAll(staged)
 			return ApplyResult{}, fmt.Errorf("backup: 替换 %s 失败：%w", sec.Label, err)
 		}
+		_ = os.RemoveAll(old)
 		files += n
 	}
 	return ApplyResult{Sections: sections, Files: files}, nil
@@ -576,6 +592,11 @@ func extractRegion(zipPath, region, dst string) (int, error) {
 		return 0, err
 	}
 	defer zr.Close()
+	// Create the destination up front: a region with zero entries in the package
+	// still restores as an (empty) folder, which is what makes the swap work.
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return 0, err
+	}
 	prefix := region + "/"
 	files := 0
 	for _, e := range zr.File {
