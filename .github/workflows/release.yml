@@ -1,14 +1,10 @@
 name: Release
 
-# Cut a release by pushing a SemVer tag:
-#   git tag v0.5.0 && git push origin v0.5.0
-# goreleaser then builds every target and publishes the GitHub Release. It runs
-# on a macOS runner because the darwin target needs CGO for the computer-use
-# substrate — see the header of .goreleaser.yaml.
+# Cut a release manually from the Actions tab. This fork publishes its Windows
+# builds locally (portable single exe + installer-less zip), so tag pushes no
+# longer start goreleaser: the upstream multi-platform matrix does not apply.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write # required to create the GitHub Release + upload assets

@@ -392,7 +392,7 @@ func (s *Service) favMediasByIDs(ctx context.Context, fid int64) ([]favMedia, er
 				Cover:    v.Data.Pic,
 				Duration: v.Data.Duration,
 				Type:     2,
-				Upper:    struct {
+				Upper: struct {
 					Name string `json:"name"`
 				}{Name: v.Data.Owner.Name},
 			}

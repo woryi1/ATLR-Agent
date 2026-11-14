@@ -12,21 +12,6 @@ name: Desktop
 # excluded from ./...), so the CLI's CGO-free, cross-platform matrix stays
 # green independent of Wails.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'cmd/octo-desktop/**'
-      - 'internal/server/**'
-      # The app embeds the web UI built from web/ (webdist is gitignored).
-      - 'web/**'
-      # Root-module dep bumps flow into the nested desktop module via its
-      # replace directive, so they must build-verify the desktop app too.
-      - 'go.mod'
-      - 'go.sum'
-      - 'scripts/package-desktop-macos.sh'
-      - 'scripts/package-desktop-linux.sh'
-      - 'scripts/embed-rg-windows.ps1'
-      - '.github/workflows/desktop.yml'
   pull_request:
     paths:
       - 'cmd/octo-desktop/**'

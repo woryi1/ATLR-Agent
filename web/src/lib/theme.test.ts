@@ -38,7 +38,7 @@ beforeEach(async () => {
   vi.mocked(getThemeSelection).mockReset()
   vi.mocked(getThemeSelection).mockResolvedValue({})
   vi.mocked(saveThemeSelection).mockReset()
-  vi.mocked(saveThemeSelection).mockResolvedValue({})
+  vi.mocked(saveThemeSelection).mockResolvedValue(undefined)
   await loadUserPacks()
   for (const el of document.querySelectorAll('link[data-octo-theme]')) el.remove()
 })
