@@ -49,6 +49,27 @@ type Track struct {
 	Duration int    `json:"duration"`
 }
 
+// favMedia is one entry of a favourite folder, as both the listing endpoint and
+// the id-fallback produce it.
+type favMedia struct {
+	BVID     string `json:"bvid"`
+	Title    string `json:"title"`
+	Cover    string `json:"cover"`
+	Duration int    `json:"duration"`
+	Type     int    `json:"type"`
+	Upper    struct {
+		Name string `json:"name"`
+	} `json:"upper"`
+}
+
+type favPage struct {
+	Code int `json:"code"`
+	Data struct {
+		Medias  []favMedia `json:"medias"`
+		HasMore bool       `json:"has_more"`
+	} `json:"data"`
+}
+
 type cachedURL struct {
 	url string
 	at  time.Time
@@ -244,24 +265,31 @@ func (s *Service) fetchRemote(ctx context.Context) ([]Track, bool, error) {
 	seen := map[string]bool{}
 	seenTitle := map[string]bool{}
 	complete := true
+	addMedia := func(m favMedia) {
+		if m.Type != 2 || m.BVID == "" || seen[m.BVID] {
+			return
+		}
+		// The two favourites overlap in practice (same upload re-faved):
+		// collapse identical titles as well, normalised for case/space.
+		key := strings.ToLower(strings.Join(strings.Fields(m.Title), " "))
+		if key != "" && seenTitle[key] {
+			return
+		}
+		seen[m.BVID] = true
+		if key != "" {
+			seenTitle[key] = true
+		}
+		tracks = append(tracks, Track{
+			BVID:     m.BVID,
+			Title:    m.Title,
+			Artist:   m.Upper.Name,
+			Cover:    m.Cover,
+			Duration: m.Duration,
+		})
+	}
 	for _, fid := range FavLists {
 		for pn := 1; pn <= 100; pn++ {
-			var page struct {
-				Code int `json:"code"`
-				Data struct {
-					Medias []struct {
-						BVID     string `json:"bvid"`
-						Title    string `json:"title"`
-						Cover    string `json:"cover"`
-						Duration int    `json:"duration"`
-						Type     int    `json:"type"`
-						Upper    struct {
-							Name string `json:"name"`
-						} `json:"upper"`
-					} `json:"medias"`
-					HasMore bool `json:"has_more"`
-				} `json:"data"`
-			}
+			var page favPage
 			// The full parameter set matters: PiliPlus sends keyword/type/tid as
 			// well, and the WAF rejects the shortened form it sees as scraped.
 			u := fmt.Sprintf("%s/x/v3/fav/resource/list?media_id=%d&pn=%d&ps=20&keyword=&order=mtime&type=0&tid=0&platform=web", apiBase, fid, pn)
@@ -275,39 +303,26 @@ func (s *Service) fetchRemote(ctx context.Context) ([]Track, bool, error) {
 				s.refreshCookie(ctx)
 				time.Sleep(time.Duration(2*(attempt+1)*(attempt+1)) * time.Second)
 			}
+			if err == nil && page.Code != 0 {
+				err = fmt.Errorf("favlist %d: code %d", fid, page.Code)
+			}
 			if err != nil {
+				// The ordered listing endpoint is the one the WAF refuses first
+				// (412), while the id list still answers. Rebuild the whole
+				// folder from ids + per-video info instead of showing 0 songs.
+				if medias, ferr := s.favMediasByIDs(ctx, fid); ferr == nil && len(medias) > 0 {
+					for _, m := range medias {
+						addMedia(m)
+					}
+					break
+				}
 				if len(tracks) > 0 {
 					return tracks, false, nil
 				}
 				return nil, false, err
 			}
-			if page.Code != 0 {
-				if len(tracks) > 0 {
-					return tracks, false, nil
-				}
-				return nil, false, fmt.Errorf("favlist %d: code %d", fid, page.Code)
-			}
 			for _, m := range page.Data.Medias {
-				if m.Type != 2 || m.BVID == "" || seen[m.BVID] {
-					continue
-				}
-				// The two favourites overlap in practice (same upload re-faved):
-				// collapse identical titles as well, normalised for case/space.
-				key := strings.ToLower(strings.Join(strings.Fields(m.Title), " "))
-				if key != "" && seenTitle[key] {
-					continue
-				}
-				seen[m.BVID] = true
-				if key != "" {
-					seenTitle[key] = true
-				}
-				tracks = append(tracks, Track{
-					BVID:     m.BVID,
-					Title:    m.Title,
-					Artist:   m.Upper.Name,
-					Cover:    m.Cover,
-					Duration: m.Duration,
-				})
+				addMedia(m)
 			}
 			if !page.Data.HasMore {
 				break
@@ -317,6 +332,80 @@ func (s *Service) fetchRemote(ctx context.Context) ([]Track, bool, error) {
 		}
 	}
 	return tracks, complete, nil
+}
+
+// favMediasByIDs is the fallback for a blocked listing endpoint:
+// fav/resource/ids returns every aid (it keeps working while the ordered list
+// answers 412), then one web-interface/view per video fills in bvid, title,
+// cover and duration. Four workers with a 200 ms pace keep us well under the
+// rate that triggers the WAF; ~1200 songs take about a minute.
+func (s *Service) favMediasByIDs(ctx context.Context, fid int64) ([]favMedia, error) {
+	var ids struct {
+		Code int `json:"code"`
+		Data []struct {
+			ID   int64 `json:"id"`
+			Type int   `json:"type"`
+		} `json:"data"`
+	}
+	u := fmt.Sprintf("%s/x/v3/fav/resource/ids?media_id=%d", apiBase, fid)
+	if err := s.getJSON(ctx, u, &ids); err != nil {
+		return nil, err
+	}
+	if ids.Code != 0 {
+		return nil, fmt.Errorf("favlist ids %d: code %d", fid, ids.Code)
+	}
+	out := make([]favMedia, len(ids.Data))
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for i, item := range ids.Data {
+		if item.Type != 2 || item.ID == 0 {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, aid int64) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
+			var v struct {
+				Code int `json:"code"`
+				Data struct {
+					BVID     string `json:"bvid"`
+					Title    string `json:"title"`
+					Pic      string `json:"pic"`
+					Duration int    `json:"duration"`
+					Owner    struct {
+						Name string `json:"name"`
+					} `json:"owner"`
+				} `json:"data"`
+			}
+			if err := s.getJSON(ctx, fmt.Sprintf("%s/x/web-interface/view?aid=%d", apiBase, aid), &v); err != nil || v.Code != 0 {
+				return
+			}
+			out[i] = favMedia{
+				BVID:     v.Data.BVID,
+				Title:    v.Data.Title,
+				Cover:    v.Data.Pic,
+				Duration: v.Data.Duration,
+				Type:     2,
+				Upper:    struct {
+					Name string `json:"name"`
+				}{Name: v.Data.Owner.Name},
+			}
+		}(i, item.ID)
+	}
+	wg.Wait()
+	medias := out[:0]
+	for _, m := range out {
+		if m.BVID != "" {
+			medias = append(medias, m)
+		}
+	}
+	return medias, nil
 }
 
 // RefreshAsync re-pages the favourites in the background and swaps the result in
@@ -336,7 +425,9 @@ func (s *Service) RefreshAsync() {
 			s.refreshing = false
 			s.mu.Unlock()
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		// The id fallback fetches per-video info (~1,200 songs at 4 workers),
+		// so a cold rebuild needs minutes rather than seconds.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 		s.ensureCookie(ctx)
 		tracks, complete, err := s.fetchRemote(ctx)

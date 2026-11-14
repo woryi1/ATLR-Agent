@@ -505,17 +505,16 @@ func decryptFile(pkgPath, password string) (string, error) {
 	return tmpPath, nil
 }
 
-// ApplyResult reports what was restored and where the pre-restore safety copy
-// went.
+// ApplyResult reports what was restored.
 type ApplyResult struct {
-	Sections  []string `json:"sections"`
-	Files     int      `json:"files"`
-	BackupDir string   `json:"backup_dir"`
+	Sections []string `json:"sections"`
+	Files    int      `json:"files"`
 }
 
-// Apply restores the selected sections from a package. Existing region folders
-// are moved (not deleted) into a timestamped folder under Cache first, so an
-// aborted or unwanted restore can be undone by hand.
+// Apply restores the selected sections. Import is destructive by design: the
+// live folder is replaced with the package contents and the old one is deleted.
+// The new tree is extracted beside the live one first, so a failed extraction
+// still leaves the user's data untouched.
 func Apply(pkgPath, password string, wanted []string) (ApplyResult, error) {
 	sum, zipPath, err := ReadPreview(pkgPath, password)
 	if err != nil {
@@ -541,38 +540,32 @@ func Apply(pkgPath, password string, wanted []string) (ApplyResult, error) {
 	if err != nil {
 		return ApplyResult{}, err
 	}
-	backupDir, err := datahome.RegionPath(datahome.RegionCache, "pre-restore-"+time.Now().Format("20060102-150405"))
-	if err != nil {
-		return ApplyResult{}, err
-	}
-	if err := os.MkdirAll(backupDir, 0o700); err != nil {
-		return ApplyResult{}, err
-	}
 
 	files := 0
 	for _, id := range sections {
 		sec, _ := SectionByID(id)
 		live := filepath.Join(dataDir, sec.Region)
-		parked := filepath.Join(backupDir, sec.Region)
-		moved := false
-		if _, statErr := os.Stat(live); statErr == nil {
-			if err := os.Rename(live, parked); err != nil {
-				return ApplyResult{}, fmt.Errorf("backup: 备份现有 %s 失败：%w", sec.Label, err)
-			}
-			moved = true
-		}
-		n, err := extractRegion(zipPath, sec.Region, live)
-		if err != nil {
-			// Put the user's own data back; the package extraction is discarded.
-			_ = os.RemoveAll(live)
-			if moved {
-				_ = os.Rename(parked, live)
-			}
+		staged := live + ".restore-tmp"
+		if err := os.RemoveAll(staged); err != nil {
 			return ApplyResult{}, err
+		}
+		n, err := extractRegion(zipPath, sec.Region, staged)
+		if err != nil {
+			_ = os.RemoveAll(staged)
+			return ApplyResult{}, fmt.Errorf("backup: 写入 %s 失败：%w", sec.Label, err)
+		}
+		// Extraction succeeded: replace the live folder in one step.
+		if err := os.RemoveAll(live); err != nil {
+			_ = os.RemoveAll(staged)
+			return ApplyResult{}, fmt.Errorf("backup: 清除旧 %s 失败：%w", sec.Label, err)
+		}
+		if err := os.Rename(staged, live); err != nil {
+			_ = os.RemoveAll(staged)
+			return ApplyResult{}, fmt.Errorf("backup: 替换 %s 失败：%w", sec.Label, err)
 		}
 		files += n
 	}
-	return ApplyResult{Sections: sections, Files: files, BackupDir: backupDir}, nil
+	return ApplyResult{Sections: sections, Files: files}, nil
 }
 
 // extractRegion writes every entry under region/ into dst, refusing anything

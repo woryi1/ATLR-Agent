@@ -387,6 +387,16 @@ func main() {
 		// Prompt for notification permission (macOS blocks until answered, so
 		// off the UI thread) — without it every toast silently no-ops.
 		go bridge.requestNotificationAuthorization()
+		// The server is in-process: a restart means "start this exe again".
+		// relaunchSelf() already starts a copy that waits for this pid to exit.
+		server.SetRestartHook(func() {
+			if err := relaunchSelf(); err != nil {
+				bridge.showError(L().errTitle, err.Error())
+				return
+			}
+			bridge.allowQuit.Store(true)
+			app.Quit()
+		})
 		startHub(app, bridge, settings)
 	})
 

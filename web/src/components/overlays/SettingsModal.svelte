@@ -21,7 +21,7 @@
   import { ago, clockTick } from '../../lib/relTime'
   import * as api from '../../lib/api'
   import {
-    backupSections, exportBackup, previewBackup, applyBackup, openBackupFolder,
+    backupSections, exportBackup, previewBackup, applyBackup, openBackupFolder, restartApp,
     isBackupFile, formatBytes,
     type BackupSection, type BackupSummary, type ExportResult, type ApplyResult,
   } from '../../lib/backup'
@@ -202,16 +202,46 @@
     if (!importFile || !importSummary) return
     const ids = Object.keys(importSel).filter(id => importSel[id])
     if (ids.length === 0) { showToast('至少选择一项要恢复的数据', 'error'); return }
-    if (!(await confirmDialog('导入会覆盖所选数据；现有数据会先备份到 Cache\\pre-restore-*。继续吗？'))) return
+    const personal = ids.some(id => id !== 'work')
+    const warning = personal
+      ? '⚠️ 你正在导入个人数据（设置 / 会话 / 技能）。这会直接替换并删除现有的重要数据，且不会生成任何备份，无法恢复。\n\n确定继续吗？'
+      : '将用备份包替换当前的 Work 工作目录，现有文件会被删除。确定继续吗？'
+    if (!(await confirmDialog(warning))) return
     importBusy = true
     try {
       importDone = await applyBackup(importFile, importPwd, ids)
-      showToast('数据已恢复，请重启程序生效', 'success')
+      showToast('数据已恢复，3 秒后自动重启', 'success')
+      scheduleRestart()
     } catch (e: any) {
       showToast(e?.message || '恢复失败', 'error')
     } finally {
       importBusy = false
     }
+  }
+
+  // ── 导入后自动重启 ──────────────────────────────────────────────────────
+  let restartCountdown = $state(0)
+  let restartTimer: ReturnType<typeof setTimeout> | null = null
+
+  function scheduleRestart(): void {
+    cancelRestart()
+    restartCountdown = 3
+    const tick = () => {
+      restartCountdown -= 1
+      if (restartCountdown <= 0) {
+        restartTimer = null
+        void restartApp()
+        return
+      }
+      restartTimer = setTimeout(tick, 1000)
+    }
+    restartTimer = setTimeout(tick, 1000)
+  }
+
+  function cancelRestart(): void {
+    if (restartTimer) clearTimeout(restartTimer)
+    restartTimer = null
+    restartCountdown = 0
   }
 
   function onBackupDrop(e: DragEvent): void {
@@ -995,7 +1025,7 @@
                             </label>
                           {/each}
                         </div>
-                        <p class="backup-note">导入会覆盖所选数据；现有内容会先移到 Cache\pre-restore-时间。完成后需要重启程序。</p>
+                        <p class="backup-note">导入会直接替换并删除所选数据，不生成备份，无法恢复。完成后应用会自动重启。</p>
                         <div class="backup-actions">
                           <button class="link-btn" disabled={importBusy} onclick={runImport}>
                             {importBusy ? '正在恢复…' : '开始恢复'}
@@ -1005,10 +1035,16 @@
                     {/if}
                     {#if importDone}
                       <div class="backup-result">
-                        <div>已恢复：{importDone.sections.map(sectionLabel).join('、')}</div>
-                        <div class="backup-dim">{importDone.files} 个文件</div>
-                        <div class="backup-dim backup-path">旧数据已备份到：{importDone.backup_dir}</div>
-                        <button class="link-btn" onclick={() => void openBackupFolder(importDone?.backup_dir)}>打开备份目录</button>
+                        <div>已恢复：{importDone.sections.map(sectionLabel).join('、')}（{importDone.files} 个文件）</div>
+                        {#if restartCountdown > 0}
+                          <div class="backup-restart">
+                            <span>{restartCountdown} 秒后自动重启…</span>
+                            <button class="link-btn" onclick={cancelRestart}>取消</button>
+                          </div>
+                        {:else}
+                          <div class="backup-dim">需要重启应用后才会生效。</div>
+                          <button class="link-btn" onclick={() => void restartApp()}>立即重启</button>
+                        {/if}
                       </div>
                     {/if}
                   {/if}
@@ -1158,6 +1194,7 @@
   border: 1px solid var(--border-secondary); border-radius: 10px; font-size: 12.5px;
 }
 .backup-dim { font-size: 11.5px; color: var(--text-tertiary); }
+.backup-restart { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--text); }
 .backup-path { word-break: break-all; }
 .backup-error { font-size: 12px; color: #d4380d; }
 .backup-drop {

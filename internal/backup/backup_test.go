@@ -63,8 +63,7 @@ func TestExportPreviewRestore(t *testing.T) {
 		t.Fatalf("summary = %+v", sum)
 	}
 
-	// Restore into a second data root: the old records folder must be parked,
-	// not silently merged.
+	// Restore into a second data root: import replaces the folder outright.
 	dst := t.TempDir()
 	t.Setenv(datahome.PortableRootEnv, dst)
 	dstData, err := datahome.Dir()
@@ -83,10 +82,7 @@ func TestExportPreviewRestore(t *testing.T) {
 		t.Fatalf("restored file missing: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dstData, "Records", "old.jsonl")); err == nil {
-		t.Fatal("old file should have been moved out of the live region")
-	}
-	if _, err := os.Stat(filepath.Join(res2.BackupDir, "Records", "old.jsonl")); err != nil {
-		t.Fatalf("old data not parked: %v", err)
+		t.Fatal("old file should have been deleted by the replace")
 	}
 	// Sections that were not requested stay untouched.
 	if _, err := os.Stat(filepath.Join(dstData, "User", "config.yml")); err == nil {

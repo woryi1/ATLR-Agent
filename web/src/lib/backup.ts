@@ -32,7 +32,6 @@ export interface BackupSummary {
 export interface ApplyResult {
   sections: string[]
   files: number
-  backup_dir: string
 }
 
 async function jsonOrThrow<T>(res: Response): Promise<T> {
@@ -83,6 +82,13 @@ export async function openBackupFolder(dir?: string): Promise<void> {
   const q = dir ? `?dir=${encodeURIComponent(dir)}` : ''
   const res = await fetch(`/api/data/backup/open${q}`, { method: 'POST' })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
+}
+
+/** Ask the desktop shell to relaunch the app (the server runs in-process). */
+export async function restartApp(): Promise<void> {
+  try {
+    await fetch('/api/app/restart', { method: 'POST' })
+  } catch { /* the process may already be gone */ }
 }
 
 /** True when the dropped file looks like one of our packages. */

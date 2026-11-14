@@ -151,7 +151,9 @@
         biliQrKey = ''
         await refreshBiliMe()
         // Login raises the quality ceiling and unblocks the favourites call:
-        // refetch now instead of making the user restart the app.
+        // refetch now instead of making the user restart the app. A cold
+        // rebuild pages ~1,200 videos, so tell them it is happening.
+        showToast('正在刷新曲库…')
         await forceRefreshPlaylist()
       } else if (status === 'expired') {
         clearInterval(id)
@@ -1311,7 +1313,7 @@
                 aria-label="搜索歌曲"
               />
             {:else}
-              <span>曲库 · {$musicTracks.length} 首</span>
+              <span>{$musicTracks.length === 0 ? '曲库加载中…' : `曲库 · ${$musicTracks.length} 首`}</span>
             {/if}
             <button
               class="mp-lib-search-btn"

@@ -1013,6 +1013,7 @@ func (s *Server) registerRoutes() {
 	s.api("POST /api/data/backup/preview", s.handleBackupPreview)
 	s.api("POST /api/data/backup/apply", s.handleBackupApply)
 	s.api("POST /api/data/backup/open", s.handleBackupOpen)
+	s.api("POST /api/app/restart", s.handleAppRestart)
 	s.api("PUT /api/config/reasoning_effort", s.handlePutReasoningEffort)
 	s.api("PUT /api/config/permission_mode", s.handlePutPermissionMode)
 	s.api("POST /api/config/test", s.handleTestConfig)
