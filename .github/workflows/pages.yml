@@ -1,0 +1,95 @@
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'landing/**'
+      - 'docs/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+# Least-privilege default; the deploy job elevates only what actions/deploy-pages needs.
+permissions:
+  contents: read
+
+# One deployment in flight at a time — Pages deploys aren't safe to run concurrently.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: Install docs dependencies
+        working-directory: docs
+        run: npm ci
+
+      - name: Build docs site
+        working-directory: docs
+        run: npm run build
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          # Root: copy all landing files so new files like robots.txt, OG images,
+          # and Google Search Console verification files are deployed automatically.
+          cp -a landing/. _site/
+          # /docs/*: the generated Starlight site (astro.config.mjs sets base: "/docs").
+          mkdir -p _site/docs
+          cp -r docs/dist/. _site/docs/
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      # Dual-deploy to Cloudflare Pages: Cloudflare's edge is reachable from
+      # networks where GitHub Pages is blocked (notably mainland China), and
+      # will take over octo-agent.dev via the project's custom domain. The
+      # GitHub Pages deploy stays as-is. Skipped quietly when the API token
+      # secret isn't configured (e.g. on forks).
+      - name: Check Cloudflare credentials
+        id: cf
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -n "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "CLOUDFLARE_API_TOKEN not set; skipping Cloudflare Pages deploy"
+          fi
+
+      - name: Deploy to Cloudflare Pages
+        if: steps.cf.outputs.enabled == 'true'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy _site --project-name=octo-agent --branch=main
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

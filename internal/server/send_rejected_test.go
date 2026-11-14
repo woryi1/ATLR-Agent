@@ -1,0 +1,587 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+)
+
+// TestHandleWSUserMessage_BoundToOtherLeaseActiveEmitsSendRejected guards the
+// web UI's optimistic-send rollback: when the session is bound to another entry
+// and that entry still holds an active turn lease, the message is rejected
+// outright because a force takeover would not be safe.
+func TestHandleWSUserMessage_BoundToOtherLeaseActiveEmitsSendRejected(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.initWS()
+	srv.turnRunning = make(map[string]bool)
+	srv.steerQueues = make(map[string][]queuedTurn)
+	srv.sessionAgents = make(map[string]*agent.Agent)
+
+	sess := agent.NewSession("stub-model", "")
+	if _, _, err := sess.Bind(agent.EntryTUI, false); err != nil {
+		t.Fatalf("bind to TUI: %v", err)
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	// With an active turn lease the binding is not recoverable, so the server
+	// must reject the message outright rather than offering a force takeover.
+	if err := sess.WriteLease(agent.EntryTUI, time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("write lease: %v", err)
+	}
+
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 256),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+	srv.wsHub.subscribe(conn, sess.ID)
+
+	srv.handleWSUserMessage(conn, &wsMsgUserMessage{
+		SessionID: sess.ID,
+		Content:   json.RawMessage(`"hello from web"`),
+	})
+
+	var rejected bool
+	deadline := time.After(2 * time.Second)
+drain:
+	for {
+		select {
+		case b := <-conn.send:
+			var ev map[string]any
+			if err := json.Unmarshal(b, &ev); err != nil {
+				continue
+			}
+			if typ, _ := ev["type"].(string); typ == "send_rejected" {
+				rejected = true
+				if sid, _ := ev["session_id"].(string); sid != sess.ID {
+					t.Errorf("send_rejected session_id = %q, want %q", sid, sess.ID)
+				}
+				break drain
+			}
+		case <-deadline:
+			break drain
+		}
+	}
+	if !rejected {
+		t.Fatal("expected send_rejected event when session is bound to another entry with active lease")
+	}
+}
+
+// TestHandleWSUserMessage_OtherEntryNoLeaseEmitsBindRequired: when the session
+// is bound to another entry but no turn lease is active, the server asks the
+// browser to confirm a force takeover instead of dropping the message.
+func TestHandleWSUserMessage_OtherEntryNoLeaseEmitsBindRequired(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.initWS()
+	srv.turnRunning = make(map[string]bool)
+	srv.steerQueues = make(map[string][]queuedTurn)
+	srv.sessionAgents = make(map[string]*agent.Agent)
+
+	sess := agent.NewSession("stub-model", "")
+	if _, _, err := sess.Bind(agent.EntryTUI, false); err != nil {
+		t.Fatalf("bind to TUI: %v", err)
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 256),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+	srv.wsHub.subscribe(conn, sess.ID)
+
+	srv.handleWSUserMessage(conn, &wsMsgUserMessage{
+		SessionID: sess.ID,
+		Content:   json.RawMessage(`"hello from web"`),
+	})
+
+	var required bool
+	deadline := time.After(2 * time.Second)
+drain:
+	for {
+		select {
+		case b := <-conn.send:
+			var ev map[string]any
+			if err := json.Unmarshal(b, &ev); err != nil {
+				continue
+			}
+			typ, _ := ev["type"].(string)
+			if typ == "bind_required" {
+				required = true
+				if sid, _ := ev["session_id"].(string); sid != sess.ID {
+					t.Errorf("bind_required session_id = %q, want %q", sid, sess.ID)
+				}
+				break drain
+			}
+			if typ == "send_rejected" {
+				t.Fatalf("expected bind_required, got send_rejected: %v", ev["message"])
+			}
+		case <-deadline:
+			break drain
+		}
+	}
+	if !required {
+		t.Fatal("expected bind_required event when session is bound to another entry without active lease")
+	}
+}
+
+// holdSender holds the turn open until the test closes the block channel.
+// Used when we need to inspect mid-turn persisted state before release.
+type holdSender struct {
+	block   <-chan struct{}
+	started chan<- struct{}
+	once    sync.Once
+}
+
+func (s *holdSender) SendMessages(_ context.Context, _, _ string, _ []agent.Message, _ int) (agent.Reply, error) {
+	s.once.Do(func() { close(s.started) })
+	<-s.block
+	return agent.Reply{Content: "stub reply"}, nil
+}
+
+func (s *holdSender) StreamMessages(_ context.Context, _, _ string, _ []agent.Message, _ int, onChunk func(string), _ func(string)) (agent.Reply, error) {
+	s.once.Do(func() { close(s.started) })
+	<-s.block
+	if onChunk != nil {
+		onChunk("stub reply")
+	}
+	return agent.Reply{Content: "stub reply"}, nil
+}
+
+func (s *holdSender) SendMessagesWithTools(_ context.Context, _, _ string, _ []agent.Message, _ int, _ []agent.ToolDefinition) (agent.Reply, error) {
+	s.once.Do(func() { close(s.started) })
+	<-s.block
+	return agent.Reply{Content: "stub reply"}, nil
+}
+
+func (s *holdSender) StreamMessagesWithTools(_ context.Context, _, _ string, _ []agent.Message, _ int, _ []agent.ToolDefinition, onChunk func(string), _ agent.ToolInputDeltaFunc, _ agent.ThinkingDeltaFunc) (agent.Reply, error) {
+	s.once.Do(func() { close(s.started) })
+	<-s.block
+	if onChunk != nil {
+		onChunk("stub reply")
+	}
+	return agent.Reply{Content: "stub reply"}, nil
+}
+
+// TestHandleWSUserMessage_ForceTakesOverStaleBinding: force=true lets the web
+// UI take over a session bound to another entry when no turn lease is active.
+func TestHandleWSUserMessage_ForceTakesOverStaleBinding(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.initWS()
+	srv.turnRunning = make(map[string]bool)
+	srv.steerQueues = make(map[string][]queuedTurn)
+	srv.sessionAgents = make(map[string]*agent.Agent)
+
+	sess := agent.NewSession("stub-model", "")
+	if _, _, err := sess.Bind(agent.EntryTUI, false); err != nil {
+		t.Fatalf("bind to TUI: %v", err)
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 256),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+	srv.wsHub.subscribe(conn, sess.ID)
+
+	// Hold the turn open so we can inspect the persisted binding before the
+	// turn goroutine finishes and releases it.
+	block := make(chan struct{})
+	started := make(chan struct{})
+	srv.sender = &holdSender{block: block, started: started}
+
+	srv.handleWSUserMessage(conn, &wsMsgUserMessage{
+		SessionID: sess.ID,
+		Content:   json.RawMessage(`"hello from web"`),
+		Force:     true,
+	})
+
+	// Wait until the turn goroutine has reached the sender; only then is it
+	// guaranteed to still be holding the binding. Without this synchronization
+	// the goroutine can finish and release the binding before we reload the
+	// session, making the assertion flaky.
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn never reached sender")
+	}
+
+	// The binding is acquired synchronously before the turn goroutine starts;
+	// verify it persisted to disk before the turn completes and releases it.
+	fresh, err := agent.LoadSession(sess.ID)
+	if err != nil {
+		t.Fatalf("reload session: %v", err)
+	}
+	if !fresh.BoundTo(agent.EntryWeb) {
+		t.Fatalf("expected session to be bound to web after force takeover, got %q", fresh.BoundEntry)
+	}
+
+	// Now let the turn finish and wait for its completion broadcast.
+	close(block)
+
+	var sawComplete bool
+	drain := time.After(3 * time.Second)
+drainLoop:
+	for {
+		select {
+		case b := <-conn.send:
+			var ev map[string]any
+			if err := json.Unmarshal(b, &ev); err != nil {
+				continue
+			}
+			typ, _ := ev["type"].(string)
+			if typ == "complete" {
+				sawComplete = true
+				break drainLoop
+			}
+			if typ == "send_rejected" {
+				t.Fatalf("expected takeover success, got send_rejected: %v", ev["message"])
+			}
+			if typ == "bind_required" {
+				t.Fatalf("expected takeover success, got bind_required: %v", ev["message"])
+			}
+		case <-drain:
+			break drainLoop
+		}
+	}
+	if !sawComplete {
+		t.Fatal("expected turn to complete after force takeover")
+	}
+}
+
+// TestHandleWSUserMessage_ForceTakeoverEmitsSessionTakenOver: a successful
+// force takeover must notify every watcher of the session — including the
+// displaced client — with a structured session_taken_over event carrying the
+// previous owner, so the frontend can localise the notice. The notice is a
+// client-side event only: nothing about it may land in the persisted history.
+func TestHandleWSUserMessage_ForceTakeoverEmitsSessionTakenOver(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.initWS()
+	srv.turnRunning = make(map[string]bool)
+	srv.steerQueues = make(map[string][]queuedTurn)
+	srv.sessionAgents = make(map[string]*agent.Agent)
+
+	sess := agent.NewSession("stub-model", "")
+	if _, _, err := sess.Bind(agent.EntryTUI, false); err != nil {
+		t.Fatalf("bind to TUI: %v", err)
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	// No turn lease: the binding is stale, so the force takeover succeeds.
+
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 256),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+	srv.wsHub.subscribe(conn, sess.ID)
+
+	// Let the turn complete immediately; the takeover event is broadcast
+	// synchronously before the turn goroutine starts.
+	block := make(chan struct{})
+	close(block)
+	started := make(chan struct{})
+	srv.sender = &holdSender{block: block, started: started}
+
+	srv.handleWSUserMessage(conn, &wsMsgUserMessage{
+		SessionID: sess.ID,
+		Content:   json.RawMessage(`"hello from web"`),
+		Force:     true,
+	})
+
+	var got map[string]any
+	var sawComplete bool
+	deadline := time.After(3 * time.Second)
+drain:
+	for {
+		select {
+		case b := <-conn.send:
+			var ev map[string]any
+			if err := json.Unmarshal(b, &ev); err != nil {
+				continue
+			}
+			switch typ, _ := ev["type"].(string); typ {
+			case "session_taken_over":
+				got = ev
+			case "complete":
+				sawComplete = true
+			}
+			if got != nil && sawComplete {
+				break drain
+			}
+		case <-deadline:
+			break drain
+		}
+	}
+	if got == nil {
+		t.Fatal("expected session_taken_over event after a successful force takeover")
+	}
+	if sid, _ := got["session_id"].(string); sid != sess.ID {
+		t.Errorf("session_taken_over session_id = %q, want %q", sid, sess.ID)
+	}
+	if prev, _ := got["previous_entry"].(string); prev != agent.EntryTUI {
+		t.Errorf("session_taken_over previous_entry = %q, want %q", prev, agent.EntryTUI)
+	}
+	if entry, _ := got["entry"].(string); entry != agent.EntryWeb {
+		t.Errorf("session_taken_over entry = %q, want %q", entry, agent.EntryWeb)
+	}
+	if !sawComplete {
+		t.Fatal("expected the turn to still complete: the takeover notice must not block it")
+	}
+
+	// The "complete" broadcast does not mean the turn goroutine is done writing:
+	// its deferred wind-down (releaseSessionBinding) still rewrites the session
+	// file afterwards, and a concurrent read can catch torn bytes ("invalid
+	// character ... after top-level value" on the Windows CI leg). Wait on the
+	// drain gate — held across the wind-down — before reloading.
+	if !srv.drain.drain(3 * time.Second) {
+		t.Fatal("turn wind-down did not finish")
+	}
+
+	// The notice is informational for connected clients only — the persisted
+	// transcript must not gain any record of it.
+	fresh, err := agent.LoadSession(sess.ID)
+	if err != nil {
+		t.Fatalf("reload session: %v", err)
+	}
+	for _, m := range fresh.Messages {
+		if strings.Contains(m.Content, "taken over") {
+			t.Fatalf("takeover notice leaked into persisted history: %q", m.Content)
+		}
+	}
+}
+
+// TestHandleWSUserMessage_DrainWaitsForBindingRelease: a drain must not report
+// idle while the turn goroutine's deferred wind-down — releaseSessionBinding
+// and the idle-steer kick, both of which write the session file — is still
+// running. A drain that returns early lets a restart, or a test's t.TempDir
+// cleanup on Windows, race those writes ("The directory is not empty"). The
+// binding still being on disk after a clean drain is the observable form of
+// that escape.
+func TestHandleWSUserMessage_DrainWaitsForBindingRelease(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.initWS()
+	srv.turnRunning = make(map[string]bool)
+	srv.steerQueues = make(map[string][]queuedTurn)
+	srv.sessionAgents = make(map[string]*agent.Agent)
+
+	sess := agent.NewSession("stub-model", "")
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 256),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+	srv.wsHub.subscribe(conn, sess.ID)
+
+	block := make(chan struct{})
+	started := make(chan struct{})
+	srv.sender = &holdSender{block: block, started: started}
+
+	srv.handleWSUserMessage(conn, &wsMsgUserMessage{
+		SessionID: sess.ID,
+		Content:   json.RawMessage(`"hello from web"`),
+	})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn never reached sender")
+	}
+
+	// Start the drain while the turn is held open, then release the turn. The
+	// drain may only return once the whole goroutine — including its deferred
+	// session writes — has finished.
+	drained := make(chan bool, 1)
+	go func() { drained <- srv.drain.drain(5 * time.Second) }()
+	close(block)
+
+	select {
+	case ok := <-drained:
+		if !ok {
+			t.Fatal("drain timed out waiting for the turn")
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("drain never returned")
+	}
+
+	fresh, err := agent.LoadSession(sess.ID)
+	if err != nil {
+		t.Fatalf("reload session: %v", err)
+	}
+	if fresh.BoundTo(agent.EntryWeb) {
+		t.Fatal("binding release escaped the drain gate: session still bound to web after a clean drain")
+	}
+}
+
+// TestHandleWSUserMessage_ForceRejectedWhenLeaseActive: force=true still cannot
+// steal a session while another entry holds an active turn lease.
+func TestHandleWSUserMessage_ForceRejectedWhenLeaseActive(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.initWS()
+	srv.turnRunning = make(map[string]bool)
+	srv.steerQueues = make(map[string][]queuedTurn)
+	srv.sessionAgents = make(map[string]*agent.Agent)
+
+	sess := agent.NewSession("stub-model", "")
+	if _, _, err := sess.Bind(agent.EntryTUI, false); err != nil {
+		t.Fatalf("bind to TUI: %v", err)
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := sess.WriteLease(agent.EntryTUI, time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("write lease: %v", err)
+	}
+
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 256),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+	srv.wsHub.subscribe(conn, sess.ID)
+
+	srv.handleWSUserMessage(conn, &wsMsgUserMessage{
+		SessionID: sess.ID,
+		Content:   json.RawMessage(`"hello from web"`),
+		Force:     true,
+	})
+
+	var rejected bool
+	deadline := time.After(2 * time.Second)
+drain:
+	for {
+		select {
+		case b := <-conn.send:
+			var ev map[string]any
+			if err := json.Unmarshal(b, &ev); err != nil {
+				continue
+			}
+			typ, _ := ev["type"].(string)
+			if typ == "send_rejected" {
+				rejected = true
+				break drain
+			}
+			if typ == "bind_required" {
+				t.Fatalf("expected send_rejected due to active lease, got bind_required")
+			}
+			if typ == "complete" {
+				t.Fatalf("expected send_rejected due to active lease, got complete")
+			}
+		case <-deadline:
+			break drain
+		}
+	}
+	if !rejected {
+		t.Fatal("expected send_rejected event when force takeover races an active lease")
+	}
+}
+
+// TestHandleWSUserMessage_AllAttachmentsDroppedEmitsSendRejected: a message
+// with no text whose every attachment is dropped (here an SVG, which
+// NewImageBlock refuses) must be rejected by name — otherwise the client's
+// optimistic bubble waits forever for an echo that never comes. An empty
+// message with no files at all stays a silent no-op.
+func TestHandleWSUserMessage_AllAttachmentsDroppedEmitsSendRejected(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.initWS()
+	srv.turnRunning = make(map[string]bool)
+	srv.steerQueues = make(map[string][]queuedTurn)
+	srv.sessionAgents = make(map[string]*agent.Agent)
+
+	sess := agent.NewSession("stub-model", "")
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 256),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+	srv.wsHub.subscribe(conn, sess.ID)
+
+	srv.handleWSUserMessage(conn, &wsMsgUserMessage{
+		SessionID: sess.ID,
+		Content:   json.RawMessage(`""`),
+	})
+	srv.handleWSUserMessage(conn, &wsMsgUserMessage{
+		SessionID: sess.ID,
+		Content:   json.RawMessage(`""`),
+		Files:     []wsUserFile{{Name: "logo.svg", MimeType: "image/svg+xml", DataURL: "data:image/svg+xml;base64,PHN2Zy8+"}},
+	})
+
+	var rejections []string
+	deadline := time.After(2 * time.Second)
+drain:
+	for {
+		select {
+		case b := <-conn.send:
+			var ev map[string]any
+			if err := json.Unmarshal(b, &ev); err != nil {
+				continue
+			}
+			if typ, _ := ev["type"].(string); typ == "send_rejected" {
+				msg, _ := ev["message"].(string)
+				rejections = append(rejections, msg)
+			}
+		case <-deadline:
+			break drain
+		}
+	}
+	if len(rejections) != 1 {
+		t.Fatalf("send_rejected events = %q, want exactly one (for the dropped attachment)", rejections)
+	}
+	if !strings.Contains(rejections[0], "logo.svg") {
+		t.Errorf("send_rejected message = %q, want it to name logo.svg", rejections[0])
+	}
+}

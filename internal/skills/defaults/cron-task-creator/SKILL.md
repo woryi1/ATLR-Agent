@@ -1,0 +1,227 @@
+---
+name: cron-task-creator
+description: Create, inspect, run, edit, enable/disable, and delete octo's scheduled cron tasks — recurring agent prompts stored in ~/.octo/tasks/*.json and executed by the octo serve scheduler. Use when the user wants to schedule a recurring task, e.g. "run X every morning", "schedule a daily report", "set up a cron job", "定时任务", "每天自动跑".
+---
+
+# Create and manage octo cron tasks
+
+octo runs an agent prompt on a schedule. Each task is a JSON file in
+`~/.octo/tasks/`, loaded by the scheduler inside `octo serve`. When a task
+fires, the scheduler runs one agent turn with the task's prompt in a **fresh
+session** — a run never sees an earlier run's transcript. What's worth keeping
+across runs goes in long-term memory: each task has its own project, and with
+it its own working directory and memory directory, so a note one run saves is
+in the next run's memory block.
+Each run is bounded by a **30-minute wall-clock timeout** (the only hard cap on
+a run).
+
+## Task schema
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `name` | yes | Human-readable task name |
+| `cron` | yes | Schedule expression — see format below |
+| `prompt` | yes | The prompt sent to the agent on each run |
+| `model` | no | Model override; defaults to the server's model |
+| `agent_id` | no | Id of the expert (`/api/agents`) the run executes as; empty = the Default Agent |
+| `directory` | no | Working directory the run executes in |
+| `notify` | no | IM chats to push each run's final reply (or failure) to — see the notify table |
+| `permission_mode` | yes | `auto` (tool calls that would need approval are allowed) or `strict` (they are denied); deny rules apply either way. `interactive` is rejected — a run has nobody to answer an approval |
+| `enabled` | yes | Whether the schedule is active |
+
+`id`, `created_at`, `last_run`, `session_id`, `session_group_id` are
+server-managed — never set them by hand except `id` in the file-write fallback
+below.
+
+Every run creates a **fresh session** (titled by the run's local date and time)
+and files it under a per-task session group named after the task, so a task's
+runs cluster together in the sidebar. The group is created with the task and
+renamed/deleted along with it. Runs never share a session — each starts from a
+clean transcript.
+
+## Cron expression — 6 fields, seconds first
+
+The scheduler uses robfig/cron **with a seconds field**. A standard 5-field
+crontab line is **invalid** — always prepend a seconds field:
+
+```
+seconds minutes hours day-of-month month day-of-week
+```
+
+| Want | Expression |
+|------|------------|
+| Every day at 09:00 | `0 0 9 * * *` |
+| Every hour | `0 0 * * * *` |
+| Weekdays at 18:30 | `0 30 18 * * 1-5` |
+| 1st of each month at 08:00 | `0 0 8 1 * *` |
+
+Descriptors also work: `@hourly`, `@daily`, `@weekly`, `@every 90m`. Times are
+in the server's local timezone.
+
+**Minimum interval is 1 hour.** The scheduler rejects any expression whose
+consecutive fires are closer together than that (e.g. `0 */30 * * * *` or
+`@every 10m`) — the seconds/minutes fields exist for picking a precise time of
+day, not for sub-hourly polling. If the user wants faster iteration, use
+`/loop` in a live session instead of a cron task.
+
+## Workflow
+
+1. **Gather** the schedule, the prompt, and any optional fields. If the schedule
+   is vague ("every morning"), pick a concrete time and confirm.
+   **Always ask for `permission_mode`** — never pick it yourself. Explain it in
+   one line: `auto` lets the run use tools that would normally ask for
+   approval, `strict` refuses them (the run may then fail to finish); deny
+   rules block dangerous commands either way.
+2. **Translate** to a 6-field expression and **echo it back in plain words**
+   ("every weekday at 18:30") before creating anything.
+3. **Write a self-contained prompt.** The task session has no access to this
+   conversation — the prompt must carry all context: what to do, where, and what
+   the output should look like. When a run depends on what earlier runs found
+   ("only report issues I haven't seen"), have the prompt say what to save to
+   memory at the end of each run and to check it at the start.
+4. **Give the prompt an explicit stop condition.** An open-ended prompt makes the
+   model keep re-verifying until the 30-minute timeout instead of finishing.
+   Spell out when the task is done, especially the empty case:
+   - Bad: "Check the repository for any new open issues that need attention."
+   - Good: "List open issues created in the last 24h via one `gh issue list`
+     call. If there are none, reply exactly 'no new issues' and stop. Otherwise
+     summarize each in one line and stop — do not re-check."
+5. **Create**, then **verify** by listing. To smoke-test it, **point the user to
+   the scheduler panel and have them click Run** on the task — do **not** call
+   the run endpoint yourself from this session. A run is a full agent turn (up
+   to 30 minutes) in the task's *own* session; firing it from here just blocks
+   this conversation and the output lands in a session the user isn't watching.
+   The panel runs it where they can see it.
+
+## Editing a task
+
+The Web UI's edit button opens a session with the skill arguments
+`edit <id> "<name>"`. There is no single-task GET — find the task in
+`GET /api/tasks` by `id`.
+
+In that session (or whenever the user is clearly in the Web UI), open with an
+edit form instead of asking what to change. Elsewhere (TUI, IM), list the
+current fields as text and ask.
+
+### The edit form
+
+Read the `genui` skill before emitting it. Reply with a short line and one
+inline `octo-ui` fence — **no panel `id`** — holding, in this order:
+
+| Field | Node | Prefill |
+|---|---|---|
+| `name` | `input` | current `name` |
+| `cron` | `input`, label saying 6 fields, seconds first | current `cron` |
+| — | `text`, `tone: "muted"` | the current schedule in plain words ("every weekday at 18:30") |
+| `prompt` | `textarea`, `rows: 12` | current `prompt` |
+| `model` | `input`, placeholder saying empty = the server's model | current `model` or empty |
+| `directory` | `input` | current `directory` or empty |
+| `enabled` | `switch` | current `enabled` |
+| `note` | `textarea`, `rows: 3` | empty; label along the lines of "Or describe the change and I'll make it" |
+
+followed by a primary `button` with `action: "save_task"` and
+`payload: {"id": "<id>"}`. Label fields in the user's language. `notify`,
+`agent_id` and `permission_mode` stay out of the form — changes to them go
+through `note`.
+
+The renderer silently truncates a prefilled value past its cap — **500**
+characters for an `input`, **5000** for a `textarea` — and whatever it shows
+is what comes back on submit. **Leave a field out of the form when its
+current value is near its cap** (over ~480 / ~4800 characters), and say in a
+`text` node that it can be changed through `note`.
+
+When the `[octo-ui-action]` with `action: "save_task"` comes back:
+
+- Compare each submitted field with the task you fetched and `PATCH` only
+  the ones that changed.
+- **Fields only, no `note`** — the user already made the edit; don't ask
+  again. `PATCH`, then report the changes in one or two lines; a changed
+  `cron` is restated in plain words. A 400 (bad cron, sub-hourly schedule,
+  unknown expert) goes back to the user as-is. Nothing changed → say so and
+  stop.
+- **A `note`** — handle it as in the workflow above, on top of any field
+  changes: a new schedule is translated and echoed back, a rewritten prompt
+  is shown and confirmed before `PATCH`.
+
+## API — one surface, all under `/api/tasks`
+
+Prefer the API whenever `octo serve` is up (default `:8088`): every change
+reschedules the running process immediately. If the Environment section has an
+`Octo server:` line, use that address in place of `127.0.0.1:8088` below.
+
+```bash
+# Create — returns {"id":"task_..."}. Include any optional field (directory,
+# model, agent_id, notify) right here.
+curl -s -X POST http://127.0.0.1:8088/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"daily-report","cron":"0 0 9 * * *","prompt":"Summarize ...","permission_mode":"auto","directory":"/srv/repo"}'
+
+curl -s http://127.0.0.1:8088/api/tasks                      # list
+curl -s -X DELETE http://127.0.0.1:8088/api/tasks/{id}       # delete
+
+# Run now — prefer the scheduler panel's Run button (see the workflow). Only
+# call this when the user explicitly asks to trigger a run from here.
+curl -s -X POST http://127.0.0.1:8088/api/tasks/{id}/run
+
+# Edit any subset of fields — this is also how you enable/disable.
+curl -s -X PATCH http://127.0.0.1:8088/api/tasks/{id} \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"new prompt ...","enabled":false}'
+```
+
+`PATCH /api/tasks/{id}` accepts `name`, `enabled`, `cron`, `prompt`, `model`,
+`agent_id`, `directory`, `notify`, `permission_mode` — send only the fields you
+want to change.
+A changed `cron` is re-validated (syntax and the 1-hour floor) and rejected
+with a 400.
+Renaming via `name` also renames the task's session group. Look up `{id}` from
+the create response or the list. (Earlier builds had a separate
+`/api/cron-tasks/...` route and a `/toggle` endpoint; both are gone — everything
+is `/api/tasks` now.)
+
+### Fallback — direct file write (server not running)
+
+Write `~/.octo/tasks/<id>.json` with `write_file` (`id` format
+`task_<unix-millis>`; filename must equal `<id>.json`):
+
+```json
+{
+  "id": "task_1717999999999",
+  "name": "daily-report",
+  "cron": "0 0 9 * * *",
+  "prompt": "Summarize ...",
+  "directory": "/srv/repo",
+  "permission_mode": "auto",
+  "enabled": true,
+  "created_at": "2026-06-10T09:00:00Z"
+}
+```
+
+The file is picked up the next time `octo serve` starts. A hand-written file
+with a bad cron expression — invalid syntax, or faster than the 1-hour floor —
+fails silently at load (logged to stderr only, task stays listed but never
+fires): double-check the 6-field format and the interval. **File edits to an
+already-running server are ignored until restart** — when the server is up,
+always go through the API.
+
+## Caveats — mention when relevant
+
+- **Tasks only fire while `octo serve` is running.** No serve → no runs. Missed
+  schedules are not replayed on restart.
+- **API changes take effect immediately; hand-edited files don't** (until the
+  next serve start).
+- **A failed IM push is logged on the server and never affects the run.**
+
+## notify — per-platform `chat_id`
+
+`notify` is a list (a single bare object is also accepted); every entry is
+pushed: `[{"platform":"feishu","chat_id":"oc_..."}, ...]`.
+
+| Platform | `chat_id` | Notes |
+|----------|-----------|-------|
+| `feishu` | `oc_…` chat id | Works with app creds in `~/.octo/channels.yml`; get the id from chat settings or the server log after messaging the bot. |
+| `dingtalk` | staff id (1:1) or `cid…` openConversationId (group) | A DM's conversation id does NOT work — use the staff id. Needs "robot message send" permission. |
+| `weixin` | iLink user id | User must have messaged the bot once (refreshes the `context_token` the push reads); a long-stale token may be rejected. |
+| `telegram` | Telegram chat id (user/group/channel) | Bot must be able to message it (user started it, or bot is a member). |
+| `discord` | channel id | Bot needs Send Messages permission in that channel. |
+| `wecom` | (ignored) | Pushes go through a group-robot webhook (`webhook_key`/`webhook_url` in channel config); bound to one group, so `chat_id` is just a label. |

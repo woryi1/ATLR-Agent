@@ -1,0 +1,538 @@
+// Package app is the single place that constructs provider clients and wires
+// them into an agent. CLI, HTTP server, and IM bridge all bootstrap through
+// here, so the provider wire packages are imported in exactly one spot and the
+// one-directional dependency graph (provider → agent) stays intact.
+//
+// This file owns provider-client construction and the provider.Provider →
+// agent.Sender adapter. Higher-level session assembly (executor, gate, MCP,
+// sub-agents) lands in bootstrap.go as the migration proceeds.
+package app
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/config"
+	"github.com/open-octo/octo-agent/internal/provider"
+	"github.com/open-octo/octo-agent/internal/provider/anthropic"
+	"github.com/open-octo/octo-agent/internal/provider/openai"
+	"github.com/open-octo/octo-agent/internal/provider/ratelimit"
+	"github.com/open-octo/octo-agent/internal/provider/responses"
+)
+
+// Provider name constants (legacy).  New code should use vendor IDs directly.
+const (
+	ProviderAnthropic = "anthropic"
+	ProviderOpenAI    = "openai"
+)
+
+// SenderOptions is everything needed to build an agent.Sender for a vendor.
+// Key resolution and any user-facing help text stay with the caller (a CLI
+// prints setup hints; a server returns an error) — this layer only constructs.
+type SenderOptions struct {
+	Provider string // vendor ID, e.g. "kimi", "deepseek", "anthropic", "openai"
+	APIKey   string
+	BaseURL  string // optional endpoint override; empty uses the vendor default
+	// Protocol ("anthropic" | "openai" | "openai-responses") is required only
+	// for the Custom vendor, which has no registry-pinned wire format; named
+	// vendors ignore it.
+	Protocol string
+	// Headers are extra HTTP headers sent with every request to this
+	// endpoint's BaseURL, forwarded from config.Endpoint/ModelEntry.Headers.
+	Headers map[string]string
+	// RPM and MaxConcurrency are the endpoint's rate limits, forwarded from
+	// config.Endpoint/ModelEntry. Zero means unlimited. Senders built for the
+	// same endpoint share one limiter, so the caps hold across every caller —
+	// see endpointLimiters.
+	RPM            int
+	MaxConcurrency int
+	// LimiterScope, when non-empty, is appended to the shared-limiter key so
+	// the RPM budget gates this model alone instead of pooling with the
+	// endpoint's other models. Set only for per-model RPMs
+	// (config.ModelEntry.RPMScopedByModel); empty keeps the endpoint-level
+	// pooling.
+	LimiterScope string
+
+	// CacheKey is forwarded as the provider's prompt-cache key, stable across a
+	// conversation's turns so the backend routes them to the same cache.
+	CacheKey string
+	// ThinkingBudget > 0 enables Anthropic extended thinking with this trace
+	// budget; ignored by OpenAI-protocol vendors.
+	ThinkingBudget int
+	// ReasoningEffort ("low"|"medium"|"high"|"xhigh"|"max") is forwarded to OpenAI-protocol
+	// vendors as reasoning_effort; ignored by Anthropic-protocol vendors
+	// (which use ThinkingBudget).
+	ReasoningEffort string
+	// ShowReasoning gates whether the reasoning/thinking trace is surfaced to
+	// the agent event stream.
+	ShowReasoning bool
+}
+
+// AnthropicThinkingBudget maps a unified reasoning-effort level to an Anthropic
+// thinking-token figure. "" (off) yields 0, which disables thinking. On modern
+// Claude models (adaptive thinking + output_config.effort) the provider uses
+// this only as a max_tokens floor; on older Claude / Kimi-for-coding it is the
+// literal thinking.budget_tokens. The provider bumps max_tokens to fit a value
+// larger than it, so the higher levels can outrun the default cap safely.
+func AnthropicThinkingBudget(effort string) int {
+	switch effort {
+	case "low":
+		return 4096
+	case "medium":
+		return 16384
+	case "high":
+		return 32768
+	case "xhigh":
+		return 48000
+	case "max":
+		return 64000
+	}
+	return 0
+}
+
+// NewSender builds the provider client for opts and wraps it as an agent.Sender.
+// It is the single entry point through which every transport obtains a sender.
+func NewSender(opts SenderOptions) (agent.Sender, error) {
+	key := limiterKey(opts.Provider, opts.BaseURL)
+	if opts.LimiterScope != "" {
+		key += "|" + opts.LimiterScope
+	}
+	limiter := endpointLimiters.For(key, opts.RPM, opts.MaxConcurrency)
+	p, err := buildClient(opts.Provider, opts.APIKey, opts.BaseURL, opts.Protocol, opts.Headers, limiter)
+	if err != nil {
+		return nil, err
+	}
+	// Anthropic-protocol models on the legacy budget path (older Claude,
+	// Kimi-for-coding) enable thinking only from a positive ThinkingBudget and
+	// ignore the effort string entirely. Callers that set only ReasoningEffort
+	// (e.g. the server, which carries the persisted reasoning_effort) would
+	// otherwise never enable thinking — derive the budget from the effort here
+	// so every transport behaves like the CLI. An explicit budget wins; the
+	// figure is harmless to OpenAI-protocol vendors, which ignore it.
+	thinkingBudget := opts.ThinkingBudget
+	if thinkingBudget == 0 {
+		thinkingBudget = AnthropicThinkingBudget(opts.ReasoningEffort)
+	}
+	return sender{
+		p:               p,
+		cacheKey:        opts.CacheKey,
+		thinkingBudget:  thinkingBudget,
+		reasoningEffort: opts.ReasoningEffort,
+		showReasoning:   opts.ShowReasoning,
+	}, nil
+}
+
+// DefaultBaseURL returns the vendor's built-in API endpoint for the given
+// provider ID, or "" for an unknown one. Exposed so callers can show the
+// effective endpoint without importing the vendor packages themselves.
+//
+// Deprecated: prefer VendorBaseURL(id) from provider.go.
+func DefaultBaseURL(providerName string) string {
+	return VendorBaseURL(providerName)
+}
+
+// ConnectionOverrides bundles the endpoint-specific settings that only apply
+// when the resolved vendor is the config entry's own vendor.
+type ConnectionOverrides struct {
+	Protocol       string
+	Headers        map[string]string
+	RPM            int
+	MaxConcurrency int
+}
+
+// EntryConnectionOverrides returns the endpoint settings to apply when
+// building a sender for resolvedProvider, given the config entry that
+// supplied the API key. They are only meaningful for the entry's own
+// provider: a caller may resolve a DIFFERENT vendor than the config's default
+// entry (e.g. a --provider flag, OCTO_PROVIDER, or a <PROVIDER>_MODEL env var
+// picking a vendor other than entry.Provider) while still reusing that
+// entry's API key. In that mismatch case, the entry describes a different
+// endpoint and none of its settings may be applied to the mismatched vendor's
+// requests — Headers in particular may carry a value that overrides
+// Authorization/x-api-key for a completely different gateway, so leaking it
+// onto the wrong provider's API would send that secret to the wrong place,
+// and the rate limits belong to a quota the mismatched vendor doesn't share.
+func EntryConnectionOverrides(resolvedProvider string, entry config.ModelEntry) ConnectionOverrides {
+	if resolvedProvider != entry.Provider {
+		return ConnectionOverrides{}
+	}
+	return ConnectionOverrides{
+		Protocol:       entry.Protocol,
+		Headers:        entry.Headers,
+		RPM:            entry.RPM,
+		MaxConcurrency: entry.MaxConcurrency,
+	}
+}
+
+// endpointLimiters hands out the shared rate limiter for an endpoint. A
+// provider client is built per session — and again per sub-agent, per
+// workflow step, per background title call — so a limiter owned by one client
+// would gate nothing; keying them here by endpoint is what makes a
+// free-tier quota hold across all of them.
+var endpointLimiters ratelimit.Registry
+
+// limiterKey identifies the endpoint a sender talks to. An empty BaseURL
+// resolves to the vendor default first, so an endpoint that spells out the
+// official URL and one that leaves it blank share a limiter instead of
+// getting one quota each.
+func limiterKey(providerName, baseURL string) string {
+	if baseURL == "" {
+		baseURL = VendorBaseURL(providerName)
+	}
+	return providerName + "|" + baseURL
+}
+
+// buildClient constructs the vendor client and applies an optional base-URL
+// override. An empty key is accepted only for CustomEndpoint vendors (keyless
+// local servers); every other vendor fails here with its env var named.
+// protocol is used only for vendors with no registry-pinned wire format (the
+// Custom catch-all); named vendors ignore it and use their own protocol.
+func buildClient(name, apiKey, baseURL, protocol string, headers map[string]string, limiter *ratelimit.Limiter) (provider.Provider, error) {
+	v := vendorByID(name)
+	if v == nil {
+		return nil, fmt.Errorf("unknown provider %q", name)
+	}
+	if v.CustomEndpoint && baseURL == "" {
+		return nil, fmt.Errorf("provider %q requires a base URL (set %s_BASE_URL or base_url in config)",
+			name, strings.ToUpper(name))
+	}
+	// An empty override means "the vendor's own endpoint". The wire clients'
+	// zero-value defaults point at api.openai.com / api.anthropic.com, which is
+	// wrong for every other vendor speaking the same protocol — so resolve the
+	// registry endpoint here instead of leaving it to the client.
+	if baseURL == "" {
+		baseURL = v.DefaultBaseURL
+	}
+
+	// A registry-pinned protocol always wins; the Custom vendor leaves it empty
+	// and relies on the caller-supplied protocol from the model entry.
+	proto := v.Protocol
+	if proto == "" {
+		proto = protocol
+	}
+	if proto == "" {
+		return nil, fmt.Errorf("provider %q requires a protocol (\"anthropic\", \"openai\" or \"openai-responses\")", name)
+	}
+	// OpenAI's own endpoint gets the Responses API: from GPT-5.4 on, Chat
+	// Completions rejects function tools unless reasoning_effort is "none".
+	// A redirected base URL (OPENAI_BASE_URL, a proxy, a compatible server)
+	// keeps Chat Completions, which such servers are far more likely to speak.
+	if name == ProviderOpenAI && isOfficialOpenAIBaseURL(baseURL) {
+		proto = "openai-responses"
+	}
+	// The key-required policy lives here, not in the wire clients: the same
+	// openai client serves api.openai.com (key mandatory) and a keyless local
+	// Ollama behind the Custom vendor. A client built with an empty key sends
+	// no auth header at all.
+	if strings.TrimSpace(apiKey) == "" && !v.CustomEndpoint {
+		return nil, fmt.Errorf("provider %q requires an API key (set %s or api_key in config)", name, v.APIKeyEnvVar)
+	}
+
+	switch proto {
+	case "anthropic":
+		client, err := anthropic.New(apiKey)
+		if err != nil {
+			return nil, err
+		}
+		if baseURL != "" {
+			client.BaseURL = baseURL
+		}
+		client.Headers = headers
+		client.Limiter = limiter
+		return client, nil
+	case "openai":
+		client, err := openai.New(apiKey)
+		if err != nil {
+			return nil, err
+		}
+		if baseURL != "" {
+			client.BaseURL = baseURL
+		}
+		// Pass the vendor id as the dialect so the client can apply
+		// vendor-specific quirks (DeepSeek's thinking-mode toggle); names the
+		// client doesn't recognise leave the request in its generic shape.
+		client.Dialect = name
+		client.Headers = headers
+		client.Limiter = limiter
+		return client, nil
+	case "openai-responses":
+		client, err := responses.New(apiKey)
+		if err != nil {
+			return nil, err
+		}
+		if baseURL != "" {
+			client.BaseURL = baseURL
+		}
+		client.ClampMaxEffort = name == ProviderOpenAI
+		client.Headers = headers
+		client.Limiter = limiter
+		return client, nil
+	default:
+		return nil, fmt.Errorf("unknown protocol %q for provider %q", proto, name)
+	}
+}
+
+// isOfficialOpenAIBaseURL reports whether baseURL is api.openai.com itself,
+// with or without a trailing slash or "/v1".
+func isOfficialOpenAIBaseURL(baseURL string) bool {
+	base := strings.TrimSuffix(strings.TrimRight(baseURL, "/"), "/v1")
+	return base == openai.DefaultBaseURL
+}
+
+// sender adapts a provider.Provider into agent.Sender. Keeping the adapter here
+// means the agent package never imports provider — a one-directional dep graph
+// that pays off as more provider implementations land.
+type sender struct {
+	p               provider.Provider
+	cacheKey        string
+	thinkingBudget  int
+	reasoningEffort string
+	showReasoning   bool
+}
+
+// LowEffort implements agent.LowEffortSender: it returns a copy of s with
+// reasoning effort capped to "low" — the cheapest non-zero budget — rather
+// than disabled outright. Effort is lowered, not removed, so the request
+// shape stays consistent with earlier turns in the same conversation that
+// may already carry thinking blocks in history (a live check against
+// kimi-for-coding confirmed mixing enabled-thinking history with a
+// disabled-thinking request doesn't actually error there, but "low" is the
+// safer choice across every Anthropic-protocol-compatible backend, tested
+// or not, and it fully solves the latency/cost problem this exists for).
+func (s sender) LowEffort() agent.Sender {
+	s.reasoningEffort = "low"
+	s.thinkingBudget = AnthropicThinkingBudget("low")
+	return s
+}
+
+// NoReasoning implements agent.NoReasoningSender: it returns a copy of s with
+// reasoning disabled entirely (empty effort / zero thinking budget). Used by
+// GenerateTitle because a 6-word title needs no reasoning and even "low"
+// reasoning can consume the tight title token budget or time out.
+func (s sender) NoReasoning() agent.Sender {
+	s.reasoningEffort = ""
+	s.thinkingBudget = 0
+	return s
+}
+
+// reasoningSink returns the OnThinking callback to hand the provider: the
+// agent's onThinking when reasoning display is enabled, else nil so the
+// provider skips surfacing reasoning entirely.
+func (s sender) reasoningSink(onThinking func(string)) func(string) {
+	if !s.showReasoning || onThinking == nil {
+		return nil
+	}
+	return onThinking
+}
+
+func (s sender) SendMessages(ctx context.Context, model, system string, msgs []agent.Message, maxTokens int) (agent.Reply, error) {
+	if s.p == nil {
+		return agent.Reply{}, errors.New("app: provider is nil")
+	}
+	resp, err := s.p.Send(ctx, provider.Request{
+		Model:           model,
+		SystemPrompt:    system,
+		Messages:        msgs,
+		MaxTokens:       maxTokens,
+		CacheKey:        s.cacheKey,
+		ThinkingBudget:  s.thinkingBudget,
+		ReasoningEffort: s.reasoningEffort,
+	})
+	if err != nil {
+		return agent.Reply{}, err
+	}
+	return replyFromResponse(resp), nil
+}
+
+// StreamMessages delegates to the provider's SendStream when it implements
+// provider.StreamingProvider, else falls back to the buffered Send path and
+// synthesises a single onChunk call with the full content.
+func (s sender) StreamMessages(
+	ctx context.Context,
+	model, system string,
+	msgs []agent.Message,
+	maxTokens int,
+	onChunk func(string),
+	onThinking func(string),
+) (agent.Reply, error) {
+	if s.p == nil {
+		return agent.Reply{}, errors.New("app: provider is nil")
+	}
+	req := provider.Request{
+		Model:           model,
+		SystemPrompt:    system,
+		Messages:        msgs,
+		MaxTokens:       maxTokens,
+		CacheKey:        s.cacheKey,
+		ThinkingBudget:  s.thinkingBudget,
+		ReasoningEffort: s.reasoningEffort,
+	}
+	if sp, ok := s.p.(provider.StreamingProvider); ok {
+		resp, err := sp.SendStream(ctx, req, provider.StreamCallbacks{
+			OnText:     onChunk,
+			OnThinking: s.reasoningSink(onThinking),
+		})
+		if err != nil {
+			return agent.Reply{}, err
+		}
+		return replyFromResponse(resp), nil
+	}
+
+	resp, err := s.p.Send(ctx, req)
+	if err != nil {
+		return agent.Reply{}, err
+	}
+	if onChunk != nil && resp.Content != "" {
+		onChunk(resp.Content)
+	}
+	return replyFromResponse(resp), nil
+}
+
+// SendMessagesWithTools implements agent.ToolSender.
+func (s sender) SendMessagesWithTools(
+	ctx context.Context,
+	model, system string,
+	msgs []agent.Message,
+	maxTokens int,
+	toolDefs []agent.ToolDefinition,
+) (agent.Reply, error) {
+	if s.p == nil {
+		return agent.Reply{}, errors.New("app: provider is nil")
+	}
+	resp, err := s.p.Send(ctx, provider.Request{
+		Model:           model,
+		SystemPrompt:    system,
+		Messages:        msgs,
+		MaxTokens:       maxTokens,
+		CacheKey:        s.cacheKey,
+		Tools:           toolDefs,
+		ThinkingBudget:  s.thinkingBudget,
+		ReasoningEffort: s.reasoningEffort,
+	})
+	if err != nil {
+		return agent.Reply{}, err
+	}
+	return replyFromResponse(resp), nil
+}
+
+// StreamMessagesWithTools implements agent.ToolStreamingSender.
+func (s sender) StreamMessagesWithTools(
+	ctx context.Context,
+	model, system string,
+	msgs []agent.Message,
+	maxTokens int,
+	toolDefs []agent.ToolDefinition,
+	onChunk func(string),
+	onToolDelta agent.ToolInputDeltaFunc,
+	onThinking agent.ThinkingDeltaFunc,
+) (agent.Reply, error) {
+	if s.p == nil {
+		return agent.Reply{}, errors.New("app: provider is nil")
+	}
+	req := provider.Request{
+		Model:           model,
+		SystemPrompt:    system,
+		Messages:        msgs,
+		MaxTokens:       maxTokens,
+		CacheKey:        s.cacheKey,
+		Tools:           toolDefs,
+		ThinkingBudget:  s.thinkingBudget,
+		ReasoningEffort: s.reasoningEffort,
+	}
+	if sp, ok := s.p.(provider.StreamingProvider); ok {
+		resp, err := sp.SendStream(ctx, req, provider.StreamCallbacks{
+			OnText:      onChunk,
+			OnToolDelta: onToolDelta,
+			OnThinking:  s.reasoningSink(onThinking),
+		})
+		if err != nil {
+			return agent.Reply{}, err
+		}
+		return replyFromResponse(resp), nil
+	}
+
+	// Buffered fallback.
+	resp, err := s.p.Send(ctx, req)
+	if err != nil {
+		return agent.Reply{}, err
+	}
+	if onChunk != nil && resp.Content != "" {
+		onChunk(resp.Content)
+	}
+	return replyFromResponse(resp), nil
+}
+
+func replyFromResponse(resp provider.Response) agent.Reply {
+	return agent.Reply{
+		Content:          resp.Content,
+		Blocks:           resp.Blocks,
+		Model:            resp.Model,
+		StopReason:       resp.StopReason,
+		InputTokens:      resp.InputTokens,
+		OutputTokens:     resp.OutputTokens,
+		CacheReadTokens:  resp.CacheReadTokens,
+		CacheWriteTokens: resp.CacheWriteTokens,
+	}
+}
+
+// TestConnection pings the provider with a minimal request to verify that
+// the API key, base URL, and model all work. It returns a descriptive error
+// on failure (auth, model not found, network, etc.). headers are the
+// endpoint's extra request headers, as real requests send them.
+func TestConnection(ctx context.Context, providerName, apiKey, baseURL, model, protocol string, headers map[string]string) error {
+	// No limiter: this is a single user-initiated ping, and making it queue
+	// behind a busy endpoint's window would look like a hung "Test" button.
+	p, err := buildClient(providerName, apiKey, baseURL, protocol, headers, nil)
+	if err != nil {
+		return err
+	}
+	// Bypasses the Agent entry points, so it needs its own conversation ID.
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	ctx = agent.WithUpstreamSessionID(ctx, "conntest-"+hex.EncodeToString(b[:]))
+	_, err = p.Send(ctx, provider.Request{
+		Model:     model,
+		Messages:  []agent.Message{{Role: agent.RoleUser, Content: "hi"}},
+		MaxTokens: 1,
+	})
+	return err
+}
+
+// ErrModelListingUnsupported is returned by ListModels for an endpoint whose
+// wire protocol has no model-listing call octo knows how to make.
+var ErrModelListingUnsupported = errors.New("this endpoint does not support listing models")
+
+// ListModels asks the endpoint which model ids it serves (GET /v1/models on
+// the OpenAI protocol). The result carries ids only — no context window or
+// vision flag — so callers must not treat it as a ready model configuration.
+func ListModels(ctx context.Context, providerName, apiKey, baseURL, protocol string, headers map[string]string) ([]string, error) {
+	// A Responses endpoint lists models with the same GET /v1/models as Chat
+	// Completions, so the openai client's listing serves both.
+	if protocol == "openai-responses" {
+		protocol = "openai"
+	}
+	p, err := buildClient(providerName, apiKey, baseURL, protocol, headers, nil)
+	if err != nil {
+		return nil, err
+	}
+	lister, ok := p.(interface {
+		ListModels(context.Context) ([]string, error)
+	})
+	if !ok {
+		return nil, ErrModelListingUnsupported
+	}
+	return lister.ListModels(ctx)
+}
+
+// Compile-time assertions: sender satisfies all agent sender interfaces.
+var (
+	_ agent.Sender              = sender{}
+	_ agent.StreamingSender     = sender{}
+	_ agent.ToolSender          = sender{}
+	_ agent.ToolStreamingSender = sender{}
+)

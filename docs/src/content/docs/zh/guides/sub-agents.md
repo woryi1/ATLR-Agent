@@ -1,0 +1,83 @@
+---
+title: 子代理
+description: 启动一个独立的、专门化的 agent，拥有自己独立的上下文窗口。
+---
+
+`sub_agent` 工具会启动一个全新的 agent——一个带着自己的人格和工具集、对话历史从空白开始的
+独立 agent。这里没有对应的 slash 命令：任务需要隔离或者需要一个专门视角时，模型会直接调用
+这个工具。
+
+每个子代理都以**零对话上下文**启动：它看不到当前对话，所以模型必须写一个自包含的 prompt，
+并指定 `subagent_type`（必填）。如果你想分叉的是对话本身——从任意一条历史消息切出一个可以
+直接对话的新会话——请用 web 端的会话 branch 功能；那才是真正的对话 fork，而这刻意不是子代理
+能做的事。
+
+递归被硬性限制在一层：子代理自己的工具集里永远不包含 `sub_agent`，就算有什么绕过了这层过滤，
+调用它也会被直接拒绝。
+
+## 内置类型
+
+| 类型 | 只读 | 说明 |
+|---|---|---|
+| `explore` | 是 | 快速调研，系统提示精简 |
+| `general` | 否 | 完整工具集，用于端到端委派 |
+| `code-review` | 是 | 通过 `git diff` 做 review |
+
+`explore` 是唯一的"lean"类型——它的系统提示里会去掉 skills 清单和记忆注入，
+毕竟一次快速调研通常两者都用不上。所有类型都跑在父模型上（除非显式传 `model` 覆盖）：
+子代理的结论直接决定父代理的下一步，侦察兵降级，情报也跟着降级。
+
+## 自定义类型
+
+在 `~/.octo/agents/<name>.md`（用户级）或 `.octo/agents/<name>.md`（项目级，同名时优先）放一个
+markdown 文件，它就变成一个模型可以按文件名请求的 `subagent_type`：
+
+```markdown
+---
+description: Audits code for security vulnerabilities
+read_only: true
+tools: [read_file, grep, glob, terminal]
+disallowed_tools: [write_file, edit_file]
+model: inherit
+---
+You are a security-focused sub-agent. Review the diff for OWASP top 10 issues, hard-coded
+secrets, and injection risks. Report file:line findings with severity — don't modify anything.
+```
+
+| 字段 | 是否必填 | 含义 |
+|---|---|---|
+| `description` | 是 | 给模型看的，让它知道什么时候该用这个类型 |
+| `read_only` | 否 | 限制只能用不产生副作用的工具 |
+| `tools` | 否 | 显式白名单 |
+| `disallowed_tools` | 否 | 从继承来的工具集里减掉这些 |
+| `model` | 否 | `inherit`（默认）或者写死一个具体 model id |
+
+frontmatter 里的 `name` 字段就算写了也会被忽略——文件名（去掉 `.md`）才是模型用来请求这个类型的
+标识。目录每次查找都会重新扫描，改完文件立刻生效，不需要重启。
+
+## 跟进一个子代理
+
+子代理是在后台跑还是原地跑，由 octo 运行在什么地方决定，模型不参与这个选择。交互式会话（TUI、
+Web UI、IM 对话）一律把子代理放到后台：派出去父回合就收尾，它干活的时候你可以继续说话，结果
+稍后以完成通知的形式送达。headless one-shot（位置参数消息、`--prompt-file` 或管道 stdin）没有后续
+回合来接这条通知，所以它原地跑完子代理、把回复直接交回来。
+
+模型在同一轮里发出多个 `sub_agent` 调用时，它们会**并发**扇出（同时在跑的上限默认 16 个，可用
+[配置文件](/docs/zh/reference/config-file/#tools-配置块)里的 `tools.sub_agent_max_concurrency` 调整），而不是
+一个跑完再跑下一个；超过上限的新派发会被拒绝，模型等有空位了再补。一个子代理只要没被杀掉、正常
+结束，就会保持可寻址：
+
+| 工具 | 作用 |
+|---|---|
+| `sub_agent_send` | 给一个正在运行或已经结束的子代理发送后续消息 |
+| `sub_agent_status` | 不阻塞地查看进度 |
+| `sub_agent_kill` | 提前停止一个子代理 |
+
+## 子代理不能做什么
+
+子代理的 `terminal` 调用一律**同步**执行：传了 `run_in_background` 或 `detached` 也会被忽略，超过
+超时（默认 120 秒，或本次调用显式传的 `timeout`）的命令会被直接杀掉并返回错误，而不是转成后台进程。子代理在启动它的那一个回合内就要返回，
+之后没有回合来收割后台命令的输出——而一个游离的后台进程还会把完成通知打进父会话里。真正长时间运行
+（或需要活得比代理更久）的命令，应该交给父代理去跑。子代理也不能再启动自己的子代理。
+
+下一步：确定性地编排一整支子代理队伍，而不是一个一个来，正是[工作流](/docs/zh/guides/workflows/)要做的事。

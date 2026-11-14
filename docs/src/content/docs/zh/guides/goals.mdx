@@ -1,0 +1,53 @@
+---
+title: 运行长周期目标
+description: 给 octo 一个能跨越空闲时段持续推进的目标，而不只是回答一条消息。
+---
+
+import { Badge } from '@astrojs/starlight/components';
+
+<Badge text="Beta" variant="caution" /><br /><br />
+
+目标（goal）是 agent 会持续推进的一个长期objective，即使在空闲时段也会继续，而不是回完当前这条
+消息就停下。
+
+```text
+/goal 把内部 API 客户端从 v1 迁移到 v2，覆盖所有调用点
+/goal edit          # 调整当前目标的描述
+/goal pause         # 暂停空闲续跑，目标本身还在
+/goal resume        # 重新捡起续跑循环
+/goal clear         # 清掉当前目标
+/goal replace       # 强制替换一个还没完成的目标（已完成的直接 /goal 新目标 即可）
+```
+
+当一个带着目标的会话进入空闲状态时，octo 会自己继续朝目标推进——用的是和 `/loop` 一样的机制，
+只不过应用在单个持久目标上，而不是一条重复的 prompt。底层工具（`get_goal`、`create_goal`、
+`update_goal`）模型也能直接调用，所以目标可以在对话过程中被创建或调整，不一定非要走 slash 命令。
+
+每一轮自动开跑的回合都会在对话里留一行说明——新目标是 `Goal starts`，之后每轮是 `Goal continues`
+——状态变化同样会留一行：`Goal complete` 带最终用量，以及 `Goal blocked`、`Goal budget reached`、
+`Goal usage limited`。驱动续跑的那段 prompt 是隐藏的，所以这行字就是你判断「这段输出是目标自己跑
+出来的，不是我让它做的」的依据。TUI 打在滚动区，Web UI 内联渲染在会话里；`/goal` 命令本身的回复
+也走同一个位置。IM 渠道刻意安静一些——聊天里只会收到 `/goal` 的回复，以及目标结束或卡住时的通知，
+不会每续跑一轮就报一行。
+
+:::note[`/goal edit` 各端行为不同]
+TUI 里不带文本的 `/goal edit` 会把当前目标的描述预填进输入框，等你下次按 Enter 才真正提交，
+`/goal edit <文本>` 这种直接带文本的写法会被拒绝——它只支持预填。Web UI 和 IM 渠道里
+`/goal edit <文本>` 一步到位直接改。其余子命令（`pause`/`resume`/`clear`/`replace`）在各端行为
+一致，因为目标状态挂在会话本身上，不挂在具体传输方式上。
+:::
+
+## 关掉这个功能
+
+目标是按会话可选启用的，也可以整体关闭：
+
+```yaml
+# ~/.octo/config.yml
+goal:
+  enabled: false
+```
+
+关闭之后，`/goal` 会报告自己不可用，而不是悄悄什么都不做。
+
+下一步：目标和[渠道](/docs/zh/guides/channels/)可以配合——在手机上起一个，让它自己跑，回头再来看。
+如果你要的是一条反复执行的 prompt 而不是单个持久目标，见 [`/loop`](/docs/zh/guides/loop/)。

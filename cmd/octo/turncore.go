@@ -1,0 +1,387 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/tasks"
+	"github.com/open-octo/octo-agent/internal/tools"
+)
+
+// ViewSink is the render-decoupling seam between the turn orchestration core
+// (runTurn) and whatever is presenting it — today the plain-text REPL
+// (plainView), later a bubbletea TUI. runTurn drives a ViewSink and never
+// touches a terminal directly, so the same orchestration (memory nudge,
+// pre/post hooks, the streaming RunStream call) backs both the TTY and the
+// headless paths. The embedded userPrompter (Ask) lets the permission gate
+// and ask_user_question request a structured answer through the same seam —
+// stdin line in plainView, modal in the TUI.
+type ViewSink interface {
+	userPrompter
+
+	// TurnStarted fires once before the model is called, so the view can
+	// arm per-turn state (spinner, fresh event-rendering closure).
+	TurnStarted()
+
+	// Emit receives every streaming AgentEvent from the run, in order. It is
+	// invoked synchronously from the agent loop — a blocking Emit blocks the
+	// loop (same contract as agent.EventHandler).
+	Emit(ev agent.AgentEvent)
+
+	// TurnEnded fires once after the run returns, carrying the final reply,
+	// this turn's elapsed time + token usage, and any error (including
+	// context.Canceled for an interrupt), so the view can tear down per-turn
+	// state and render the outcome (summary line, cache line, ^C, error).
+	TurnEnded(reply agent.Reply, stats TurnStats, err error)
+
+	// Notice surfaces an out-of-band message not tied to the model stream
+	// (e.g. a pre/post-turn hook failure). Never blocks the turn.
+	Notice(msg string)
+}
+
+// TurnStats carries the wall-clock time and token spend of a single turn,
+// computed by runTurn from Agent.SessionTokens() deltas (Reply.InputTokens/
+// OutputTokens alone only reflect the turn's last LLM call, not the whole
+// multi-iteration tool loop). Every ViewSink renders it into an always-on
+// per-turn summary line so the user knows what a turn cost regardless of
+// verbosity.
+type TurnStats struct {
+	Elapsed time.Duration
+	Tokens  int // input + output tokens billed during this turn
+	// Prompt-side cache accounting for the turn, from Agent.SessionCacheTokens()
+	// deltas. InputTokens is the uncached remainder (non-overlapping with the
+	// cache buckets), so views can derive utilization via
+	// agent.CacheUtilizationPct. All zero when the backend reports no cache info.
+	// Sub-agent and mid-turn compaction/consolidation usage folds into these
+	// counters too (AccrueChildUsage/addUsage carry cache deltas), so the
+	// percentage is the true share, not a lower bound.
+	InputTokens      int
+	CacheReadTokens  int
+	CacheWriteTokens int
+}
+
+// cacheSuffix renders the summary line's ", cache NN%" tail — the share of
+// this turn's prompt served from the provider cache — or "" when the backend
+// reported no cache activity, so cache-less providers keep the old line.
+func (s TurnStats) cacheSuffix() string {
+	pct, ok := agent.CacheUtilizationPct(s.InputTokens, s.CacheReadTokens, s.CacheWriteTokens)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf(", cache %d%%", pct)
+}
+
+// runTurn executes one user turn: it applies the memory nudge and the pre-turn
+// hook to build the model-facing input, streams the turn through the agent
+// loop (RunStream subsumes the no-tools case via its internal TurnStream
+// fallback), then fires the post-turn hook. All presentation flows through
+// sink; the caller owns input reading, slash-command dispatch, the turn's
+// cancellable context, and the save/loop decision based on the returned error.
+func runTurn(ctx context.Context, a *agent.Agent, cfg replConfig, sink ViewSink, line string) (agent.Reply, error) {
+	// Clear-and-rebuild: a fully-completed plan is closed, so drop it before
+	// this turn's tools run — the new turn's tasks then start a fresh plan
+	// instead of piling onto old, done ones (same semantics as the server's
+	// prepareToolTurn). An incomplete plan carries over so the agent keeps
+	// working on it. No-op when tasks are disabled (nil store), empty, or
+	// only-deleted (nothing to close). Turns are serialized (one turn
+	// goroutine at a time), so this read-then-swap is safe.
+	if tools.AllTasksComplete(tools.ActiveTaskStore()) {
+		tools.SetTaskStore(tasks.New())
+	}
+	// Scope the turn's tools-layer per-session state (the replay-secret cache)
+	// to this CLI session. With no session (a nil cfg.session, e.g. an
+	// ephemeral one-shot) the cache degrades to process-level — correct,
+	// because that process IS the session boundary.
+	if cfg.session != nil {
+		ctx = tools.WithSessionID(ctx, cfg.session.ID)
+	}
+	turnInput := line
+
+	// Drain anything that accumulated before this turn started — in practice a
+	// background-process completion notice (Agent.Inbox) that fired while the
+	// REPL was idle. Prepend it so the model sees it as context for this turn.
+	// This is the idle counterpart to the in-turn drain that RunStream does at
+	// the start of each loop iteration.
+	if pending := a.Inbox.Drain(); len(pending) > 0 {
+		turnInput = strings.Join(agent.Texts(pending), "\n\n") + "\n\n" + turnInput
+	}
+
+	// UserPromptSubmit / Stop hooks now fire inside the agent core (Agent.Hooks),
+	// so every transport — not just this CLI path — runs them; runTurn no longer
+	// invokes hooks itself.
+
+	sink.TurnStarted()
+
+	turnStart := time.Now()
+	inBefore, outBefore := a.SessionTokens()
+	crBefore, cwBefore := a.SessionCacheTokens()
+
+	// RunStream owns the streaming + agentic tool loop. With no tools it falls
+	// back internally to TurnStream, adapting text deltas into EventTextDelta
+	// and firing a terminal EventTurnDone — so a single call path covers both
+	// the tool-enabled and plain-chat turns and the sink sees a uniform event
+	// stream regardless.
+	reply, err := a.RunStream(ctx, turnInput, cfg.tools, cfg.executor, sink.Emit)
+
+	inAfter, outAfter := a.SessionTokens()
+	crAfter, cwAfter := a.SessionCacheTokens()
+	stats := TurnStats{
+		Elapsed:          time.Since(turnStart),
+		Tokens:           (inAfter - inBefore) + (outAfter - outBefore),
+		InputTokens:      inAfter - inBefore,
+		CacheReadTokens:  crAfter - crBefore,
+		CacheWriteTokens: cwAfter - cwBefore,
+	}
+
+	sink.TurnEnded(reply, stats, err)
+	return reply, err
+}
+
+// plainView is the plain-text ViewSink: the rendering that the synchronous,
+// line-based REPL used inline before turn orchestration was extracted. It
+// backs both the non-tty path and the --no-tui fallback. Output is byte-for-
+// byte the same as the pre-extraction REPL.
+type plainView struct {
+	out       io.Writer
+	errOut    io.Writer
+	reader    lineReader // for Ask prompts; nil → Ask auto-cancels
+	verbosity verbosity
+	plain     bool
+
+	// secretReader reads one secret line with NO echo (production wires
+	// term.ReadPassword over stdin; tests inject a stub). Kept separate from
+	// reader so a secret never echoes or lands in readline history. Nil →
+	// secret prompts auto-cancel (the headless posture).
+	secretReader func(prompt string) (string, bool)
+
+	// Per-turn state, (re)armed in TurnStarted.
+	spin  *spinner
+	inner func(agent.AgentEvent)
+}
+
+func newPlainView(reader lineReader, out, errOut io.Writer, v verbosity, plain bool) *plainView {
+	return &plainView{
+		out:       out,
+		errOut:    errOut,
+		reader:    reader,
+		verbosity: v,
+		plain:     plain,
+	}
+}
+
+func (v *plainView) TurnStarted() {
+	// Fresh event-rendering closure per turn — it carries per-turn state
+	// (started-at times, prevWasText, input dots).
+	v.inner = replToolEventHandler(v.out, v.errOut, v.plain)
+	// Spinner during the "thinking, nothing on screen yet" pause. Suppressed
+	// in quiet mode (spin stays nil; spinner.Stop is nil-safe). 250ms grace so
+	// a fast reply doesn't blink it.
+	if v.verbosity.quiet() {
+		v.spin = nil
+		return
+	}
+	v.spin = newSpinner(v.out, "thinking…")
+	v.spin.Start(250 * time.Millisecond)
+}
+
+func (v *plainView) Emit(ev agent.AgentEvent) {
+	v.spin.Stop() // idempotent + nil-safe; first event of any kind clears it
+	v.inner(ev)
+}
+
+func (v *plainView) TurnEnded(reply agent.Reply, stats TurnStats, err error) {
+	v.spin.Stop() // belt-and-braces in case the turn produced zero events
+	switch {
+	case errors.Is(err, context.Canceled):
+		// Ctrl-C / Esc: silently terminate. The agent already finalized
+		// history into a well-formed state.
+	case err != nil:
+		fmt.Fprintf(v.errOut, "\nerror: %s\n", agent.UserFacingError(err))
+	default:
+		fmt.Fprintln(v.out) // newline after the streamed reply
+		if !v.verbosity.quiet() {
+			// Per-turn summary (how long it took, what it cost) is diagnostic
+			// metadata, not answer content — it goes to stderr so a headless
+			// one-shot run (`octo "…" | program`) leaves stdout carrying only the
+			// reply text. Interactive plain-REPL users still see it (their stderr
+			// is the terminal). Mirrors printUsageLine's stderr routing.
+			fmt.Fprintf(v.errOut, "  ⏱ %s, %s tokens%s\n",
+				agent.FormatElapsedSeconds(int64(stats.Elapsed.Seconds())), agent.FormatGoalTokens(int64(stats.Tokens)),
+				stats.cacheSuffix())
+		}
+	}
+}
+
+func (v *plainView) Notice(msg string) {
+	fmt.Fprintln(v.errOut, msg)
+}
+
+// Ask renders a structured prompt to stdout and reads the answer from the
+// shared line reader — the synchronous behaviour the gate and asker used
+// before the seam existed. With no reader (e.g. piped input exhausted) every
+// prompt auto-cancels / denies.
+func (v *plainView) Ask(_ context.Context, p UserPrompt) (UserResponse, error) {
+	switch p.Kind {
+	case KindPermission:
+		return v.askPermission(p), nil
+	case KindQuestion:
+		return v.askQuestion(p), nil
+	case KindSecret:
+		return v.askSecret(p), nil
+	default:
+		return UserResponse{Cancelled: true}, nil
+	}
+}
+
+// askSecret renders the question and reads the value through the no-echo
+// secret reader. The value goes straight into UserResponse.Custom; nothing
+// echoes, and the prompt text is all that reaches the scrollback.
+func (v *plainView) askSecret(p UserPrompt) UserResponse {
+	if v.secretReader == nil {
+		return UserResponse{Cancelled: true}
+	}
+	fmt.Fprintf(v.out, "\n🔒 %s\n", p.Question)
+	answer, ok := v.secretReader("  secret (input hidden): ")
+	fmt.Fprintln(v.out) // the no-echo read leaves the cursor mid-line
+	if !ok || strings.TrimSpace(answer) == "" {
+		return UserResponse{Cancelled: true}
+	}
+	return UserResponse{Custom: strings.TrimSpace(answer)}
+}
+
+// askPermission prompts: y/yes → allow once; a/always → allow for the session;
+// anything else (incl. empty / N / no reader) → deny.
+func (v *plainView) askPermission(p UserPrompt) UserResponse {
+	fmt.Fprintf(v.out, "\n⚠ permission: %s wants to run\n", p.ToolName)
+	fmt.Fprintf(v.out, "%s\n", plainPermissionDetail(p.ToolName, p.ToolInput))
+
+	answer := ""
+	if v.reader != nil {
+		if raw, ok := v.reader.ReadLine("  allow? [y]es / [a]lways this session / [N]o: "); ok {
+			answer = strings.ToLower(strings.TrimSpace(raw))
+		}
+	}
+	switch answer {
+	case "y", "yes":
+		return UserResponse{Allow: true}
+	case "a", "always":
+		return UserResponse{Allow: true, Always: true}
+	default:
+		return UserResponse{Allow: false}
+	}
+}
+
+// askQuestion renders the ask_user_question cards and parses the selections.
+// A line reader can't do tabs, so the set degrades to one card per question,
+// asked in order. Notes are not offered: there is no pane to annotate and no
+// spare key to open one, so a preview question keeps its "Other" row here.
+func (v *plainView) askQuestion(p UserPrompt) UserResponse {
+	if v.reader == nil {
+		return UserResponse{Outcome: PromptRejected}
+	}
+
+	answers := make([]UserAnswer, len(p.Questions))
+	for i, q := range p.Questions {
+		answer, outcome := v.askOneQuestion(q, i, len(p.Questions))
+		if outcome != PromptSubmitted {
+			// Clarify carries what was answered so far; reject discards it in
+			// formatAskResponse, so passing it along costs nothing.
+			return UserResponse{Outcome: outcome, Answers: answers}
+		}
+		answers[i] = answer
+	}
+	return UserResponse{Outcome: PromptSubmitted, Answers: answers}
+}
+
+// askOneQuestion prints one card and reads one answer.
+func (v *plainView) askOneQuestion(q UserQuestion, idx, total int) (UserAnswer, UserAskOutcome) {
+	prompt := v.printQuestion(q, idx, total)
+	raw, ok := v.reader.ReadLine(prompt)
+	if !ok {
+		// EOF rejects the rest of the set rather than answering blind.
+		fmt.Fprintln(v.out)
+		return UserAnswer{}, PromptRejected
+	}
+	choice := strings.TrimSpace(raw)
+	if choice == "" {
+		// An empty line skips this question; the set continues.
+		return UserAnswer{}, PromptSubmitted
+	}
+
+	otherIdx := len(q.Options) + 1
+	clarifyIdx := otherIdx + 1
+	indices, parseErr := parseSelection(choice, clarifyIdx, q.MultiSelect)
+	if parseErr != nil {
+		fmt.Fprintf(v.out, "  (couldn't parse %q, skipping)\n", choice)
+		return UserAnswer{}, PromptSubmitted
+	}
+
+	var (
+		picks     []string
+		wantOther bool
+	)
+	for _, i := range indices {
+		switch {
+		case i == clarifyIdx:
+			return UserAnswer{}, PromptClarify
+		case i == otherIdx:
+			wantOther = true
+		case i >= 1 && i <= len(q.Options):
+			picks = append(picks, q.Options[i-1].Label)
+		}
+	}
+
+	if wantOther {
+		text, ok := v.reader.ReadLine("  Other (free text): ")
+		if !ok || strings.TrimSpace(text) == "" {
+			return UserAnswer{}, PromptSubmitted
+		}
+		return UserAnswer{Custom: strings.TrimSpace(text)}, PromptSubmitted
+	}
+	return UserAnswer{Choices: picks}, PromptSubmitted
+}
+
+// printQuestion writes the multi-line question card and returns the final
+// inline "Select [...]: " prompt — passed to ReadLine so readline renders it
+// in place.
+func (v *plainView) printQuestion(q UserQuestion, idx, total int) string {
+	header := q.Header
+	if header == "" {
+		header = "question"
+	}
+	if total > 1 {
+		header = fmt.Sprintf("%s %d/%d", header, idx+1, total)
+	}
+	fmt.Fprintf(v.out, "\n[ask_user_question · %s]\n", header)
+	fmt.Fprintf(v.out, "  %s\n", q.Question)
+	for i, opt := range q.Options {
+		fmt.Fprintf(v.out, "    %d) %s\n", i+1, opt.Label)
+		if opt.Description != "" {
+			fmt.Fprintf(v.out, "       %s\n", opt.Description)
+		}
+		if opt.Preview != "" {
+			for _, line := range strings.Split(truncateRunes(opt.Preview, plainPreviewMaxRunes), "\n") {
+				fmt.Fprintf(v.out, "       │ %s\n", line)
+			}
+		}
+	}
+	otherIdx := len(q.Options) + 1
+	fmt.Fprintf(v.out, "    %d) Other (free text)\n", otherIdx)
+	fmt.Fprintf(v.out, "    %d) Chat about this\n", otherIdx+1)
+
+	hint := fmt.Sprintf("[1-%d]", otherIdx+1)
+	if q.MultiSelect {
+		hint = "[comma-separated, e.g. 1,3]"
+	}
+	return fmt.Sprintf("  Select %s (empty skips): ", hint)
+}
+
+// plainPreviewMaxRunes bounds an inline preview on this surface. Same budget
+// the IM permission summary uses, for the same reason: enough to judge by,
+// not enough to scroll the prompt away.
+const plainPreviewMaxRunes = 600

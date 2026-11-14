@@ -1,0 +1,414 @@
+<script lang="ts">
+  import { untrack } from 'svelte'
+  import { t } from '../../lib/i18n'
+  import * as api from '../../lib/api'
+  import { parseContextWindow } from '../../lib/contextWindow'
+  import type { ProviderPreset, ModelEntry, ModelConfigInput, Protocol } from '../../lib/api'
+  import Switch from '../ui/Switch.svelte'
+  import ApiKeyInput from './ApiKeyInput.svelte'
+  import VariantChips from './VariantChips.svelte'
+
+  // Shared provider/key form used by both the first-run setup panel and the
+  // Settings → Models section. It owns the Test-connection button internally;
+  // persistence differs per caller, so Save is delegated via onSubmit.
+  let {
+    providers = [],
+    initial = null,
+    requireKey = true,
+    showPrefs = true,
+    submitLabel,
+    onSubmit,
+  }: {
+    providers?: ProviderPreset[]
+    initial?: Partial<ModelEntry> | null
+    requireKey?: boolean
+    // First-run onboard hides these: the /onboard ceremony collects permission
+    // mode / reasoning effort / show-reasoning itself, so the bootstrap form
+    // would only ask the same questions twice.
+    showPrefs?: boolean
+    submitLabel: string
+    onSubmit: (req: ModelConfigInput) => Promise<void>
+  } = $props()
+
+  // ── form state ──────────────────────────────────────────────────────────────
+  // Snapshot the prop once: this form is mounted fresh each time a modal opens,
+  // so seeding editable state from the initial value (not tracking it) is what
+  // we want — and the snapshot avoids the state_referenced_locally warning.
+  const seed = untrack(() => initial) ?? {}
+
+  // Preselect the stored provider id (a real vendor, always present in the
+  // presets list); an unknown id just falls back to the placeholder option.
+  let providerId   = $state(seed.provider ?? '')
+  // Some legacy/shortened entries have an empty model field while the entry id
+  // carries the intended model name. Use id as a fallback so the edit form is
+  // pre-filled and saveable without re-typing.
+  let model        = $state(seed.model || (seed as Partial<ModelEntry>).id || '')
+  let baseUrl      = $state(seed.base_url ?? '')
+  // Protocol is only meaningful for the Custom vendor; seed from the entry's
+  // stored wire format so an edit round-trips.
+  let protocol     = $state<Protocol>(api.normalizeProtocol(seed.protocol))
+  let apiKey       = $state('')            // never prefilled; placeholder shows the masked key
+  let permMode     = $state(seed.permission_mode ?? 'interactive')
+  let reasoning    = $state(seed.reasoning_effort ?? 'off')
+  let showReason   = $state(seed.show_reasoning ?? false)
+  // Vision is always recorded. Editing seeds from the stored value; a new entry
+  // gets the picked model's catalogue value (via applyPresetVision on select),
+  // falling back to true until the user picks or toggles.
+  let vision       = $state(seed.vision ?? true)
+  // Custom only: a model the built-in table doesn't know falls back to 128k.
+  // Empty sends nothing, so re-running the wizard keeps a window already set.
+  let ctxWin       = $state('')
+
+  let testing      = $state(false)
+  let saving       = $state(false)
+  let result       = $state<{ ok: boolean; msg: string } | null>(null)
+
+  let preset    = $derived.by(() => {
+    if (providerId) {
+      return providers.find(p => p.id === providerId) ?? null
+    }
+    // If providerId is empty but baseUrl is set, try to infer the provider
+    // from the endpoint (for legacy entries without a stored provider field).
+    if (baseUrl) {
+      const normalized = baseUrl.replace(/\/$/, '')
+      for (const p of providers) {
+        if (p.base_url.replace(/\/$/, '') === normalized) {
+          return p
+        }
+        for (const v of p.endpoint_variants ?? []) {
+          if (v.base_url.replace(/\/$/, '') === normalized) {
+            return p
+          }
+        }
+      }
+    }
+    return null
+  })
+  let variants  = $derived(preset?.endpoint_variants ?? [])
+
+  // When preset is inferred from baseUrl (providerId is empty), auto-fill
+  // providerId so the datalist renders and the save includes the provider.
+  $effect(() => {
+    if (!providerId && preset && baseUrl) {
+      providerId = preset.id
+    }
+  })
+  // A named vendor's base URL is resolved from the vendor default at runtime and
+  // may not be persisted in the stored entry. Editing such an entry seeds an
+  // empty baseUrl into a readonly (locked) field, which would fail validation
+  // and block Test/Save. Backfill it from the preset default when empty.
+  $effect(() => {
+    if (preset && !preset.custom_endpoint && !baseUrl && preset.base_url) {
+      baseUrl = preset.base_url
+    }
+  })
+  // Catalogue vendors are pinned to their endpoint; only custom_endpoint
+  // providers take a typed Base URL.
+  let baseUrlLocked = $derived(!!preset && !preset.custom_endpoint)
+  // The Custom vendor has no fixed wire protocol (empty api), so the user picks
+  // it explicitly. A hand-typed endpoint with no preset is Custom too.
+  let isCustom = $derived(preset ? (!!preset.custom_endpoint && !preset.api) : !!baseUrl)
+  // requireKey false means the caller found an existing endpoint with a
+  // stored key (see FirstRunSetup's re-run path) — leaving this blank keeps
+  // that key unchanged (saveModel's "empty api_key = unchanged" rule), so the
+  // hint should say that rather than implying a fresh key is expected.
+  // The Custom vendor may run keyless (local Ollama/vLLM), mirroring the
+  // server's app.VendorKeyOptional; the hint says so instead of "sk-…".
+  let keyPlaceholder = $derived(
+    initial?.api_key_masked
+      || (!requireKey ? $t('models.apikey.placeholder_keep')
+        : isCustom ? $t('models.apikey.placeholder_optional')
+        : $t('models.apikey.placeholder'))
+  )
+
+  // Selecting a preset fills model + base_url.
+  function onProviderChange() {
+    result = null
+    if (providerId === '') {
+      return
+    }
+    if (preset) {
+      model = preset.default_model || ''
+      baseUrl = preset.base_url || ''
+      // A Custom model has no catalogue entry, so don't carry over the last
+      // vendor's value; start from the same default as the add-endpoint form.
+      if (isCustom) vision = true
+      else applyPresetVision()
+    }
+  }
+
+  // A predefined model carries its vision capability in the preset catalogue;
+  // selecting one pre-fills the toggle (the user can still override it, and the
+  // server honours whatever is sent). Custom / unknown models keep the current
+  // value.
+  function applyPresetVision() {
+    const v = preset?.model_vision?.[model]
+    if (v !== undefined) vision = v
+  }
+
+  // For named vendors the protocol is decided by the chosen preset; for the
+  // Custom vendor (or a hand-typed endpoint with no preset) the user picks it.
+  function buildReq(): ModelConfigInput {
+    const providerID = preset ? preset.id : 'custom'
+    const wire: Protocol | undefined = isCustom
+      ? protocol
+      : (preset && preset.api === 'anthropic-messages' ? 'anthropic' : undefined)
+    const req: ModelConfigInput = {
+      type: 'default',
+      model: model.trim(),
+      base_url: baseUrl.trim(),
+      api_key: apiKey.trim(),
+      provider: providerID,
+      protocol: wire,
+    }
+    const win = isCustom ? parseContextWindow(ctxWin) : 0
+    if (win) req.context_window = win
+    // Vision is a property of the model, not a preference, so it is sent even
+    // when prefs are hidden: saveModel stores an omitted value as false.
+    req.vision = vision
+    // Onboard hides prefs; leave them to server defaults + the /onboard ceremony.
+    if (showPrefs) {
+      req.permission_mode = permMode
+      req.reasoning_effort = reasoning
+      req.show_reasoning = showReason
+    }
+    return req
+  }
+
+  function valid(): boolean {
+    return !!model.trim() && !!baseUrl.trim() && (!requireKey || isCustom || !!apiKey.trim())
+  }
+
+  // A bad window must not be dropped silently on save.
+  function windowInvalid(): boolean {
+    if (isCustom && parseContextWindow(ctxWin) === null) {
+      result = { ok: false, msg: $t('settings.endpoints.context_window.invalid') }
+      return true
+    }
+    return false
+  }
+
+  async function handleTest() {
+    if (!valid()) { result = { ok: false, msg: $t('models.error.required') }; return }
+    if (windowInvalid()) return
+    testing = true
+    result = null
+    try {
+      const r = await api.testConfig(buildReq())
+      result = { ok: r.ok, msg: r.ok ? $t('models.test.ok') : (r.message || $t('models.test.fail')) }
+    } catch (e: any) {
+      result = { ok: false, msg: e?.message ?? $t('models.test.fail') }
+    } finally {
+      testing = false
+    }
+  }
+
+  async function handleSubmit() {
+    if (!valid()) { result = { ok: false, msg: $t('models.error.required') }; return }
+    if (windowInvalid()) return
+    saving = true
+    try {
+      // Test the connection first — the button label says "Test connection and continue"
+      // during first-run onboard, and "Save" in Settings; either way, don't save an
+      // invalid or unreachable config.
+      const testRes = await api.testConfig(buildReq())
+      if (!testRes.ok) {
+        result = { ok: false, msg: testRes.message || $t('models.test.fail') }
+        saving = false
+        return
+      }
+      await onSubmit(buildReq())
+    } catch (e: any) {
+      result = { ok: false, msg: e?.message ?? $t('models.save.fail') }
+      saving = false
+    }
+    // On success the parent typically unmounts this form (closes modal / advances
+    // onboard), so we leave `saving` true to keep the button disabled until then.
+  }
+</script>
+
+<div class="form">
+  <!-- Provider -->
+  <label class="field">
+    <span class="field-label">{$t('models.provider')}</span>
+    <select class="field-input" bind:value={providerId} onchange={onProviderChange} disabled={saving}>
+      <option value="">{$t('models.provider.placeholder')}</option>
+      {#each providers as p (p.id)}
+        <option value={p.id}>{p.name}</option>
+      {/each}
+    </select>
+    {#if preset?.website_url}
+      <a class="field-link" href={preset.website_url} target="_blank" rel="noreferrer">{$t('models.get_apikey')}</a>
+    {/if}
+  </label>
+
+  <!-- Protocol (Custom vendor only — named vendors pin their own wire format) -->
+  {#if isCustom}
+    <label class="field">
+      <span class="field-label">{$t('models.protocol')}</span>
+      <select class="field-input" bind:value={protocol} disabled={saving}>
+        <option value="openai">{$t('models.protocol.openai')}</option>
+        <option value="anthropic">{$t('models.protocol.anthropic')}</option>
+        <option value="openai-responses">{$t('models.protocol.openai_responses')}</option>
+      </select>
+    </label>
+  {/if}
+
+  <!-- Model -->
+  <label class="field">
+    <span class="field-label">{$t('models.model')}</span>
+    <!-- Use a real <select> dropdown when the provider has a model catalogue,
+         so users can see and pick from all available options. Fall back to a
+         free-text input for the custom vendor with no preset model list. -->
+    {#if preset && preset.models && preset.models.length > 0}
+      <select class="field-input mono" bind:value={model} onchange={applyPresetVision} disabled={saving}>
+        {#each preset.models as m}
+          <option value={m}>{m}</option>
+        {/each}
+      </select>
+    {:else}
+      <input
+        class="field-input mono"
+        type="text"
+        placeholder={$t('models.model.placeholder')}
+        bind:value={model}
+        disabled={saving}
+      />
+    {/if}
+  </label>
+
+  <!-- Context window (Custom only — named vendors' models are in the built-in table) -->
+  {#if isCustom}
+    <label class="field">
+      <span class="field-label">{$t('settings.endpoints.context_window')}</span>
+      <input
+        class="field-input mono"
+        type="text"
+        placeholder={$t('settings.endpoints.context_window.placeholder')}
+        bind:value={ctxWin}
+        disabled={saving}
+      />
+    </label>
+    <!-- With prefs hidden (onboard) a named vendor's vision comes from its
+         catalogue, but a Custom model has no entry, so the user answers. -->
+    {#if !showPrefs}
+      <div class="toggles">
+        <div class="toggle-row">
+          <span class="toggle-label">{$t('models.vision')}</span>
+          <Switch bind:checked={vision} />
+        </div>
+      </div>
+    {/if}
+  {/if}
+
+  <!-- Base URL -->
+  <label class="field">
+    <span class="field-label">{$t('models.baseurl')}</span>
+    <input
+      class="field-input mono"
+      type="text"
+      placeholder={$t('models.baseurl.placeholder')}
+      bind:value={baseUrl}
+      readonly={baseUrlLocked}
+      disabled={saving}
+    />
+    <VariantChips {variants} value={baseUrl} disabled={saving} onselect={(v) => (baseUrl = v.base_url)} />
+  </label>
+
+  <!-- API Key -->
+  <label class="field">
+    <span class="field-label">{$t('models.apikey')}</span>
+    <ApiKeyInput bind:value={apiKey} placeholder={keyPlaceholder} disabled={saving} />
+  </label>
+
+  <!-- Preferences (hidden during onboard — the /onboard ceremony collects them) -->
+  {#if showPrefs}
+    <div class="prefs">
+      <label class="field half">
+        <span class="field-label">{$t('models.permission_mode')}</span>
+        <select class="field-input" bind:value={permMode} disabled={saving}>
+          <option value="interactive">{$t('models.permission_mode.interactive')}</option>
+          <option value="auto">{$t('models.permission_mode.auto')}</option>
+        </select>
+      </label>
+      <label class="field half">
+        <span class="field-label">{$t('models.reasoning_effort')}</span>
+        <select class="field-input" bind:value={reasoning} disabled={saving}>
+          <option value="off">{$t('models.reasoning.off')}</option>
+          <option value="low">{$t('models.reasoning.low')}</option>
+          <option value="medium">{$t('models.reasoning.medium')}</option>
+          <option value="high">{$t('models.reasoning.high')}</option>
+          <option value="xhigh">{$t('models.reasoning.xhigh')}</option>
+          <option value="max">{$t('models.reasoning.max')}</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="toggles">
+      <div class="toggle-row">
+        <span class="toggle-label">{$t('models.show_reasoning')}</span>
+        <Switch bind:checked={showReason} />
+      </div>
+      <div class="toggle-row">
+        <span class="toggle-label">{$t('models.vision')}</span>
+        <Switch bind:checked={vision} />
+      </div>
+    </div>
+  {/if}
+
+  <!-- Result -->
+  {#if result}
+    <div class="result" class:ok={result.ok} class:fail={!result.ok}>
+      {result.ok ? '✓' : '✗'} {result.msg}
+    </div>
+  {/if}
+
+  <!-- Actions -->
+  <div class="actions">
+    <button class="btn-secondary" onclick={handleTest} disabled={testing || saving}>
+      {testing ? $t('models.btn.testing') : $t('models.btn.test')}
+    </button>
+    <button class="btn-primary" onclick={handleSubmit} disabled={saving || testing}>
+      {saving ? $t('models.btn.saving') : submitLabel}
+    </button>
+  </div>
+</div>
+
+<style>
+.form { display: flex; flex-direction: column; gap: 16px; }
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field-label { font-size: 13px; font-weight: 500; color: var(--text-secondary); }
+.field-input {
+  font-family: inherit; font-size: 14px; color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 11px; outline: none; background: var(--bg-container);
+  transition: border-color 0.15s;
+}
+.field-input:focus { border-color: var(--blue-6); box-shadow: 0 0 0 2px var(--focus-ring); }
+.field-input[readonly], .field-input:disabled { background: var(--bg-table-header); cursor: not-allowed; }
+.field-link { font-size: 12px; color: var(--blue-6); text-decoration: none; align-self: flex-start; }
+.field-link:hover { text-decoration: underline; }
+.mono { font-family: var(--font-mono); }
+.prefs { display: flex; gap: 12px; }
+.field.half { flex: 1; min-width: 0; }
+.toggles { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; }
+.toggle-row + .toggle-row { border-top: 1px solid var(--border); }
+.toggle-label { font-size: 13px; color: var(--text-secondary); }
+.result { font-size: 13px; padding: 8px 12px; border-radius: 8px; }
+.result.ok { background: var(--surface-info); color: var(--success); }
+.result.fail { background: var(--warning-bg); color: var(--error); }
+.actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.btn-primary {
+  height: 34px; padding: 0 16px; border: none; background: var(--blue-6); border-radius: 6px;
+  font-size: 14px; color: var(--on-accent); cursor: pointer; font-family: inherit;
+}
+.btn-primary:hover:not(:disabled) { background: var(--blue-5); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-secondary {
+  height: 34px; padding: 0 16px; border: 1px solid var(--border); background: var(--bg-container);
+  border-radius: 6px; font-size: 13px; color: var(--text-secondary); cursor: pointer; font-family: inherit;
+}
+.btn-secondary:hover:not(:disabled) { border-color: var(--blue-5); color: var(--blue-5); }
+.btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; }
+</style>

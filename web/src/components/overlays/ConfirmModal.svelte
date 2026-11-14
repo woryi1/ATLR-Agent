@@ -1,0 +1,240 @@
+<script lang="ts">
+  import { confirmModals, activeSessionId } from '../../lib/stores'
+  import { ws } from '../../lib/ws'
+  import { t } from '../../lib/i18n'
+  import StatusTag from '../ui/StatusTag.svelte'
+
+  let modalEl = $state<HTMLDivElement | null>(null)
+
+  // Only the ACTIVE session's confirmation renders as a modal. Non-active
+  // session confirmations are stored in confirmModals but don't interrupt —
+  // the sidebar's pending_confirmation badge (via session_activity) alerts
+  // the user instead.
+  const current = $derived($activeSessionId ? $confirmModals[$activeSessionId] : undefined)
+
+  // Focus the modal whenever it (re)opens, same as AuthGate/CommandPalette —
+  // review caught that a window-level keydown listener without stealing
+  // focus leaves the chat composer's textarea focused underneath the
+  // backdrop. Enter there both sends the composer's draft AND (via bubbling)
+  // approved the pending tool call — approving blind again, just via
+  // keyboard instead of the backdrop click this fix closed off.
+  $effect(() => {
+    if (current && modalEl) modalEl.focus()
+  })
+
+  function clearCurrent() {
+    const sid = current?.sessionId
+    if (!sid) return
+    confirmModals.update(m => {
+      const n = { ...m }
+      delete n[sid]
+      return n
+    })
+  }
+
+  function deny() {
+    if (!current) return
+    ws.answerConfirmation(current.id, 'deny')
+    clearCurrent()
+  }
+
+  function answer(result: string) {
+    if (!current) return
+    ws.answerConfirmation(current.id, result)
+    clearCurrent()
+  }
+
+  // #1105: Esc / Enter, matching AuthGate / CommandPalette. Bound on the
+  // modal element itself (focused via the $effect above), not on
+  // svelte:window — a window-level listener fires *in addition to*
+  // whatever element already has focus, which was the composer textarea.
+  // Enter maps to the primary action — for a permission ask that's now
+  // "allow once" (the least-privilege choice), not "allow for session".
+  function onKeydown(e: KeyboardEvent) {
+    if (!current) return
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      current.kind === 'ok' ? answer('ok') : deny()
+    } else if (e.key === 'Enter') {
+      e.preventDefault()
+      answer(current.kind === 'ok' ? 'ok' : 'yes')
+    }
+  }
+
+  // #1105: diff line classification, same rule ToolGroup.svelte uses for
+  // the post-execution edit card — kept in sync so the preview and the
+  // result look identical.
+  function diffLineClass(line: string): string {
+    if (line.startsWith('@@')) return 'diff-hdr'
+    if (line.startsWith('-')) return 'diff-line rm'
+    if (line.startsWith('+')) return 'diff-line add'
+    return 'diff-line plain'
+  }
+</script>
+
+{#if current}
+<!-- #1105: backdrop no longer denies on click — a stray click used to
+     silently cancel the pending tool call mid-turn. Dismissal now requires
+     an explicit button or Esc. -->
+<div class="backdrop" role="presentation">
+  <div class="modal" role="dialog" aria-modal="true" tabindex="-1" bind:this={modalEl} onkeydown={onKeydown}>
+    <div class="modal-header">
+      <iconify-icon icon="ant-design:safety-outlined" width="16" style="color:var(--warning);flex-shrink:0"></iconify-icon>
+      <span class="modal-title">{$t('perm.title')}</span>
+      <span class="header-tag">
+        <StatusTag status="warning">{$t('perm.awaiting')}</StatusTag>
+      </span>
+    </div>
+
+    <div class="modal-body">
+      {#if current.message}
+        <p class="desc">{current.message}</p>
+      {/if}
+      {#if current.command}
+        <pre class="terminal"><span class="prompt">$</span> {current.command}</pre>
+      {:else if current.diff}
+        <div class="diff-block">
+          {#each current.diff.split('\n') as line}
+            <div class={diffLineClass(line)}>{line}</div>
+          {/each}
+        </div>
+      {:else if current.input}
+        <pre class="terminal">{current.input}</pre>
+      {:else if current.content}
+        <pre class="terminal">{current.content}</pre>
+      {/if}
+    </div>
+
+    <div class="modal-footer">
+      {#if current.kind === 'ok'}
+        <button class="btn-primary" onclick={() => answer('ok')}>{$t('common.ok')}</button>
+      {:else}
+        <button class="btn-deny" onclick={deny}>
+          <iconify-icon icon="ant-design:close-outlined" width="12"></iconify-icon>
+          {$t('perm.deny')}
+        </button>
+        <span class="spacer"></span>
+        <!-- Result strings are the wire contract with the server's mapConfirmResult:
+             'yes' = allow once, 'always' = allow + remember for the session.
+             Anything else (incl. 'deny') denies. Don't rename without updating the server.
+             #1105: "allow once" is now the primary (blue) button — the most
+             prominent action should be the least permissive one, not
+             "allow for session". -->
+        <button class="btn-primary" onclick={() => answer('yes')}>
+          <iconify-icon icon="ant-design:check-outlined" width="12"></iconify-icon>
+          {$t('perm.allow_once')}
+        </button>
+        <button class="btn-secondary" onclick={() => answer('always')}>{$t('perm.allow_session')}</button>
+      {/if}
+    </div>
+  </div>
+</div>
+{/if}
+
+<style>
+.backdrop {
+  position: fixed; inset: 0; z-index: 1100;
+  background: var(--scrim);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.modal {
+  width: 100%; max-width: 480px;
+  /* #2103: --warning-bg is a translucent tint meant for badges and notices
+     that already sit on an opaque surface. As a floating panel's background
+     it left the whole dialog at 16% opacity, so the chat behind it bled
+     through the very content being approved. Layer the tint over an opaque
+     surface instead — same warm colour, nothing shows through. */
+  background: linear-gradient(var(--warning-bg), var(--warning-bg)), var(--bg-container);
+  border: 1px solid var(--warning-border);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 16px 48px rgba(0,0,0,0.18);
+  animation: octo-fadein 0.16s ease;
+}
+/* The modal itself is the focus target (see the $effect above) so Enter/Esc
+   don't leak to whatever was focused underneath (e.g. the chat composer). */
+.modal:focus { outline: none; }
+.modal-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--warning-border);
+}
+.modal-title {
+  font-size: 14px; font-weight: 600; color: var(--text-heading); flex: 1;
+}
+.header-tag {
+  margin-left: auto; flex-shrink: 0;
+}
+.modal-body {
+  padding: 16px 18px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.desc {
+  margin: 0;
+  /* #2103: full-strength text, not --text-secondary. This line says what is
+     about to be approved, and against the tinted panel the secondary grey
+     lands at ~3.2:1 (light) / ~3.6:1 (dark) — under the 4.5:1 AA floor for
+     13px. The rest of the modal's greys are chrome; this one is content. */
+  font-size: 13px; line-height: 1.6; color: var(--text);
+}
+.terminal {
+  margin: 0; padding: 10px 12px;
+  background: var(--terminal-bg); color: var(--terminal-text);
+  border-radius: 6px;
+  font-size: 12px; line-height: 1.6;
+  font-family: var(--font-mono);
+  overflow-x: auto; overflow-y: auto; max-height: 220px;
+  white-space: pre-wrap; word-break: break-all;
+}
+.prompt { color: var(--success); }
+/* #1105: edit_file preview — same classification/coloring ToolGroup.svelte
+   uses for the post-execution diff card, scoped to this modal's spacing. */
+.diff-block {
+  /* #2103: its own surface, so the half-opaque add/rm line fills blend with
+     the neutral container the way they do in ToolGroup's diff card, not with
+     the modal's orange tint. */
+  background: var(--bg-container);
+  border: 1px solid var(--border); border-radius: 6px;
+  overflow: hidden; overflow-y: auto; max-height: 220px;
+  font-size: 12px; line-height: 1.6;
+  font-family: var(--font-mono);
+}
+.diff-hdr { padding: 4px 10px; color: var(--text-tertiary); }
+.diff-line { padding: 1px 10px; white-space: pre-wrap; word-break: break-all; }
+.diff-line.rm { background: var(--error-bg); color: var(--error-dark); border-left: 2px solid var(--error); }
+.diff-line.add { background: var(--success-bg); color: var(--success-text); border-left: 2px solid var(--success); }
+.diff-line.plain { color: var(--text-secondary); }
+.modal-footer {
+  padding: 12px 18px;
+  border-top: 1px solid var(--warning-border);
+  display: flex; align-items: center; gap: 8px;
+}
+.spacer { flex: 1; }
+.btn-deny {
+  height: 32px; padding: 0 12px;
+  border: 1px solid var(--border); background: var(--bg-container);
+  border-radius: 6px;
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--text-secondary);
+  cursor: pointer; font-family: inherit;
+}
+.btn-deny:hover { border-color: var(--error); color: var(--error); }
+.btn-secondary {
+  height: 32px; padding: 0 12px;
+  border: 1px solid var(--border); background: var(--bg-container);
+  border-radius: 6px;
+  font-size: 13px; color: var(--text-secondary);
+  cursor: pointer; font-family: inherit;
+}
+.btn-secondary:hover { border-color: var(--blue-5); color: var(--blue-5); }
+.btn-primary {
+  height: 32px; padding: 0 14px;
+  border: none; background: var(--blue-6);
+  border-radius: 6px;
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--on-accent);
+  cursor: pointer; font-family: inherit;
+}
+.btn-primary:hover { background: var(--blue-5); }
+</style>

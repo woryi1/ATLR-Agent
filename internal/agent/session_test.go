@@ -1,0 +1,1164 @@
+package agent
+
+import (
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/datahome"
+)
+
+// setTempHome redirects both HOME (Unix) and USERPROFILE (Windows) to tmp so
+// sessionsDir() stays inside the test sandbox on all platforms.
+func setTempHome(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp) // Windows: os.UserHomeDir() reads USERPROFILE
+	return tmp
+}
+
+func TestSessionsDirUsesProfile(t *testing.T) {
+	home := setTempHome(t)
+	t.Setenv(datahome.ProfileEnv, "work")
+
+	dir, err := SessionsDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, ".octo-work", "sessions"); dir != want {
+		t.Errorf("sessions dir = %q, want %q", dir, want)
+	}
+}
+
+func TestNewSession(t *testing.T) {
+	s := NewSession("claude-haiku-4-5-20251001", "be helpful")
+	if s.ID == "" {
+		t.Fatal("expected non-empty ID")
+	}
+	if s.Model != "claude-haiku-4-5-20251001" {
+		t.Errorf("model = %q, want %q", s.Model, "claude-haiku-4-5-20251001")
+	}
+	if s.System != "be helpful" {
+		t.Errorf("system = %q, want %q", s.System, "be helpful")
+	}
+	if s.CreatedAt.IsZero() {
+		t.Error("CreatedAt must be set")
+	}
+}
+
+func TestSessionSourceRoundTrip(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Source = "cron"
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if got.Source != "cron" {
+		t.Fatalf("Source = %q, want %q", got.Source, "cron")
+	}
+}
+
+func TestSessionHookStartedRoundTrip(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	if s.HookStarted {
+		t.Fatal("new session must start with HookStarted=false")
+	}
+	s.MarkHookStarted()
+	if !s.HookStarted || !s.forceRewrite {
+		t.Fatalf("MarkHookStarted should set the flag and force a rewrite; got started=%v forceRewrite=%v", s.HookStarted, s.forceRewrite)
+	}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if !got.HookStarted {
+		t.Fatal("HookStarted did not survive the round trip")
+	}
+}
+
+func TestSessionLeaseSurvivesForcedRewrite(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Messages = append(s.Messages, NewUserMessage("hi"))
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := s.WriteLease("web", time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("WriteLease: %v", err)
+	}
+	// MarkHookStarted (first-turn SessionStart) forces the next Save to rewrite
+	// the whole file, which must NOT drop the append-only lease record.
+	s.MarkHookStarted()
+	s.Messages = append(s.Messages, NewAssistantMessage("ok"))
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save (rewrite): %v", err)
+	}
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if holder, active := got.LeaseActive(); !active || holder != "web" {
+		t.Errorf("lease lost across forced rewrite: active=%v holder=%q, want active web", active, holder)
+	}
+}
+
+func TestSessionIDFormat(t *testing.T) {
+	s := NewSession("m", "")
+	// YYYYMMDD-HHMMSS-xxxxxxxx — 24 chars (15 timestamp + '-' + 8 hex suffix).
+	if len(s.ID) != 24 {
+		t.Errorf("ID len = %d, want 24 (got %q)", len(s.ID), s.ID)
+	}
+	if s.ID[8] != '-' || s.ID[15] != '-' {
+		t.Errorf("ID separators wrong: %q", s.ID)
+	}
+}
+
+func TestSessionID_NoCollisionSameSecond(t *testing.T) {
+	// Two sessions created back-to-back (same second) must get distinct IDs,
+	// so their save files don't clobber each other.
+	seen := map[string]bool{}
+	for i := 0; i < 100; i++ {
+		id := NewSession("m", "").ID
+		if seen[id] {
+			t.Fatalf("duplicate session ID within the same second: %q", id)
+		}
+		seen[id] = true
+	}
+}
+
+func TestTurnCount(t *testing.T) {
+	s := NewSession("m", "")
+	if s.TurnCount() != 0 {
+		t.Errorf("TurnCount = %d, want 0", s.TurnCount())
+	}
+	s.Messages = []Message{
+		NewUserMessage("hi"),
+		NewAssistantMessage("hello"),
+		NewUserMessage("bye"),
+		NewAssistantMessage("goodbye"),
+	}
+	if s.TurnCount() != 2 {
+		t.Errorf("TurnCount = %d, want 2", s.TurnCount())
+	}
+}
+
+func TestSaveAndLoad(t *testing.T) {
+	// Point sessions dir at a temp directory so we don't pollute ~/.octo.
+	setTempHome(t)
+
+	s := NewSession("model-x", "sys")
+	s.Messages = []Message{
+		NewUserMessage("ping"),
+		NewAssistantMessage("pong"),
+	}
+
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+
+	if got.ID != s.ID {
+		t.Errorf("ID: got %q, want %q", got.ID, s.ID)
+	}
+	if got.Model != "model-x" {
+		t.Errorf("Model: got %q, want %q", got.Model, "model-x")
+	}
+	if len(got.Messages) != 2 {
+		t.Errorf("Messages len: got %d, want 2", len(got.Messages))
+	}
+	if got.Messages[0].Content != "ping" {
+		t.Errorf("Messages[0].Content: got %q, want %q", got.Messages[0].Content, "ping")
+	}
+}
+
+func TestSave_AppendsIncrementally(t *testing.T) {
+	setTempHome(t)
+
+	s := NewSession("m", "sys")
+	s.Messages = []Message{NewUserMessage("u1"), NewAssistantMessage("a1")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	// Add a second turn and save again — should append, not rewrite.
+	s.Messages = append(s.Messages, NewUserMessage("u2"), NewAssistantMessage("a2"))
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != 4 {
+		t.Fatalf("loaded %d messages, want 4", len(got.Messages))
+	}
+	for i, want := range []string{"u1", "a1", "u2", "a2"} {
+		if got.Messages[i].Content != want {
+			t.Errorf("Messages[%d] = %q, want %q", i, got.Messages[i].Content, want)
+		}
+	}
+}
+
+func TestSave_RewritesWhenHistoryShrinks(t *testing.T) {
+	// Simulates compaction: history is rewritten to fewer messages. Save must
+	// rewrite the file from scratch, not append, so the load reflects the
+	// shrunk history.
+	setTempHome(t)
+
+	s := NewSession("m", "")
+	for i := 0; i < 6; i++ {
+		s.Messages = append(s.Messages, NewUserMessage("x"))
+	}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Compaction replaces the 6 with a summary + 1 kept.
+	s.Messages = []Message{NewUserMessage("[summary]"), NewAssistantMessage("kept")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != 2 {
+		t.Fatalf("loaded %d messages, want 2 (file should have been rewritten)", len(got.Messages))
+	}
+	if got.Messages[0].Content != "[summary]" {
+		t.Errorf("Messages[0] = %q, want '[summary]'", got.Messages[0].Content)
+	}
+}
+
+func TestSetTitle_AppendsAndReloads(t *testing.T) {
+	// A title set after the first Save is appended as its own record (the meta
+	// header on disk is left untouched) and survives a reload.
+	setTempHome(t)
+
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("ping"), NewAssistantMessage("pong")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTitle("  Fix the login bug  "); err != nil {
+		t.Fatalf("SetTitle: %v", err)
+	}
+
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "Fix the login bug" {
+		t.Errorf("Title = %q, want %q (trimmed)", got.Title, "Fix the login bug")
+	}
+	// Messages must be intact alongside the appended title record.
+	if len(got.Messages) != 2 {
+		t.Errorf("Messages len = %d, want 2", len(got.Messages))
+	}
+}
+
+func TestSetTitle_NeverCreatesOrphanFile(t *testing.T) {
+	// A session that believes it is persisted but whose transcript is gone
+	// (deleted meanwhile, or the path resolves to a different HOME than the
+	// one it was saved under) must NOT materialize a file holding nothing but
+	// a title record — those show up as ghost sessions in list views.
+	setTempHome(t)
+
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("ping"), NewAssistantMessage("pong")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	path, err := s.SavePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetTitle("ghost"); err == nil {
+		t.Fatal("SetTitle on a missing transcript: want error, got nil")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("SetTitle created an orphan title-only file at %s", path)
+	}
+}
+
+func TestSetTitle_LastWins(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("ping")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTitle("first"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTitle("second"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "second" {
+		t.Errorf("Title = %q, want %q (last title record wins)", got.Title, "second")
+	}
+}
+
+func TestSetTitle_SurvivesCompaction(t *testing.T) {
+	// A history-shrinking Save (compaction) rewrites the file; the title must be
+	// folded back into the meta header rather than lost with the dropped lines.
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("u1"), NewAssistantMessage("a1"), NewUserMessage("u2")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTitle("kept title"); err != nil {
+		t.Fatal(err)
+	}
+	s.Messages = []Message{NewUserMessage("[summary]")} // shorter → rewriteAll
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "kept title" {
+		t.Errorf("Title = %q, want %q after compaction", got.Title, "kept title")
+	}
+}
+
+func TestSetTitle_BeforeSave(t *testing.T) {
+	// Setting a title on a never-saved session keeps it in memory; the first
+	// Save then persists it via the meta header (no file to append to yet).
+	setTempHome(t)
+	s := NewSession("m", "")
+	if err := s.SetTitle("early"); err != nil {
+		t.Fatal(err)
+	}
+	s.Messages = []Message{NewUserMessage("hi")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "early" {
+		t.Errorf("Title = %q, want %q", got.Title, "early")
+	}
+}
+
+func TestDisplayTitle(t *testing.T) {
+	tests := []struct {
+		name string
+		s    *Session
+		want string
+	}{
+		{
+			name: "explicit title wins",
+			s:    &Session{Title: "My Title", Messages: []Message{NewUserMessage("ignored")}},
+			want: "My Title",
+		},
+		{
+			name: "falls back to first user message",
+			s:    &Session{Messages: []Message{NewUserMessage("help me refactor the parser")}},
+			want: "help me refactor the parser",
+		},
+		{
+			name: "strips system-reminder and takes first real line",
+			s: &Session{Messages: []Message{NewUserMessage(
+				"<system-reminder>injected context</system-reminder>\n\nreal question here")}},
+			want: "real question here",
+		},
+		{
+			name: "skips a leading tool-result user turn",
+			s: &Session{Messages: []Message{
+				NewToolResultMessage([]ContentBlock{NewToolResultBlock("id", "out", false)}),
+				NewUserMessage("the actual prompt"),
+			}},
+			want: "the actual prompt",
+		},
+		{
+			name: "untitled when empty",
+			s:    &Session{},
+			want: "*Octo Agent",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.s.DisplayTitle(); got != tt.want {
+				t.Errorf("DisplayTitle() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestTruncateSnippet pins the display-width truncation strategy: a 50
+// half-width-column budget (25 full-width CJK chars ≈ eight English words),
+// wide runes counting double, cuts snapped back to Latin word boundaries,
+// and an ellipsis only when content was actually dropped.
+func TestTruncateSnippet(t *testing.T) {
+	cases := map[string]string{
+		// Fits within the budget — returned unchanged, no ellipsis.
+		"hello there":                "hello there",
+		"please fix the login bug":   "please fix the login bug",   // 24 cols
+		"帮我 review 一下这个 PR 的改动":      "帮我 review 一下这个 PR 的改动",      // mixed, 30 cols
+		"Ask user question 组件遮挡屏幕内容": "Ask user question 组件遮挡屏幕内容", // mixed, 34 cols
+
+		// English over budget: cut snaps back to the last word boundary —
+		// "pooling" is dropped whole rather than left as "pool…".
+		"improve concurrency handling around connection pooling internals": "improve concurrency handling around connection…",
+
+		// CJK over budget: characters are semantic units, cut anywhere —
+		// 25 full-width chars fill the budget exactly.
+		"修复登录页面的无限重定向问题并补充测试用例覆盖所有分支": "修复登录页面的无限重定向问题并补充测试用例覆盖所有…",
+
+		// Mixed over budget: the English prefix spends budget too, so fewer
+		// CJK chars fit.
+		"fix: 修复登录页面的无限重定向问题并补充测试用例覆盖所有分支": "fix: 修复登录页面的无限重定向问题并补充测试用例覆…",
+
+		// One unbroken overlong token (URL/hash): no word boundary to snap
+		// to, so it hard-cuts at the budget.
+		"abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwx": "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmn…",
+	}
+	for in, want := range cases {
+		if got := truncateSnippet(in); got != want {
+			t.Errorf("truncateSnippet(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSavePath_IsJSONL(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	path, err := s.SavePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Ext(path) != ".jsonl" {
+		t.Errorf("SavePath ext = %q, want .jsonl", filepath.Ext(path))
+	}
+}
+
+func TestLoadSession_NotFound(t *testing.T) {
+	setTempHome(t)
+
+	_, err := LoadSession("19991231-235959")
+	if err == nil {
+		t.Fatal("expected error for missing session")
+	}
+}
+
+func TestLoadSession_RejectsTraversal(t *testing.T) {
+	setTempHome(t)
+
+	// Session ids reach LoadSession straight from HTTP/WS requests, so a
+	// traversal payload must be refused before it can resolve outside
+	// ~/.octo/sessions (go/path-injection).
+	for _, id := range []string{
+		"../../../etc/passwd",
+		"..",
+		"foo/bar",
+		"/etc/passwd",
+		"",
+	} {
+		if _, err := LoadSession(id); err == nil {
+			t.Errorf("LoadSession(%q): expected rejection, got nil error", id)
+		}
+	}
+}
+
+func TestLoadSession_StripDotJSON(t *testing.T) {
+	setTempHome(t)
+
+	s := NewSession("m", "")
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	got, err := LoadSession(s.ID + ".json")
+	if err != nil {
+		t.Fatalf("LoadSession with .json suffix: %v", err)
+	}
+	if got.ID != s.ID {
+		t.Errorf("ID mismatch: got %q, want %q", got.ID, s.ID)
+	}
+}
+
+func TestListSessions(t *testing.T) {
+	setTempHome(t)
+
+	// Save 3 sessions, then stamp distinct file mtimes so ordering (newest
+	// first, by mtime) is deterministic.
+	ids := make([]string, 3)
+	base := time.Now()
+	for i := 0; i < 3; i++ {
+		s := &Session{ID: "20260101-00000" + string(rune('0'+i)), CreatedAt: base, Model: "m"}
+		if err := s.Save(); err != nil {
+			t.Fatal(err)
+		}
+		ids[i] = s.ID
+		path, _ := s.SavePath()
+		mod := base.Add(time.Duration(i) * time.Hour)
+		if err := os.Chtimes(path, mod, mod); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sessions, err := ListSessions(10)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 3 {
+		t.Fatalf("got %d sessions, want 3", len(sessions))
+	}
+	// Newest mtime first → the last-stamped (index 2) leads.
+	if sessions[0].ID != ids[2] {
+		t.Errorf("sessions[0].ID = %q, want %q (newest mtime)", sessions[0].ID, ids[2])
+	}
+}
+
+// TestListSessions_SkipsAgentEventsSidecar: the server writes a sub-agent
+// event trail beside each transcript as <id>.agent-events.jsonl. It shares the
+// extension, so a bare suffix test lists it as a session in its own right —
+// one whose first line is an event rather than a meta record, so it loads with
+// no title and renders as a ghost "*Octo Agent" row next to the real session.
+func TestListSessions_SkipsAgentEventsSidecar(t *testing.T) {
+	setTempHome(t)
+	s := seedSession(t, "20260101-000000-aaaaaaaa")
+
+	dir, err := SessionsDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sidecar := filepath.Join(dir, s.ID+AgentEventsSuffix)
+	if err := os.WriteFile(sidecar, []byte(`{"kind":"tool","agent_id":"agent_1"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Newer mtime than the transcript: if it were listed it would sort first,
+	// which is exactly how it surfaced at the top of the sidebar.
+	mod := time.Now().Add(time.Hour)
+	if err := os.Chtimes(sidecar, mod, mod); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, err := ListSessions(10)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != s.ID {
+		var got []string
+		for _, sess := range sessions {
+			got = append(got, sess.ID)
+		}
+		t.Fatalf("ListSessions = %v, want just %q", got, s.ID)
+	}
+
+	ids, err := listSessionIDs()
+	if err != nil {
+		t.Fatalf("listSessionIDs: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != s.ID {
+		t.Errorf("listSessionIDs = %v, want just %q", ids, s.ID)
+	}
+
+	// "last" resolves by mtime, so the sidecar would win it outright.
+	last, err := ResolveSessionID("last")
+	if err != nil {
+		t.Fatalf("ResolveSessionID(last): %v", err)
+	}
+	if last != s.ID {
+		t.Errorf("ResolveSessionID(last) = %q, want %q", last, s.ID)
+	}
+}
+
+// TestSidecarIDIsNotAddressable: the containment rules on a caller-supplied id
+// only stop it escaping the sessions directory, and "<id>.agent-events" escapes
+// nothing — it is a plain stem that lands squarely on another session's event
+// trail. Reading one back as a session is merely wrong; deleting or rewriting
+// one is destruction, and these ids reach the path layer straight from HTTP.
+func TestSidecarIDIsNotAddressable(t *testing.T) {
+	setTempHome(t)
+	real := seedSession(t, "20260101-000000-aaaaaaaa")
+
+	dir, err := SessionsDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sidecar := filepath.Join(dir, real.ID+AgentEventsSuffix)
+	if err := os.WriteFile(sidecar, []byte(`{"kind":"tool","agent_id":"agent_1"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ghost := real.ID + ".agent-events"
+	if _, err := LoadSession(ghost); err == nil {
+		t.Errorf("LoadSession(%q) succeeded; a sidecar is not a session", ghost)
+	}
+	if err := DeleteSession(ghost); err == nil {
+		t.Errorf("DeleteSession(%q) succeeded", ghost)
+	}
+	if _, err := os.Stat(sidecar); err != nil {
+		t.Errorf("sidecar gone after a rejected delete: %v", err)
+	}
+	if got, err := ResolveSessionID(ghost); err == nil {
+		t.Errorf("ResolveSessionID(%q) = %q, want an error", ghost, got)
+	}
+
+	// The real session stays reachable by every one of those routes.
+	if _, err := LoadSession(real.ID); err != nil {
+		t.Errorf("LoadSession(%q): %v", real.ID, err)
+	}
+	if got, err := ResolveSessionID(real.ID); err != nil || got != real.ID {
+		t.Errorf("ResolveSessionID(%q) = %q, %v", real.ID, got, err)
+	}
+	if err := DeleteSession(real.ID); err != nil {
+		t.Errorf("DeleteSession(%q): %v", real.ID, err)
+	}
+}
+
+func TestListSessions_Limit(t *testing.T) {
+	setTempHome(t)
+
+	for i := 0; i < 5; i++ {
+		s := &Session{ID: "20260101-00000" + string(rune('0'+i)), CreatedAt: time.Now(), Model: "m"}
+		if err := s.Save(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sessions, err := ListSessions(3)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 3 {
+		t.Errorf("got %d sessions with limit 3", len(sessions))
+	}
+}
+
+func TestSyncFrom(t *testing.T) {
+	s := NewSession("m", "")
+	h := NewHistory()
+	h.Append(NewUserMessage("hello"))
+	h.Append(NewAssistantMessage("world"))
+
+	s.SyncFrom(h)
+
+	if len(s.Messages) != 2 {
+		t.Errorf("Messages len = %d, want 2", len(s.Messages))
+	}
+}
+
+func TestToHistory(t *testing.T) {
+	s := NewSession("m", "")
+	s.Messages = []Message{
+		NewUserMessage("a"),
+		NewAssistantMessage("b"),
+	}
+	h := s.ToHistory()
+	if h.Len() != 2 {
+		t.Errorf("History.Len() = %d, want 2", h.Len())
+	}
+	snap := h.Snapshot()
+	if snap[0].Content != "a" {
+		t.Errorf("snap[0].Content = %q, want %q", snap[0].Content, "a")
+	}
+}
+
+func TestShortID(t *testing.T) {
+	s := &Session{ID: "20260528-171234-a3b2c1d4"}
+	if got := s.ShortID(); got != "a3b2c1d4" {
+		t.Errorf("ShortID = %q, want %q", got, "a3b2c1d4")
+	}
+	// Degenerate IDs (shorter than 8 chars) round-trip whole.
+	short := &Session{ID: "abc"}
+	if got := short.ShortID(); got != "abc" {
+		t.Errorf("ShortID = %q, want %q", got, "abc")
+	}
+}
+
+// seedSession creates and saves a session with a synthetic ID we control,
+// so resolver tests can target known prefixes/suffixes.
+func seedSession(t *testing.T, id string) *Session {
+	t.Helper()
+	s := &Session{ID: id, CreatedAt: time.Now(), Model: "test-model"}
+	s.Messages = []Message{{Role: "user", Content: "hi"}}
+	if err := s.Save(); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+	return s
+}
+
+func TestResolveSessionID_Last(t *testing.T) {
+	setTempHome(t)
+	if _, err := ResolveSessionID("last"); err == nil {
+		t.Fatal("expected error when no sessions exist")
+	}
+	seedSession(t, "20260101-000000-aaaaaaaa")
+	// Sleep so mtimes are distinguishable across the two files.
+	time.Sleep(20 * time.Millisecond)
+	newest := seedSession(t, "20260201-000000-bbbbbbbb")
+
+	got, err := ResolveSessionID("last")
+	if err != nil {
+		t.Fatalf("ResolveSessionID(last): %v", err)
+	}
+	if got != newest.ID {
+		t.Errorf("got %q, want %q (newest)", got, newest.ID)
+	}
+}
+
+func TestResolveSessionID_SubstringUnique(t *testing.T) {
+	setTempHome(t)
+	a := seedSession(t, "20260101-000000-aaaaaaaa")
+	seedSession(t, "20260201-000000-bbbbbbbb")
+
+	got, err := ResolveSessionID("aaaaaaaa")
+	if err != nil {
+		t.Fatalf("substring resolve: %v", err)
+	}
+	if got != a.ID {
+		t.Errorf("got %q, want %q", got, a.ID)
+	}
+}
+
+func TestResolveSessionID_Ambiguous(t *testing.T) {
+	setTempHome(t)
+	seedSession(t, "20260528-100000-aaaaaaaa")
+	seedSession(t, "20260528-110000-aaaaaabb")
+
+	// "aaaaaa" is a substring of both hex suffixes.
+	_, err := ResolveSessionID("aaaaaa")
+	if err == nil {
+		t.Fatal("expected ambiguity error")
+	}
+	msg := err.Error()
+	if !contains(msg, "ambiguous") {
+		t.Errorf("expected 'ambiguous' in error, got: %s", msg)
+	}
+}
+
+func TestResolveSessionID_ExactFullIDFastPath(t *testing.T) {
+	setTempHome(t)
+	s := seedSession(t, "20260528-171234-a3b2c1d4")
+	got, err := ResolveSessionID(s.ID)
+	if err != nil {
+		t.Fatalf("exact resolve: %v", err)
+	}
+	if got != s.ID {
+		t.Errorf("got %q, want %q", got, s.ID)
+	}
+}
+
+func TestResolveSessionID_NoMatch(t *testing.T) {
+	setTempHome(t)
+	seedSession(t, "20260528-100000-aaaaaaaa")
+	if _, err := ResolveSessionID("not-a-real-suffix"); err == nil {
+		t.Fatal("expected no-match error")
+	}
+}
+
+// contains is a tiny local helper so the resolver tests don't pull in
+// strings.Contains via a new import block. Keeps the test additions minimal.
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSessionBind(t *testing.T) {
+	s := NewSession("m", "")
+
+	res, msg, err := s.Bind(EntryTUI, false)
+	if res != Bound || err != nil {
+		t.Fatalf("bind new: %v %v %v", res, msg, err)
+	}
+
+	res, msg, err = s.Bind(EntryTUI, false)
+	if res != AlreadyBound || err != nil {
+		t.Fatalf("bind same: %v %v %v", res, msg, err)
+	}
+
+	res, _, err = s.Bind(EntryWeb, false)
+	if res != Rejected || !errors.Is(err, ErrSessionBoundToOther) {
+		t.Fatalf("bind other without steal: %v %v", res, err)
+	}
+
+	res, msg, err = s.Bind(EntryWeb, true)
+	if res != Stolen || err != nil {
+		t.Fatalf("steal idle: %v %v %v", res, msg, err)
+	}
+	if !s.BoundTo(EntryWeb) {
+		t.Fatal("expected web binding after steal")
+	}
+
+	// Simulate an active turn lease from the current owner; stealing must fail.
+	s.LeaseEntry = EntryWeb
+	s.LeaseExpires = time.Now().Add(time.Minute)
+	res, _, err = s.Bind(EntryTUI, true)
+	if res != Rejected || err == nil {
+		t.Fatalf("steal with active lease should fail: %v %v", res, err)
+	}
+	s.LeaseExpires = time.Time{}
+
+	if !s.Unbind(EntryWeb) {
+		t.Fatal("Unbind should succeed for current entry")
+	}
+	if s.IsBound() {
+		t.Fatal("expected unbound after Unbind")
+	}
+	if s.Unbind(EntryTUI) {
+		t.Fatal("Unbind should fail for non-current entry")
+	}
+}
+
+func TestSession_UsedTools_PlainMessagesIsFalse(t *testing.T) {
+	s := &Session{Messages: []Message{
+		{Role: RoleUser, Content: "hi"},
+		{Role: RoleAssistant, Content: "hello"},
+	}}
+	if s.UsedTools() {
+		t.Error("plain text session should not be UsedTools()")
+	}
+}
+
+func TestSession_UsedTools_ToolUseBlockIsTrue(t *testing.T) {
+	s := &Session{Messages: []Message{
+		{Role: RoleUser, Content: "list files"},
+		{Role: RoleAssistant, Blocks: []ContentBlock{
+			NewTextBlock("I'll list them"),
+			NewToolUseBlock("call_1", "terminal", map[string]any{"command": "ls"}),
+		}},
+	}}
+	if !s.UsedTools() {
+		t.Error("session with a tool_use block should be UsedTools()=true")
+	}
+}
+
+func TestSession_UsedTools_EmptyMessagesIsFalse(t *testing.T) {
+	s := &Session{}
+	if s.UsedTools() {
+		t.Error("empty session should not be UsedTools()")
+	}
+}
+
+func TestDeleteSession(t *testing.T) {
+	home := setTempHome(t)
+
+	s := NewSession("claude-haiku-4-5-20251001", "")
+	s.Messages = []Message{{Role: RoleUser, Content: "hi"}}
+	if err := s.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	if err := DeleteSession(s.ID); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	if _, err := LoadSession(s.ID); err == nil {
+		t.Fatal("session still loadable after delete")
+	}
+
+	// The transcript is gone for good — a session delete bypasses the trash.
+	trashed := 0
+	_ = filepath.WalkDir(filepath.Join(home, ".octo", "trash"), func(_ string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			trashed++
+		}
+		return nil
+	})
+	if trashed != 0 {
+		t.Errorf("deleted session staged %d file(s) in the trash, want 0", trashed)
+	}
+
+	// Deleting a missing session is not an error (idempotent).
+	if err := DeleteSession(s.ID); err != nil {
+		t.Errorf("deleting an already-gone session should be nil, got %v", err)
+	}
+}
+
+func TestDeleteSession_RejectsTraversal(t *testing.T) {
+	setTempHome(t)
+
+	for _, id := range []string{"", "../escape", "sub/dir", "/abs/path"} {
+		if err := DeleteSession(id); err == nil {
+			t.Errorf("DeleteSession(%q) = nil, want error", id)
+		}
+	}
+}
+
+func TestSetModelConfig_AppendsAndReloads(t *testing.T) {
+	// A model binding set after the first Save is appended as its own record
+	// and survives a reload, carrying both the entry name and model string.
+	setTempHome(t)
+
+	s := NewSession("old-model", "")
+	s.Messages = []Message{NewUserMessage("ping"), NewAssistantMessage("pong")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetModelConfig("kimi", "kimi-k2.6"); err != nil {
+		t.Fatalf("SetModelConfig: %v", err)
+	}
+
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ModelConfig != "kimi" || got.Model != "kimi-k2.6" {
+		t.Errorf("reloaded = (%q, %q), want (kimi, kimi-k2.6)", got.ModelConfig, got.Model)
+	}
+	if len(got.Messages) != 2 {
+		t.Errorf("Messages len = %d, want 2", len(got.Messages))
+	}
+
+	// Unbinding (back to the default entry) also survives a reload.
+	if err := got.SetModelConfig("", "claude-sonnet-4-6"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ModelConfig != "" || again.Model != "claude-sonnet-4-6" {
+		t.Errorf("after unbind = (%q, %q), want (\"\", claude-sonnet-4-6)", again.ModelConfig, again.Model)
+	}
+}
+
+func TestSetModelConfig_SurvivesRewrite(t *testing.T) {
+	// A full rewrite (compaction path) folds the binding into the meta header.
+	setTempHome(t)
+
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("ping"), NewAssistantMessage("pong")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetModelConfig("kimi", "kimi-k2.6"); err != nil {
+		t.Fatal(err)
+	}
+	s.forceRewrite = true
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ModelConfig != "kimi" || got.Model != "kimi-k2.6" {
+		t.Errorf("after rewrite = (%q, %q), want (kimi, kimi-k2.6)", got.ModelConfig, got.Model)
+	}
+}
+
+func TestSetModelConfig_BeforeSave(t *testing.T) {
+	// Binding before the first Save just rides the meta header.
+	setTempHome(t)
+
+	s := NewSession("m", "")
+	if err := s.SetModelConfig("kimi", "kimi-k2.6"); err != nil {
+		t.Fatal(err)
+	}
+	s.Messages = []Message{NewUserMessage("ping")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ModelConfig != "kimi" || got.Model != "kimi-k2.6" {
+		t.Errorf("loaded = (%q, %q), want (kimi, kimi-k2.6)", got.ModelConfig, got.Model)
+	}
+}
+
+func TestSetWorkingDir_AppendsAndReloads(t *testing.T) {
+	// A working dir set after the first Save is appended as its own record and
+	// survives a reload; setting a new one wins over the old.
+	setTempHome(t)
+
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("ping"), NewAssistantMessage("pong")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetWorkingDir("/tmp/repo-a"); err != nil {
+		t.Fatalf("SetWorkingDir: %v", err)
+	}
+
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WorkingDir != "/tmp/repo-a" {
+		t.Errorf("reloaded WorkingDir = %q, want /tmp/repo-a", got.WorkingDir)
+	}
+	if len(got.Messages) != 2 {
+		t.Errorf("Messages len = %d, want 2", len(got.Messages))
+	}
+
+	// Last write wins across a reload.
+	if err := got.SetWorkingDir("/tmp/repo-b"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.WorkingDir != "/tmp/repo-b" {
+		t.Errorf("after re-set WorkingDir = %q, want /tmp/repo-b", again.WorkingDir)
+	}
+}
+
+func TestSetWorkingDir_SurvivesRewrite(t *testing.T) {
+	// A full rewrite (compaction path) folds the working dir into the meta header.
+	setTempHome(t)
+
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("ping"), NewAssistantMessage("pong")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetWorkingDir("/tmp/repo-a"); err != nil {
+		t.Fatal(err)
+	}
+	s.forceRewrite = true
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WorkingDir != "/tmp/repo-a" {
+		t.Errorf("after rewrite WorkingDir = %q, want /tmp/repo-a", got.WorkingDir)
+	}
+}
+
+func TestSetWorkingDir_BeforeSave(t *testing.T) {
+	// A working dir set before the first Save just rides the meta header.
+	setTempHome(t)
+
+	s := NewSession("m", "")
+	if err := s.SetWorkingDir("/tmp/repo-a"); err != nil {
+		t.Fatal(err)
+	}
+	s.Messages = []Message{NewUserMessage("ping")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WorkingDir != "/tmp/repo-a" {
+		t.Errorf("loaded WorkingDir = %q, want /tmp/repo-a", got.WorkingDir)
+	}
+}
+
+func TestSetAgentID_AppendsAndReloads(t *testing.T) {
+	// An agent id set after the first Save is appended as its own record and
+	// survives a reload; setting a new one wins over the old.
+	setTempHome(t)
+
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("ping"), NewAssistantMessage("pong")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAgentID("copywriter"); err != nil {
+		t.Fatalf("SetAgentID: %v", err)
+	}
+
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AgentID != "copywriter" {
+		t.Errorf("reloaded AgentID = %q, want copywriter", got.AgentID)
+	}
+	if len(got.Messages) != 2 {
+		t.Errorf("Messages len = %d, want 2", len(got.Messages))
+	}
+
+	// Last write wins across a reload.
+	if err := got.SetAgentID("resume-coach"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.AgentID != "resume-coach" {
+		t.Errorf("after re-set AgentID = %q, want resume-coach", again.AgentID)
+	}
+}
+
+func TestSetAgentID_BeforeSave(t *testing.T) {
+	// An agent id set before the first Save just rides the meta header.
+	setTempHome(t)
+
+	s := NewSession("m", "")
+	if err := s.SetAgentID("copywriter"); err != nil {
+		t.Fatal(err)
+	}
+	s.Messages = []Message{NewUserMessage("ping")}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AgentID != "copywriter" {
+		t.Errorf("loaded AgentID = %q, want copywriter", got.AgentID)
+	}
+}
+
+// TestIsAutoNamePlaceholder pins THE placeholder predicate: the title
+// generation gate, turn-end adoption (server and channel), and list overlays
+// all share it — if they disagree a title is generated but never adopted.
+func TestIsAutoNamePlaceholder(t *testing.T) {
+	cases := []struct {
+		title string
+		want  bool
+	}{
+		{"", true},
+		{"  ", true},
+		{"Session 1", true},
+		{"Session 42", true},
+		{"*Octo Agent", true},
+		{"Session", false},
+		{"修复登录问题", false},
+		{"My Session 2", false},
+	}
+	for _, c := range cases {
+		if got := IsAutoNamePlaceholder(c.title); got != c.want {
+			t.Errorf("IsAutoNamePlaceholder(%q) = %v, want %v", c.title, got, c.want)
+		}
+	}
+}

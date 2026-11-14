@@ -1,0 +1,125 @@
+---
+title: 安装
+description: 在 Linux、macOS 或 Windows 上安装 octo，并在手机上装 Android App。
+---
+
+import { Tabs, TabItem, Steps, Aside } from '@astrojs/starlight/components';
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+安装脚本会自动识别你的架构、下载对应的 release、校验 SHA-256，并把 `octo` 装进 `PATH`：
+
+```bash
+curl -fsSL https://octo-agent.dev/install.sh | sh
+```
+
+然后启动本地服务并在浏览器里完成引导：
+
+```bash
+octo serve -d                  # 后台运行本地服务
+xdg-open http://127.0.0.1:8088 # 打开控制台
+```
+
+`127.0.0.1` 是回环地址，不需要访问密钥——页面会直接进入首次运行引导（选 provider、填 key）。之后可以用
+`octo serve --stop` 停止服务。更喜欢用终端？直接运行 `octo` 即可。
+
+想要 GUI？取**桌面应用**——从[最新 release](https://github.com/open-octo/octo-agent/releases/latest)
+下载 `Octo-x86_64.AppImage`，`chmod +x` 后运行。它需要主机上有 GTK4 + WebKitGTK 6.0（多数较新的桌面
+环境都自带；缺了的话应用会提示你装什么）。
+
+预编译包（linux / darwin / windows × amd64 + arm64）和 `checksums.txt` 都在
+[最新 release](https://github.com/open-octo/octo-agent/releases/latest) 里，你也可以手动下载。
+
+</TabItem>
+<TabItem label="macOS">
+
+**安装脚本（命令行）**——和 Linux 一样的一行命令：
+
+```bash
+curl -fsSL https://octo-agent.dev/install.sh | sh
+octo serve -d                  # 后台运行本地服务
+open http://127.0.0.1:8088     # 打开控制台
+```
+
+**双击安装器**——从[最新 release](https://github.com/open-octo/octo-agent/releases/latest) 下载
+`octo-setup.pkg`（一个通用包同时覆盖 Apple Silicon 和 Intel），双击运行。
+
+<Steps>
+1. Installer.app 只提供"仅为我安装"——不需要管理员密码。
+2. 它会把 **Octo 桌面应用**装到 `~/Applications/Octo.app`，并把随附的 `octo` CLI 加进 `PATH`
+   （追加到 `~/.zprofile` / `~/.bash_profile` / `~/.profile`）。
+3. 安装完成后会打开这个应用——一个原生窗口，无需管理浏览器或后台服务。
+4. 要在终端里用，打开一个**新**终端窗口运行 `octo`。
+</Steps>
+
+<Aside type="caution" title="Gatekeeper 会报警，这是预期的">
+应用还没有经过公证，Gatekeeper 会提示"来自身份不明的开发者"——右键（Control 点击）`Octo.app` → **打开**，
+或者去**系统设置 → 隐私与安全性 → 仍要打开**。`.pkg` 没有 App Store 那种卸载器；运行
+`~/.octo/uninstall.sh` 即可移除（你的 `~/.octo` 数据会保留）。
+</Aside>
+
+</TabItem>
+<TabItem label="Windows">
+
+**安装脚本（PowerShell）**——对应 `curl … | sh` 一行命令的 Windows 版：自动识别架构、校验 SHA-256、
+按用户级安装 `octo.exe` 并加进 `PATH`：
+
+```powershell
+irm https://octo-agent.dev/install.ps1 | iex
+```
+
+**双击安装器**——从[最新 release](https://github.com/open-octo/octo-agent/releases/latest) 下载
+`octo-setup.exe`，双击运行。
+
+<Steps>
+1. 按用户级别安装（不弹管理员提示）**Octo 桌面应用**加 `octo` CLI，把 CLI 加进 `PATH`，并添加一个
+   启动该应用的开始菜单项。
+2. 安装完成后会打开这个应用——一个原生窗口，没有需要在后台管理的东西。
+3. 要在终端里用，打开一个**新**终端窗口运行 `octo`。
+</Steps>
+
+安装器暂未做代码签名，Windows SmartScreen 可能会提示"Windows 已保护你的电脑"——点击**更多信息 → 仍要运行**
+即可。像卸载其他软件一样从"添加或删除程序"里卸载。
+
+</TabItem>
+</Tabs>
+
+## 手机 App
+
+在手机上用同一个 octo。Android 每个版本都会构建
+[**`octo-android.apk`**](https://dl.octo-agent.dev/releases/latest/download/octo-android.apk)，在手机上下载后直接安装。iOS 暂时需从源码构建（见
+[`mobile/`](https://github.com/open-octo/octo-agent/tree/main/mobile)）。App 目前是开发者预览。
+
+<Steps>
+1. 安装 APK。系统提示时，允许浏览器安装应用。
+2. 在电脑上打开桌面应用或 Web UI 的**设置 → 手机**，选择或填写一个手机能访问到的地址：局域网地址、
+   Tailscale 域名或隧道 URL。
+3. 在 App 里扫描页面上的二维码（或粘贴链接）。
+</Steps>
+
+二维码里带着你的访问密钥，别给别人看。手机怎么连到电脑交给你的网络，见
+[连接手机 App](/docs/zh/guides/self-host/#连接手机-app)。
+
+## 升级
+
+```bash
+octo upgrade         # 原地安装最新 release，经过 SHA-256 校验
+octo upgrade --check # 只比较版本号
+```
+
+Web UI 的版本徽标提供同样的升级入口。
+
+## 用 Go 或从源码安装
+
+```bash
+go install github.com/open-octo/octo-agent/cmd/octo@latest
+```
+
+```bash
+git clone https://github.com/open-octo/octo-agent.git
+cd octo-agent
+make build       # 产出 ./octo
+```
+
+下一步：[快速开始](/docs/zh/getting-started/quickstart/)。

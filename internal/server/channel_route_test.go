@@ -1,0 +1,1088 @@
+package server
+
+import (
+	"context"
+	"encoding/base64"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/agentprofile"
+	"github.com/open-octo/octo-agent/internal/channel"
+	"github.com/open-octo/octo-agent/internal/config"
+	"github.com/open-octo/octo-agent/internal/hooks"
+	"github.com/open-octo/octo-agent/internal/tools"
+)
+
+// fullFakeAdapter implements the whole channel.Adapter surface with no-ops,
+// recording SendText calls — handleChannelMessage runs a real turn through
+// the UIController, which touches typing/update methods too.
+type fullFakeAdapter struct {
+	mu              sync.Mutex
+	sent            []string
+	sendTypingCount int
+	stopTypingCount int
+}
+
+func (a *fullFakeAdapter) Platform() string { return "fake" }
+func (a *fullFakeAdapter) Start(ctx context.Context, _ func(channel.InboundEvent)) error {
+	<-ctx.Done()
+	return nil
+}
+func (a *fullFakeAdapter) Stop() error { return nil }
+func (a *fullFakeAdapter) SendText(chatID, text, replyTo string) channel.SendResult {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sent = append(a.sent, text)
+	return channel.SendResult{OK: true, MessageID: "f1"}
+}
+func (a *fullFakeAdapter) SendFile(chatID, path, name, replyTo string) channel.SendResult {
+	return channel.SendResult{OK: true}
+}
+func (a *fullFakeAdapter) UpdateMessage(chatID, messageID, text string) bool { return true }
+func (a *fullFakeAdapter) SupportsMessageUpdates() bool                      { return false }
+func (a *fullFakeAdapter) SendTyping(chatID, contextToken string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sendTypingCount++
+	return nil
+}
+func (a *fullFakeAdapter) StopTyping(chatID, contextToken string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stopTypingCount++
+	return nil
+}
+func (a *fullFakeAdapter) Flush(chatID string)   {}
+func (a *fullFakeAdapter) SupportsButtons() bool { return false }
+func (a *fullFakeAdapter) SendButtons(chatID, text string, buttons []channel.Button, replyTo string) channel.SendResult {
+	return channel.SendResult{OK: true, MessageID: "f1"}
+}
+func (a *fullFakeAdapter) ValidateConfig(channel.PlatformConfig) []string { return nil }
+
+func (a *fullFakeAdapter) texts() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.sent...)
+}
+
+func (a *fullFakeAdapter) typingCounts() (sendTyping, stopTyping int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sendTypingCount, a.stopTypingCount
+}
+
+// chanServer returns a mustServer with a channel manager wired to stub agents.
+func chanServer(t *testing.T) *Server {
+	t.Helper()
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.channelMgr = channel.NewManager(&channel.Config{}, func(*agentprofile.Profile) *agent.Agent {
+		return agent.New(&stubSender{}, "stub-model")
+	}, channel.BindByChat)
+	return srv
+}
+
+func evFor(text string) channel.InboundEvent {
+	return channel.InboundEvent{Platform: "fake", ChatID: "c1", UserID: "u1", MessageID: "m1", Text: text}
+}
+
+// TestRouteChannelEvent_PendingAskConsumesMessage: while a permission prompt
+// is pending, the next plain message answers it instead of starting a turn.
+func TestRouteChannelEvent_PendingAskConsumesMessage(t *testing.T) {
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	sess := srv.channelMgr.GetOrCreateSession(evFor("seed"), nil)
+	replyCh, release, err := sess.BeginAsk("c1", "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	srv.routeChannelEvent(context.Background(), ad, evFor("yes"))
+
+	select {
+	case got := <-replyCh:
+		if got != "yes" {
+			t.Errorf("ask received %q, want %q", got, "yes")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending ask did not receive the message")
+	}
+}
+
+// TestRouteChannelEvent_CommandBeatsPendingAsk: /stop must reach the command
+// router even while an ask is pending — it cancels the turn that is asking.
+func TestRouteChannelEvent_CommandBeatsPendingAsk(t *testing.T) {
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	sess := srv.channelMgr.GetOrCreateSession(evFor("seed"), nil)
+	replyCh, release, err := sess.BeginAsk("c1", "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	srv.routeChannelEvent(context.Background(), ad, evFor("/stop"))
+
+	select {
+	case got := <-replyCh:
+		t.Fatalf("command %q was consumed by the ask", got)
+	default:
+	}
+	if len(ad.texts()) == 0 {
+		t.Fatal("command produced no reply")
+	}
+}
+
+// TestRouteChannelEvent_NormalMessageRunsTurn: with no pending ask, a plain
+// message starts an agent turn that replies through the adapter.
+func TestRouteChannelEvent_NormalMessageRunsTurn(t *testing.T) {
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	srv.routeChannelEvent(context.Background(), ad, evFor("hello"))
+
+	waitFor(t, func() bool {
+		for _, txt := range ad.texts() {
+			if strings.Contains(txt, "stub reply") {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// panicSender panics on every send path, simulating a turn that blows up
+// mid-flight (a provider adapter bug, a nil deref, etc.).
+type panicSender struct{}
+
+func (panicSender) SendMessages(_ context.Context, _, _ string, _ []agent.Message, _ int) (agent.Reply, error) {
+	panic("boom in SendMessages")
+}
+func (panicSender) StreamMessages(_ context.Context, _, _ string, _ []agent.Message, _ int, _ func(string), _ func(string)) (agent.Reply, error) {
+	panic("boom in StreamMessages")
+}
+func (panicSender) SendMessagesWithTools(_ context.Context, _, _ string, _ []agent.Message, _ int, _ []agent.ToolDefinition) (agent.Reply, error) {
+	panic("boom in SendMessagesWithTools")
+}
+func (panicSender) StreamMessagesWithTools(_ context.Context, _, _ string, _ []agent.Message, _ int, _ []agent.ToolDefinition, _ func(string), _ agent.ToolInputDeltaFunc, _ agent.ThinkingDeltaFunc) (agent.Reply, error) {
+	panic("boom in StreamMessagesWithTools")
+}
+
+// A panic inside an IM turn must not crash the serve process — handleChannelMessage
+// runs the whole turn in the goroutine routeChannelEvent spawns for it, outside
+// any caller's recover, so it must recover itself. If the guard is missing this
+// test panics the test binary instead of failing cleanly.
+func TestHandleChannelMessage_RecoversTurnPanic(t *testing.T) {
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.channelMgr = channel.NewManager(&channel.Config{}, func(*agentprofile.Profile) *agent.Agent {
+		return agent.New(panicSender{}, "stub-model")
+	}, channel.BindByChat)
+	ad := &fullFakeAdapter{}
+
+	// Runs the turn synchronously here; a recovered panic returns normally.
+	srv.handleChannelMessage(context.Background(), ad, evFor("hello"), nil)
+	// Reaching this line proves the turn panic was recovered, not propagated.
+}
+
+// TestHandleChannelMessage_SetsPerTurnGate: every IM turn gets a fresh
+// permission gate (configured mode + chat-interactive ask) on the session
+// agent — the factory-time strict gate is gone.
+// IM turns build their agent via the channel factory (persistent, not buildAgent),
+// so runChannelTurns must resolve compact_auto_pct from config per turn — else IM
+// silently ignores the configured threshold that web/desktop honor.
+func TestHandleChannelMessage_HonorsCompactAutoPct(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints:      []config.Endpoint{{ID: "ep-a", Provider: "openai", Models: []config.EndpointModel{{Model: "stub-model"}}}},
+		Default:        "ep-a::stub-model",
+		CompactAutoPct: 70,
+	})
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	sess := srv.channelMgr.GetOrCreateSession(evFor("seed"), nil)
+	// The factory does not set it; only a turn resolves it from config.
+	if sess.Agent.CompactAutoFraction != 0 {
+		t.Fatalf("factory should not pre-set CompactAutoFraction, got %v", sess.Agent.CompactAutoFraction)
+	}
+
+	srv.handleChannelMessage(context.Background(), ad, evFor("hello"), nil)
+
+	if want := float64(70) / 100.0; sess.Agent.CompactAutoFraction != want {
+		t.Errorf("after an IM turn CompactAutoFraction = %v, want %v (from compact_auto_pct: 70)", sess.Agent.CompactAutoFraction, want)
+	}
+}
+
+func TestHandleChannelMessage_SetsPerTurnGate(t *testing.T) {
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	sess := srv.channelMgr.GetOrCreateSession(evFor("seed"), nil)
+	if sess.Agent.Gate != nil {
+		t.Fatal("factory must not pre-set a gate anymore")
+	}
+
+	srv.handleChannelMessage(context.Background(), ad, evFor("hello"), nil)
+
+	if sess.Agent.Gate == nil {
+		t.Error("handleChannelMessage must set a per-turn permission gate")
+	}
+}
+
+// TestHandleChannelMessage_TypingKeepaliveWired is an end-to-end regression
+// test for #1117: handleChannelMessage must start the typing keepalive
+// before running the turn and stop it exactly once by the time it returns.
+// This catches a future refactor silently dropping stopTyping somewhere in
+// the handleChannelMessage -> runChannelTurns -> NewUIController chain — the
+// unit tests for channel_typing.go and UIController's stopTyping callback
+// each pass even if the wiring between them breaks.
+func TestHandleChannelMessage_TypingKeepaliveWired(t *testing.T) {
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	srv.handleChannelMessage(context.Background(), ad, evFor("hello"), nil)
+
+	sendTyping, stopTyping := ad.typingCounts()
+	if sendTyping == 0 {
+		t.Error("handleChannelMessage must call SendTyping at least once")
+	}
+	if stopTyping != 1 {
+		t.Errorf("handleChannelMessage must call StopTyping exactly once, got %d", stopTyping)
+	}
+}
+
+// TestRouteChannelEvent_OtherUserCannotAnswer pins the reply-scoping rule
+// under a shared-session binding (BindByChat): a second user's "yes" in the
+// same chat must not answer the requester's prompt.
+func TestRouteChannelEvent_OtherUserCannotAnswer(t *testing.T) {
+	srv := chanServer(t) // BindByChat: one session per chat, shared by users
+	ad := &fullFakeAdapter{}
+
+	sess := srv.channelMgr.GetOrCreateSession(evFor("seed"), nil)
+	replyCh, release, err := sess.BeginAsk("c1", "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	other := evFor("yes")
+	other.UserID = "u2"
+	srv.routeChannelEvent(context.Background(), ad, other)
+
+	select {
+	case got := <-replyCh:
+		t.Fatalf("another user's reply %q answered the ask", got)
+	default:
+	}
+}
+
+// TestRouteChannelEvent_EmptyTextNeverAnswers: a text-less event (sticker,
+// image) must not consume — and thereby deny — a pending ask.
+func TestRouteChannelEvent_EmptyTextNeverAnswers(t *testing.T) {
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	sess := srv.channelMgr.GetOrCreateSession(evFor("seed"), nil)
+	replyCh, release, err := sess.BeginAsk("c1", "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	srv.routeChannelEvent(context.Background(), ad, evFor("   "))
+
+	select {
+	case got := <-replyCh:
+		t.Fatalf("empty text %q answered the ask", got)
+	default:
+	}
+}
+
+// pngDataURL is a tiny valid PNG as a data URL, the shape the weixin adapter
+// hands routeChannelEvent for an inbound image message.
+func pngDataURL() string {
+	// 1x1 transparent PNG.
+	raw, _ := base64.StdEncoding.DecodeString(
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw)
+}
+
+// TestRouteChannelEvent_ImageAnswersPendingAsk: an image message sent as the
+// answer to a pending ask (ask_user_question) must not lose the image — the
+// adapter's "[图片]" placeholder text makes the message look like a text
+// reply, so the dispatcher persists the attachment and folds an
+// "[Attached file: <path>]" note into the answer text. Regression test for
+// the bug where such an answer arrived as the bare placeholder and the image
+// bytes were silently dropped.
+func TestRouteChannelEvent_ImageAnswersPendingAsk(t *testing.T) {
+	tmp := t.TempDir() // uploads land in ~/.octo/uploads — isolate HOME
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	sess := srv.channelMgr.GetOrCreateSession(evFor("seed"), nil)
+	replyCh, release, err := sess.BeginAsk("c1", "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	ev := evFor("[图片]")
+	ev.Files = []channel.FileAttachment{{Type: "image", Name: "qr.png", MimeType: "image/png", DataURL: pngDataURL()}}
+	srv.routeChannelEvent(context.Background(), ad, ev)
+
+	var got string
+	select {
+	case got = <-replyCh:
+	case <-time.After(time.Second):
+		t.Fatal("pending ask did not receive the image answer")
+	}
+	if !strings.Contains(got, "[图片]") {
+		t.Errorf("answer lost the message text: %q", got)
+	}
+	if !strings.Contains(got, "[Attached file:") || !strings.Contains(filepath.ToSlash(got), ".octo/uploads") {
+		t.Fatalf("answer missing the persisted-upload note: %q", got)
+	}
+	path := strings.TrimSuffix(strings.Split(got, "[Attached file: ")[1], "]")
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		t.Errorf("persisted image unreadable: err=%v bytes=%d", err, len(data))
+	}
+}
+
+// TestRouteChannelEvent_EmptyTextImageAnswersPendingAsk: unlike weixin, the
+// dingtalk/discord/feishu/telegram/wecom adapters construct an empty Text
+// (not a placeholder) for a pure-image inbound message. Before the dispatcher
+// gated the persist step on ev.Files rather than ev.Text alone, an empty-text
+// image answering a pending ask fell through the old empty-text guard
+// entirely — the ask never saw the image, and it kept waiting while the
+// image spawned an unrelated new turn. Regression test for that class of
+// message, distinct from weixin's "[图片]"-placeholder case above.
+func TestRouteChannelEvent_EmptyTextImageAnswersPendingAsk(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	sess := srv.channelMgr.GetOrCreateSession(evFor("seed"), nil)
+	replyCh, release, err := sess.BeginAsk("c1", "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	ev := evFor("") // empty text, as dingtalk/discord/feishu/telegram/wecom construct it
+	ev.Files = []channel.FileAttachment{{Type: "image", Name: "qr.png", MimeType: "image/png", DataURL: pngDataURL()}}
+	srv.routeChannelEvent(context.Background(), ad, ev)
+
+	var got string
+	select {
+	case got = <-replyCh:
+	case <-time.After(time.Second):
+		t.Fatal("pending ask did not receive the empty-text image answer")
+	}
+	if !strings.Contains(got, "[Attached file:") || !strings.Contains(filepath.ToSlash(got), ".octo/uploads") {
+		t.Fatalf("answer missing the persisted-upload note: %q", got)
+	}
+	path := strings.TrimSuffix(strings.Split(got, "[Attached file: ")[1], "]")
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		t.Errorf("persisted image unreadable: err=%v bytes=%d", err, len(data))
+	}
+}
+
+// TestRouteChannelEvent_ImageSteerCarriesAttachment: an image sent mid-turn
+// rides the Inbox as a steer — the attachment must reach the model as a
+// persisted path note, not vanish (same drop class as the ask-reply bug).
+func TestRouteChannelEvent_ImageSteerCarriesAttachment(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	sender := &blockingSender{started: make(chan struct{}, 8), release: make(chan struct{})}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.channelMgr = channel.NewManager(&channel.Config{}, func(*agentprofile.Profile) *agent.Agent {
+		a := agent.New(sender, "stub-model")
+		a.LiteSender, a.LiteModel = stubSender{}, "stub-model"
+		return a
+	}, channel.BindByChat)
+	ad := &fullFakeAdapter{}
+
+	srv.routeChannelEvent(context.Background(), ad, evFor("first message"))
+	<-sender.started // turn 1 is now blocked inside the sender
+
+	ev := evFor("[图片]")
+	ev.Files = []channel.FileAttachment{{Type: "image", Name: "shot.png", MimeType: "image/png", DataURL: pngDataURL()}}
+	srv.routeChannelEvent(context.Background(), ad, ev)
+
+	close(sender.release) // let turn 1 finish; the leftover steers must chain
+	<-sender.started      // the chained turn hit the sender
+
+	waitFor(t, func() bool { calls, _ := sender.snapshot(); return calls >= 2 })
+	_, inputs := sender.snapshot()
+	found := false
+	for _, in := range inputs {
+		if strings.Contains(in, "[Attached file:") && strings.Contains(filepath.ToSlash(in), ".octo/uploads") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("steered image never reached the model as a path note; inputs = %q", inputs)
+	}
+}
+
+// blockingSender lets a test hold a turn open: the first call blocks until
+// release is closed; inputs records the last user message of each call.
+type blockingSender struct {
+	mu      sync.Mutex
+	calls   int
+	inputs  []string
+	started chan struct{} // signalled once per call
+	release chan struct{} // first call blocks on this
+}
+
+func (b *blockingSender) record(msgs []agent.Message) (first bool) {
+	b.mu.Lock()
+	b.calls++
+	first = b.calls == 1
+	if len(msgs) > 0 {
+		last := msgs[len(msgs)-1]
+		text := last.Content
+		if text == "" {
+			for _, blk := range last.Blocks {
+				if blk.Type == "text" {
+					text = blk.Text
+				}
+			}
+		}
+		b.inputs = append(b.inputs, text)
+	}
+	b.mu.Unlock()
+	b.started <- struct{}{}
+	return first
+}
+
+func (b *blockingSender) SendMessages(_ context.Context, _, _ string, msgs []agent.Message, _ int) (agent.Reply, error) {
+	if b.record(msgs) {
+		<-b.release
+	}
+	return agent.Reply{Content: "blocking reply"}, nil
+}
+
+func (b *blockingSender) StreamMessages(ctx context.Context, model, system string, msgs []agent.Message, maxTokens int, onChunk func(string), _ func(string)) (agent.Reply, error) {
+	return b.SendMessages(ctx, model, system, msgs, maxTokens)
+}
+
+func (b *blockingSender) snapshot() (int, []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.calls, append([]string(nil), b.inputs...)
+}
+
+// TestRouteChannelEvent_MidTurnMessageSteers: a message during a running IM
+// turn rides the turn's Inbox and chains into a follow-up turn — it must not
+// queue as an independent second turn, and it must not be lost.
+func TestRouteChannelEvent_MidTurnMessageSteers(t *testing.T) {
+	sender := &blockingSender{started: make(chan struct{}, 8), release: make(chan struct{})}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.channelMgr = channel.NewManager(&channel.Config{}, func(*agentprofile.Profile) *agent.Agent {
+		a := agent.New(sender, "stub-model")
+		// Run title generation on a separate lite sender: the turn spawns it
+		// concurrently, and on the primary sender it races the turn's own
+		// first call for blockingSender's blocking "first" slot — when the
+		// title call wins, the test deadlocks waiting on a turn that never
+		// blocked.
+		a.LiteSender, a.LiteModel = stubSender{}, "stub-model"
+		return a
+	}, channel.BindByChat)
+	ad := &fullFakeAdapter{}
+
+	srv.routeChannelEvent(context.Background(), ad, evFor("first message"))
+	<-sender.started // turn 1 is now blocked inside the sender
+
+	srv.routeChannelEvent(context.Background(), ad, evFor("steer me in"))
+	sess := srv.channelMgr.GetSession(evFor("x"), "")
+	if !sess.Agent.Inbox.HasPending() {
+		t.Fatal("mid-turn message did not land in the running turn's Inbox")
+	}
+
+	close(sender.release) // let turn 1 finish; the leftover steers must chain
+	<-sender.started      // the chained turn hit the sender
+
+	waitFor(t, func() bool { calls, _ := sender.snapshot(); return calls >= 2 })
+	_, inputs := sender.snapshot()
+	found := false
+	for _, in := range inputs {
+		if strings.Contains(in, "steer me in") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("steer text never reached the model; inputs = %q", inputs)
+	}
+}
+
+// TestHandleChannelMessage_PersistsTurn: an IM turn's history must land on
+// disk so a fresh manager (post-restart) restores the conversation.
+func TestHandleChannelMessage_PersistsTurn(t *testing.T) {
+	tmp := t.TempDir() // isolated HOME: deterministic store IDs cross-pollinate otherwise
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	srv.handleChannelMessage(context.Background(), ad, evFor("please remember 42"), nil)
+
+	fresh := channel.NewManager(&channel.Config{}, func(*agentprofile.Profile) *agent.Agent {
+		return agent.New(&stubSender{}, "stub-model")
+	}, channel.BindByChat)
+	restored := fresh.GetOrCreateSession(evFor("x"), nil)
+	msgs := restored.Agent.History.Snapshot()
+	if len(msgs) < 2 {
+		t.Fatalf("restored history has %d messages, want >=2 (user+assistant)", len(msgs))
+	}
+}
+
+// TestHandleChannelMessage_FreezesSystemAfterFirstTurn: the composed system
+// prompt is frozen on the session's first turn (Session.SetComposedSystem)
+// and reused as-is afterward — memory written mid-session must NOT change an
+// already-open IM session's prompt, so the provider's prompt-cache prefix
+// stays stable turn over turn. Mirrors buildAgent's web-path behavior.
+func TestHandleChannelMessage_FreezesSystemAfterFirstTurn(t *testing.T) {
+	srv := chanServer(t)
+	srv.homeMemDir = t.TempDir()
+	ad := &fullFakeAdapter{}
+
+	srv.handleChannelMessage(context.Background(), ad, evFor("turn one"), nil)
+	sess := srv.channelMgr.GetSession(evFor("x"), "")
+	if strings.Contains(sess.Agent.System, "fresh-fact-9000") {
+		t.Fatal("memory marker present before it was written")
+	}
+	frozen := sess.Agent.System
+	if sess.Store.ComposedSystem != frozen {
+		t.Fatal("first turn did not freeze ComposedSystem on the session")
+	}
+
+	if err := os.WriteFile(srv.homeMemDir+"/MEMORY.md", []byte("- fresh-fact-9000"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv.handleChannelMessage(context.Background(), ad, evFor("turn two"), nil)
+	if strings.Contains(sess.Agent.System, "fresh-fact-9000") {
+		t.Error("system prompt recomposed: memory written mid-session should stay invisible until a new session")
+	}
+	if sess.Agent.System != frozen {
+		t.Error("second turn's system prompt drifted from the frozen one")
+	}
+}
+
+// TestHandleChannelMessage_WiresMemoryHooks: IM turns carry the L2 memory
+// hooks (keyword reminders + save-nudge) like web turns do via buildAgent.
+func TestHandleChannelMessage_WiresMemoryHooks(t *testing.T) {
+	srv := chanServer(t)
+	srv.homeMemDir = t.TempDir()
+	ad := &fullFakeAdapter{}
+
+	srv.handleChannelMessage(context.Background(), ad, evFor("hello"), nil)
+
+	sess := srv.channelMgr.GetSession(evFor("x"), "")
+	if !sess.Agent.Hooks.Configured(hooks.EventUserPromptSubmit) {
+		t.Error("IM agent missing UserPromptSubmit hook (keyword reminders)")
+	}
+	if !sess.Agent.Hooks.Configured(hooks.EventPostToolUse) {
+		t.Error("IM agent missing PostToolUse hook (save-nudge)")
+	}
+}
+
+// TestHandleChannelMessage_RefreshesAutoRecallBeforeRegisteringHooks: IM turns
+// never go through prepareToolTurn (only WS/REST/cron do), so runChannelTurns
+// must refresh the memory-backend globals itself before registering hooks —
+// mirrors TestBuildAgent_RefreshesAutoRecallBeforeRegisteringHooks for the web
+// path. Deliberately leaves the global auto-recall flag stale before the
+// turn, with no prepareToolTurn call anywhere in this path, to prove
+// runChannelTurns's own refresh (not some other turn type having run first)
+// is what makes this work.
+func TestHandleChannelMessage_RefreshesAutoRecallBeforeRegisteringHooks(t *testing.T) {
+	setTestHome(t)
+	marker := "octo-agent lucky number is 47"
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{{ID: "ep-a", Provider: "openai", Models: []config.EndpointModel{{Model: "gpt-4o"}}}},
+		Default:   "ep-a::gpt-4o",
+		MemoryBackend: config.MemoryBackendConfig{
+			Type:       "hindsight",
+			BaseURL:    hindsightRecallStub(t, marker),
+			AutoRecall: true,
+		},
+	})
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	tools.SetMemoryBackend(nil)
+	tools.SetMemoryBackendAutoRecall(false) // simulate a prior turn's stale state
+	t.Cleanup(func() {
+		tools.SetMemoryBackend(nil)
+		tools.SetMemoryBackendAutoRecall(false)
+	})
+
+	srv.handleChannelMessage(context.Background(), ad, evFor("hello"), nil)
+
+	// Drive a REAL Inject() call against this session's own engine and check
+	// for actual recalled content — not e.Configured(EventUserPromptSubmit)
+	// on sess.Agent.Hooks (the WorkflowNudger, wired unconditionally for
+	// every session, registers its own no-op-output hook on that same event,
+	// so "configured" is true regardless of whether the auto-recall hook is
+	// there) and not a fresh throwaway engine re-queried after the turn
+	// (proves only that the global ends up correct eventually, not that
+	// THIS turn's engine was built with the right value at registration
+	// time — see TestBuildAgent_RefreshesAutoRecallBeforeRegisteringHooks's
+	// doc comment for the experiment that found this).
+	sess := srv.channelMgr.GetSession(evFor("x"), "")
+	if sess == nil || sess.Agent == nil || sess.Agent.Hooks == nil {
+		t.Fatal("expected a bound IM session with hooks wired after handleChannelMessage")
+	}
+	got := sess.Agent.Hooks.Inject(context.Background(), hooks.Payload{
+		Event:     hooks.EventUserPromptSubmit,
+		UserInput: "what's my lucky number?",
+	})
+	if !strings.Contains(got, marker) {
+		t.Errorf("injected UserPromptSubmit text = %q, want it to contain the recalled marker %q — runChannelTurns must refresh the memory backend before registering hooks, not after", got, marker)
+	}
+}
+
+// TestHandleChannelMessage_WiresArchiveDir: IM turns get compaction chunk
+// archiving like web turns do via buildAgent — without this, folded history
+// is discarded instead of being recallable with the read tool.
+func TestHandleChannelMessage_WiresArchiveDir(t *testing.T) {
+	tmp := t.TempDir() // isolated HOME: deterministic store IDs cross-pollinate otherwise
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	srv.handleChannelMessage(context.Background(), ad, evFor("hello"), nil)
+
+	sess := srv.channelMgr.GetSession(evFor("x"), "")
+	if sess.Agent.ArchiveDir == "" {
+		t.Fatal("IM agent missing ArchiveDir — compaction would fold history without archiving it")
+	}
+	want, err := sess.Store.ChunkDir()
+	if err != nil {
+		t.Fatalf("sess.Store.ChunkDir(): %v", err)
+	}
+	if sess.Agent.ArchiveDir != want {
+		t.Errorf("ArchiveDir = %q, want %q (session's own chunk dir)", sess.Agent.ArchiveDir, want)
+	}
+}
+
+// TestHandleChannelMessage_RejectsTurnWhenBoundToOtherEntry: when the session
+// is owned by another entry, the channel turn is rejected and the reply hints
+// at /new and /bind --force.
+func TestHandleChannelMessage_RejectsTurnWhenBoundToOtherEntry(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	// Pre-create the chat's deterministic store and mark it web-bound.
+	sess := srv.channelMgr.GetOrCreateSession(evFor("seed"), nil)
+	storeID := sess.Store.ID
+	path, err := sess.Store.SavePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	webBound := agent.NewSession("stub-model", "")
+	webBound.ID = storeID
+	webBound.Source = "channel"
+	webBound.BoundEntry = agent.EntryWeb
+	webBound.BoundAt = time.Now()
+	if err := webBound.Save(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := agent.LoadSession(storeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.Store = loaded
+
+	srv.handleChannelMessage(context.Background(), ad, evFor("hello again"), nil)
+
+	waitFor(t, func() bool {
+		for _, txt := range ad.texts() {
+			if strings.Contains(txt, "bound to web") {
+				return true
+			}
+		}
+		return false
+	})
+
+	for _, txt := range ad.texts() {
+		if strings.Contains(txt, "bound to web") {
+			if !strings.Contains(txt, "/new") || !strings.Contains(txt, "/list") || !strings.Contains(txt, "/bind --force <number>") {
+				t.Errorf("rejection message missing hints: %q", txt)
+			}
+			return
+		}
+	}
+	t.Fatal("expected rejection text from adapter")
+}
+
+// TestHandleChannelMessage_RecoversWhenSessionFileDeletedExternally (#1079):
+// if the chat's bound session was deleted from the web UI while this IM
+// session sat idle in the manager's cache, the next message used to hit
+// acquireSessionBinding's authoritative LoadSession and fail outright with a
+// confusing "session ... not found" error — the reporter's expectation was
+// that the chat should just start fresh instead.
+func TestHandleChannelMessage_RecoversWhenSessionFileDeletedExternally(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+
+	// Establish the chat's session and give it some history, exactly like an
+	// ordinary prior conversation.
+	sess := srv.channelMgr.GetOrCreateSession(evFor("seed"), nil)
+	sess.Agent.History.Append(agent.Message{Role: agent.RoleUser, Content: "old message"})
+	if err := sess.Persist(); err != nil {
+		t.Fatal(err)
+	}
+	path, err := sess.Store.SavePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the web UI deleting the session file entirely — nothing else
+	// (no other entry's binding) takes its place.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	srv.handleChannelMessage(context.Background(), ad, evFor("hello again"), nil)
+
+	waitFor(t, func() bool { return len(ad.texts()) > 0 })
+
+	for _, txt := range ad.texts() {
+		if strings.Contains(txt, "not found") {
+			t.Fatalf("turn surfaced the stale-session error instead of starting fresh: %q", txt)
+		}
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("session file was not recreated on disk: %v", err)
+	}
+}
+
+// TestHandleChannelMessage_AdvertisesWorkflowToTopLevelTurn (#1133 follow-up):
+// runChannelTurns used to compute the top-level turn's tool list before
+// stamping the ctx-scoped sub-agent manager that carries its spawner, so
+// tools.DefaultToolsForCtx saw no manager yet for that call — the IM
+// channel's own turn never advertised workflow (only its spawned children
+// did, via their own ctx-threaded toolsFn), even though the IM path never
+// depended on prepareToolTurn's removed global swap in the first place (it
+// doesn't call prepareToolTurn at all — it builds its own sub-agent manager
+// inline).
+func TestHandleChannelMessage_AdvertisesWorkflowToTopLevelTurn(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	rec := &recordingSender{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: true})
+	srv.channelMgr = channel.NewManager(&channel.Config{}, func(*agentprofile.Profile) *agent.Agent {
+		return agent.New(rec, "stub-model")
+	}, channel.BindByChat)
+
+	ad := &fullFakeAdapter{}
+	srv.handleChannelMessage(context.Background(), ad, evFor("hello"), nil)
+
+	waitFor(t, func() bool { return len(rec.lastTools) > 0 })
+
+	found := false
+	for _, d := range rec.lastTools {
+		if d.Name == "workflow" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("workflow not advertised to top-level IM turn; got %v", rec.lastTools)
+	}
+}
+
+// TestHandleChannelMessage_BackgroundCompletionTriggersIdleTurn: when an
+// async background process finishes after the synchronous turn chain has
+// ended, the completion note is drained into a follow-up idle turn so the
+// model can react without waiting for the user's next message.
+func TestHandleChannelMessage_BackgroundCompletionTriggersIdleTurn(t *testing.T) {
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: true})
+	srv.channelMgr = channel.NewManager(&channel.Config{}, func(*agentprofile.Profile) *agent.Agent {
+		return agent.New(&stubSender{}, "stub-model")
+	}, channel.BindByChat)
+	ad := &fullFakeAdapter{}
+
+	srv.handleChannelMessage(context.Background(), ad, evFor("hello"), nil)
+
+	// Wait for the user-initiated turn to finish.
+	waitFor(t, func() bool {
+		for _, txt := range ad.texts() {
+			if strings.Contains(txt, "stub reply") {
+				return true
+			}
+		}
+		return false
+	})
+
+	// Simulate an async background process exiting after the turn went idle.
+	sess := srv.channelMgr.GetSession(evFor("x"), "")
+	bgMgr := tools.SessionBackgroundManager("im:" + string(sess.Key))
+	bgMgr.FireExitHook(tools.BgExit{ID: "bg_1", Command: "make build", Status: "exited: 0", NewOutput: "done"})
+
+	// The idle turn should react to the completion note.
+	waitFor(t, func() bool {
+		count := 0
+		for _, txt := range ad.texts() {
+			if strings.Contains(txt, "stub reply") {
+				count++
+			}
+		}
+		return count >= 2
+	})
+
+	// The completion note must have reached the model via history.
+	found := false
+	for _, m := range sess.Agent.History.Snapshot() {
+		if strings.Contains(m.Content, "[BACKGROUND COMPLETED]") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("background completion note never reached the agent's history")
+	}
+}
+
+// TestRunChannelIdleTurn_SkipsWhenBoundToOtherEntry: if another entry has
+// taken over the session while the IM chat was idle, the idle follow-up turn
+// must not run.
+func TestRunChannelIdleTurn_SkipsWhenBoundToOtherEntry(t *testing.T) {
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: true})
+	srv.channelMgr = channel.NewManager(&channel.Config{}, func(*agentprofile.Profile) *agent.Agent {
+		return agent.New(&stubSender{}, "stub-model")
+	}, channel.BindByChat)
+	ad := &fullFakeAdapter{}
+	// Unique chat id so this test's deterministic store ID can't collide with
+	// other channel tests (evFor hardcodes ChatID "c1"). They share the
+	// process-wide TestMain HOME, and turn paths leak fire-and-forget save
+	// goroutines that outlive a test — one of those re-saving its EntryChannel
+	// session over our EntryWeb binding mid-test is what made this flaky.
+	ev := channel.InboundEvent{Platform: "fake", ChatID: "c-idle-skip", UserID: "u1", MessageID: "m1", Text: "hello"}
+
+	// Pre-create the store file bound to web so the idle turn sees the
+	// authoritative binding and refuses to run.
+	// First create the channel session to learn its deterministic store ID,
+	// then overwrite the file with a web-bound meta record.
+	sess := srv.channelMgr.GetOrCreateSession(ev, nil)
+	storeID := sess.Store.ID
+	path, err := sess.Store.SavePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	webBound := agent.NewSession("stub-model", "")
+	webBound.ID = storeID
+	webBound.Source = "channel"
+	webBound.BoundEntry = agent.EntryWeb
+	webBound.BoundAt = time.Now()
+	if err := webBound.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reload so the in-memory store reflects the web-bound file.
+	loaded, err := agent.LoadSession(storeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.Store = loaded
+
+	sess.Agent.Inbox.Enqueue("<system-reminder>[BACKGROUND COMPLETED] bg done.</system-reminder>")
+	srv.runChannelIdleTurn(context.Background(), sess, ad, ev)
+
+	// The adapter must not have sent a reply from the idle turn.
+	for _, txt := range ad.texts() {
+		if strings.Contains(txt, "stub reply") {
+			t.Fatal("idle turn ran while session was bound to another entry")
+		}
+	}
+}
+
+// TestInjectorFor_SessionStickyAndDroppedOnUnbind: the injector's
+// once-per-session recall latch must survive turns but reset with /unbind.
+func TestInjectorFor_SessionStickyAndDroppedOnUnbind(t *testing.T) {
+	srv := chanServer(t)
+	srv.homeMemDir = t.TempDir()
+	ad := &fullFakeAdapter{}
+	ev := evFor("/unbind")
+
+	key := "im:" + string(srv.channelMgr.KeyFor(ev, ""))
+	first := srv.injectorFor(key, srv.homeMemDir)
+	if first == nil {
+		t.Fatal("injectorFor returned nil")
+	}
+	if srv.injectorFor(key, srv.homeMemDir) != first {
+		t.Error("injector must be sticky across turns in one session")
+	}
+
+	srv.handleChannelCommand(ad, ev, agentprofile.DefaultProfile())
+	if srv.injectorFor(key, srv.homeMemDir) == first {
+		t.Error("/unbind must drop the session injector (fresh recall latch)")
+	}
+}
+
+// TestInjectorFor_DroppedOnNew: the injector's once-per-session recall latch
+// must reset with /new, which creates a brand-new session.
+func TestInjectorFor_DroppedOnNew(t *testing.T) {
+	srv := chanServer(t)
+	srv.homeMemDir = t.TempDir()
+	ad := &fullFakeAdapter{}
+	ev := evFor("/new")
+
+	key := "im:" + string(srv.channelMgr.KeyFor(ev, ""))
+	first := srv.injectorFor(key, srv.homeMemDir)
+	if first == nil {
+		t.Fatal("injectorFor returned nil")
+	}
+
+	srv.handleChannelCommand(ad, ev, agentprofile.DefaultProfile())
+	if srv.injectorFor(key, srv.homeMemDir) == first {
+		t.Error("/new must drop the session injector (fresh recall latch)")
+	}
+}
+
+// /loop is a built-in the model handles via the schedule_wakeup tool, not a
+// CommandRouter command. It must pass through to the agent (handleChannelCommand
+// returns false), the same way the Web and TUI surfaces route it — otherwise an
+// IM user's "/loop …" would be swallowed as an unknown command and never reach
+// the model.
+func TestChannelCommand_LoopPassesThroughToAgent(t *testing.T) {
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+	if srv.handleChannelCommand(ad, evFor("/loop 5m check the build"), agentprofile.DefaultProfile()) {
+		t.Fatal("/loop must not be intercepted as a command — it routes to the agent")
+	}
+}
+
+// TestChannelCommand_UnbindKeepsLoopWakeup: /unbind detaches the chat but must
+// NOT cancel an already-armed loop wakeup — the session is handed to web as a
+// fallback, so the loop keeps running (its ticks are silenced by
+// suppressDelivery, not stopped). This is the behaviour that regressed before
+// the fix: /unbind used to share a case with /bind /clear /new and cancelled
+// the wakeup, silently killing the loop. /bind, /clear and /new DO cancel it,
+// because they start a fresh context.
+func TestChannelCommand_UnbindKeepsLoopWakeup(t *testing.T) {
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+	// mustServer doesn't init the wakeup maps (it's not a web/IM surface in
+	// those tests); arm one manually under the im: key the way imWaker does.
+	srv.wakeupTimers = map[string]*time.Timer{}
+	srv.wakeupStart = map[string]time.Time{}
+	sess := srv.channelMgr.GetOrCreateSession(evFor("seed"), nil)
+	key := "im:" + string(sess.Key)
+	srv.wakeupTimers[key] = time.AfterFunc(time.Hour, func() {})
+	srv.wakeupStart[key] = time.Now()
+
+	// /unbind must keep the wakeup armed — the loop continues silently.
+	if !srv.handleChannelCommand(ad, evFor("/unbind"), agentprofile.DefaultProfile()) {
+		t.Fatal("/unbind should be handled as a command")
+	}
+	if _, ok := srv.wakeupTimers[key]; !ok {
+		t.Fatal("/unbind must not cancel an armed loop wakeup (session handed to web)")
+	}
+
+	// /clear (a fresh-context command) DOES cancel the wakeup — contrast.
+	srv.handleChannelCommand(ad, evFor("/clear"), agentprofile.DefaultProfile())
+	if _, ok := srv.wakeupTimers[key]; ok {
+		t.Fatal("/clear must cancel the armed loop wakeup (fresh context)")
+	}
+}
+
+// TestChannelCommand_UnbindThenStopCancelsWakeup: after /unbind the loop keeps
+// running (suppressed), but a subsequent /stop must cancel it — the user needs
+// a way to really kill everything after leaving the chat.
+func TestChannelCommand_UnbindThenStopCancelsWakeup(t *testing.T) {
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+	srv.wakeupTimers = map[string]*time.Timer{}
+	srv.wakeupStart = map[string]time.Time{}
+	sess := srv.channelMgr.GetOrCreateSession(evFor("seed"), nil)
+	key := "im:" + string(sess.Key)
+	srv.wakeupTimers[key] = time.AfterFunc(time.Hour, func() {})
+	srv.wakeupStart[key] = time.Now()
+
+	// /unbind keeps the wakeup.
+	srv.handleChannelCommand(ad, evFor("/unbind"), agentprofile.DefaultProfile())
+	if _, ok := srv.wakeupTimers[key]; !ok {
+		t.Fatal("/unbind must keep an armed loop wakeup")
+	}
+
+	// /stop cancels it — the hard stop.
+	srv.handleChannelCommand(ad, evFor("/stop"), agentprofile.DefaultProfile())
+	if _, ok := srv.wakeupTimers[key]; ok {
+		t.Fatal("/stop after /unbind must cancel the armed loop wakeup")
+	}
+}
+
+// An IM session object outlives its turns. When the Web UI takes a turn on the
+// same session in between, the next IM turn must start from the file, or its
+// save writes the stale in-memory history back over the web turn.
+func TestHandleChannelMessage_KeepsWebTurnsTakenBetweenIMTurns(t *testing.T) {
+	setTestHome(t) // the chat's session file is shared by every IM test otherwise
+	srv := chanServer(t)
+	ad := &fullFakeAdapter{}
+	ctx := context.Background()
+
+	srv.handleChannelMessage(ctx, ad, evFor("first from im"), nil)
+	sess := srv.channelMgr.GetSession(evFor("x"), "")
+	if sess == nil || sess.Store == nil {
+		t.Fatal("no IM session after the first turn")
+	}
+
+	onDisk, err := agent.LoadSession(sess.Store.ID)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	onDisk.Messages = append(onDisk.Messages, agent.NewUserMessage("from web"), agent.NewAssistantMessage("web reply"))
+	if err := onDisk.Save(); err != nil {
+		t.Fatalf("save web turn: %v", err)
+	}
+
+	srv.handleChannelMessage(ctx, ad, evFor("second from im"), nil)
+
+	final, err := agent.LoadSession(sess.Store.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	var users []string
+	for _, m := range final.Messages {
+		if m.Role == agent.RoleUser {
+			users = append(users, strings.TrimSpace(agent.StripSystemReminders(m.Content)))
+		}
+	}
+	want := []string{"first from im", "from web", "second from im"}
+	if strings.Join(users, "|") != strings.Join(want, "|") {
+		t.Errorf("user messages on disk = %q, want %q", users, want)
+	}
+}

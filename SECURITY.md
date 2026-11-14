@@ -1,0 +1,107 @@
+# Security
+
+octo is a **single-user, personal agent**. Its server (`octo serve`) executes
+arbitrary shell commands on behalf of its one trusted operator — that is the
+product, not a vulnerability. This document states where the security
+boundary sits, what protects it, and what is deliberately out of scope.
+
+## Threat model
+
+### The boundary
+
+- **One user.** There are no accounts or roles. Whoever holds the access key
+  (or sits at the machine) has full control, including command execution via
+  chat.
+- **Loopback is trusted.** Requests from `127.0.0.1`/`::1` are exempt from
+  key authentication. Anything that can already run code as a local user on
+  the machine is outside the boundary.
+- **Everything else needs the key.** The server binds to `127.0.0.1:8088` by
+  default; binding wider (`-addr :8088`) makes every API and WebSocket
+  request from a non-loopback client require the access key.
+
+### What is defended
+
+| Threat | Defense |
+|---|---|
+| LAN / internet attacker calling an exposed API | Loopback-only default bind; 256-bit access key (constant-time compare) on every non-loopback request |
+| Malicious website CSRF-ing `http://localhost:8088` from your own browser | Browser-sent `Origin` must be local or `--cors`-allowlisted (a literal `*` is never honored); the auth cookie is `SameSite=Strict` |
+| DNS rebinding (attacker domain resolving to 127.0.0.1) | The loopback exemption requires a local `Host` header |
+| Spoofed client IPs | `X-Forwarded-For` is never consulted for the loopback exemption |
+| XSSI reads of uploaded files | `X-Content-Type-Options: nosniff` on served uploads |
+
+IM channels (Feishu, DingTalk, Discord, …) authenticate separately via each
+platform's bot credentials plus octo's chat/user binding; the adapters hold
+outbound connections only and expose no inbound HTTP routes.
+
+### What is not defended (by design)
+
+- **Hostile local processes.** Loopback traffic is trusted; malware running
+  as any local user on the same machine can reach the API. If your machine
+  is shared or compromised, the access key does not help you.
+- **Plaintext transport.** The key travels in cookies/headers over HTTP.
+  On untrusted networks, terminate TLS in front (reverse proxy, `tailscale
+  serve`) or tunnel.
+- **Brute force.** No lockout or rate limiting: the key is 256 bits of
+  `crypto/rand`; online guessing is not viable.
+- **Agent-written HTML.** Session artifacts and Light Apps render in a frame
+  from a path on octo's own origin (`/_artifacts/…`, `/_apps/…`), so they work
+  however octo is reached. Same origin means the page is not isolated from
+  the app: its script can read the access key and call the API as the user.
+  A prompt injection that gets the agent to write a page gets that page this
+  power once the user opens it. The frame keeps a page's styles and scripts
+  out of the UI, and its `localStorage` keys apart from the UI's, but that is
+  protection against accidents, not against a hostile page. A Light App the
+  user marks public is served without the key to anyone who has the link.
+  An `/_artifacts/<token>/` URL needs no key either: the token, minted only
+  for a caller holding the key, is the credential, so the mobile app's
+  cookie-less frames can load it. Anyone holding the URL can read the files
+  in that page's directory and use the page's databases until the token
+  lapses (a day unused, or a server restart).
+
+## The access key
+
+Resolution precedence: `octo serve -access-key` flag → `OCTO_ACCESS_KEY`
+env var → `access_key` in `~/.octo/config.yml` → auto-generated on first
+start and persisted to `config.yml` (mode 0600). When the bind address is
+not loopback-only, startup prints a ready-to-open URL embedding the key;
+the web UI stores it and strips it from the address bar.
+
+Clients present the key as `Authorization: Bearer <key>`, `X-Access-Key`,
+or the `octo_access_key` cookie (the `access_key` query parameter is
+accepted on `/ws` only). `GET /api/health` and `GET /api/version` are the
+only unauthenticated API routes; they carry no secrets.
+
+To rotate the key: edit `access_key` in `~/.octo/config.yml` and restart
+(or `POST /api/restart`).
+
+## The update channel
+
+`octo upgrade` (and the web UI's upgrade button) installs the latest GitHub
+release after verifying the archive's SHA-256 against the same release's
+`checksums.txt`. Both are fetched over GitHub's TLS — the verification
+catches transport corruption and mirror tampering, **not** a compromised
+GitHub account publishing a malicious release; there is no signature layer
+yet. Upgrades run only on explicit user action (the version *check* behind
+the web badge is automatic; the install never is), and the web trigger
+sits behind the access-key auth like every other mutating endpoint.
+
+## Code signing policy
+
+Neither installer is code-signed yet, so the operating system shows an
+unrecognized-publisher warning on first launch:
+
+- **Windows** (`octo-setup.exe`): SmartScreen shows "Windows protected your
+  PC" — click **More info → Run anyway**.
+- **macOS** (`octo-setup.pkg`): Gatekeeper shows an unidentified-developer
+  warning. There's no Apple Developer Program membership behind this project,
+  so this is expected for every release until that changes.
+
+Release integrity is instead verified by hash: every archive is checked
+against the `checksums.txt` published alongside it on each GitHub release
+(the same SHA-256 check `octo upgrade` runs automatically).
+
+## Reporting a vulnerability
+
+Open a [GitHub security advisory](https://github.com/open-octo/octo-agent/security/advisories/new)
+or email the maintainer privately. Please do not file public issues for
+exploitable bugs.

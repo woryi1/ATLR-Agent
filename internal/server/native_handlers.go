@@ -1,0 +1,588 @@
+package server
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+)
+
+// NativeBridge is the desktop shell's hook into OS-native capabilities that a
+// browser can't provide. It is nil under `octo serve` and set only by the
+// Wails desktop build (cmd/octo-desktop), which supplies an implementation
+// backed by the Wails runtime. When nil, the /api/native/* routes are never
+// registered, so `octo serve` exposes no extra surface — the whole native
+// layer is opt-in at construction, not a runtime branch on every request.
+type NativeBridge interface {
+	// PickFolder opens an OS directory-choose dialog seeded at startDir (which
+	// may be empty) and returns the chosen absolute path. cancelled is true
+	// when the user dismissed the dialog without choosing, in which case path
+	// is empty.
+	PickFolder(ctx context.Context, startDir string) (path string, cancelled bool, err error)
+
+	// PickFile opens an OS file-choose dialog and returns the chosen absolute
+	// path. Same cancelled semantics as PickFolder.
+	PickFile(ctx context.Context, startDir string) (path string, cancelled bool, err error)
+
+	// Notify raises an OS-native notification. Best-effort: the host logs its
+	// own failures; callers don't handle an error.
+	Notify(title, body string)
+
+	// NotifySession raises an OS-native notification that, when clicked, focuses
+	// the app and navigates to the given session. Best-effort like Notify.
+	NotifySession(title, body, sessionID string)
+
+	// DismissSessionNotification retracts the notification previously raised
+	// for the session — the user has opened the session in the app, so the OS
+	// notification has done its job. Best-effort like NotifySession; a no-op on
+	// platforms that can't retract delivered notifications (Windows).
+	DismissSessionNotification(sessionID string)
+
+	// AutostartEnabled reports whether the app is registered to launch at login.
+	AutostartEnabled() (bool, error)
+	// SetAutostart registers (enable) or unregisters the app from launch-at-login.
+	SetAutostart(enable bool) error
+
+	// ToggleMaximise maximises the window if it isn't, or restores it if it is —
+	// the double-click-the-titlebar zoom the frontend's draggable header can't do
+	// itself (the page is octo-served, so it has no Wails runtime to call).
+	ToggleMaximise()
+
+	// Minimise minimises the window to the taskbar/dock.
+	Minimise()
+
+	// Close closes the window. While the hub keeps running in the tray the shell
+	// hides the window instead of destroying it; otherwise the app's ShouldQuit
+	// hook decides whether the process terminates.
+	Close()
+
+	// WindowState reports whether the window is currently maximised. Used by the
+	// frontend to keep its maximise icon in sync with reality (covers Aero Snap,
+	// keyboard shortcuts, etc. that the frontend can't otherwise observe). Returns
+	// false before the window exists.
+	WindowState() bool
+
+	// OpenExternal opens url in the user's default browser — used by the update
+	// badge's "Download update" action to reach the release page, since the
+	// desktop build updates through its installer, not an in-place swap. The
+	// server validates url is http/https before calling.
+	OpenExternal(url string) error
+
+	// OpenFolder reveals dir in the OS file manager (Finder, Explorer, the
+	// desktop's file browser) — the sidebar's "Open folder" action on a project
+	// or a session, which a browser tab cannot do at all. The server validates
+	// dir exists and is a directory before calling.
+	OpenFolder(dir string) error
+
+	// SaveFile shows an OS save dialog seeded with defaultName, writes content
+	// to the chosen path, and returns it. cancelled is true when the user
+	// dismissed the dialog (path empty). Backs the artifact "Download" action:
+	// the octo-served webview can't trigger an in-page blob download, so the
+	// desktop shell writes the file through a native dialog instead.
+	SaveFile(ctx context.Context, defaultName, content string) (path string, cancelled bool, err error)
+
+	// Print opens the OS print dialog for the window's current content. Backs
+	// the transcript's PDF export, which prints the live DOM through a print
+	// stylesheet rather than generating a PDF itself — no PDF library, no
+	// embedded font, and the engine handles pagination and CJK. The frontend
+	// routes through here rather than calling window.print() because Wails
+	// implements print natively on macOS.
+	//
+	// Returns as soon as the dialog is up, not when printing finishes: on macOS
+	// the print panel is a window sheet. Callers must leave the DOM the print
+	// stylesheet depends on in place after this returns.
+	Print() error
+
+	// Heartbeat records a liveness beat from the frontend running inside the
+	// desktop webview, so the shell can tell a live page from a dead or black
+	// one and revive (destroy and re-create) the window rather than
+	// foregrounding a surface that will never paint again.
+	//
+	// The beat arriving is itself the proof that JS runs. The two arguments
+	// describe the render pipeline, and they must stay distinct:
+	//   - frameAgeMS >= 0: how long ago the page observed a
+	//     requestAnimationFrame tick, i.e. frames are being produced.
+	//   - frameAgeMS < 0: the page has not observed a frame at all yet.
+	//   - hidden: the page reports itself not visible, so it legitimately owes
+	//     no frames (minimised, occluded, another desktop).
+	//
+	// A visible page that beats without ever producing a frame is the black-
+	// window signature — conflating that with "hidden" would make the failure
+	// this whole mechanism exists for undetectable.
+	Heartbeat(frameAgeMS int64, hidden bool)
+}
+
+type nativePickFolderRequest struct {
+	StartDir string `json:"start_dir"`
+}
+
+// POST /api/native/pick-folder — open the OS folder dialog (desktop only) and
+// return the chosen directory. The frontend then sets it as the session
+// working dir through the existing PATCH /api/sessions/{id}/working_dir,
+// reusing that endpoint's validation and the cwd-chip refresh rather than
+// duplicating them here. Registered only when a NativeBridge is present.
+func (s *Server) handleNativePickFolder(w http.ResponseWriter, r *http.Request) {
+	// Same-machine only. In the desktop build every request is genuinely local
+	// anyway; the guard refuses to drive a native dialog on behalf of some other
+	// peer if the port is reachable — including one behind a tunnel that dials
+	// the server from loopback (see isLocalRequest).
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "native dialogs are available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		// Unreachable via routing (the route isn't registered without a bridge),
+		// kept as defense so a future unconditional registration can't panic.
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+
+	// Body is optional; a missing or unparseable one just leaves StartDir empty.
+	var req nativePickFolderRequest
+	_ = readBodyJSON(r, &req)
+
+	path, cancelled, err := s.cfg.Native.PickFolder(r.Context(), req.StartDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path":      path,
+		"cancelled": cancelled,
+	})
+}
+
+// POST /api/native/pick-file — open the OS file dialog (desktop only) and
+// return the chosen absolute path. The frontend attaches it by real path (no
+// upload) so the agent reads it in place. Registered only with a bridge.
+func (s *Server) handleNativePickFile(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "native dialogs are available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	var req nativePickFolderRequest
+	_ = readBodyJSON(r, &req)
+	path, cancelled, err := s.cfg.Native.PickFile(r.Context(), req.StartDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path":      path,
+		"cancelled": cancelled,
+	})
+}
+
+type nativeNotifyRequest struct {
+	Title     string `json:"title"`
+	Body      string `json:"body"`
+	SessionID string `json:"session_id"`
+}
+
+// POST /api/native/notify — raise an OS-native notification (desktop only).
+// The frontend calls this in desktop mode instead of the browser Notification
+// API, which native webviews don't implement. When session_id is present, the
+// desktop shell routes a click on that notification to the specified session.
+// Best-effort: it always returns ok; the bridge swallows delivery failures.
+// Registered only with a bridge.
+func (s *Server) handleNativeNotify(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "native notifications are available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	var req nativeNotifyRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if req.SessionID != "" {
+		s.cfg.Native.NotifySession(req.Title, req.Body, req.SessionID)
+	} else {
+		s.cfg.Native.Notify(req.Title, req.Body)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// POST /api/native/notify/dismiss — retract the notification a session
+// previously raised, because the user is now looking at that session in the
+// app. Best-effort like the notify endpoint: always ok, and a no-op on
+// platforms that can't retract delivered notifications (Windows).
+// Registered only with a bridge.
+func (s *Server) handleNativeNotifyDismiss(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "native notifications are available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	var req nativeNotifyRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if req.SessionID != "" {
+		s.cfg.Native.DismissSessionNotification(req.SessionID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+type nativeAutostartRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+// GET /api/native/autostart — report launch-at-login state (desktop only).
+func (s *Server) handleNativeAutostartGet(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	enabled, err := s.cfg.Native.AutostartEnabled()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": enabled})
+}
+
+// PUT /api/native/autostart — set launch-at-login (desktop only).
+func (s *Server) handleNativeAutostartSet(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	var req nativeAutostartRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if err := s.cfg.Native.SetAutostart(req.Enabled); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": req.Enabled})
+}
+
+// POST /api/native/window/toggle-maximise — maximise/restore the desktop window
+// (the double-click-titlebar zoom). Desktop only, loopback-gated.
+func (s *Server) handleNativeToggleMaximise(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	s.cfg.Native.ToggleMaximise()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// POST /api/native/window/minimise — minimise the desktop window to the
+// taskbar/dock. Desktop only, loopback-gated.
+func (s *Server) handleNativeMinimise(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	s.cfg.Native.Minimise()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+type nativeHeartbeatRequest struct {
+	FrameAgeMS int64 `json:"frame_age_ms"`
+	Hidden     bool  `json:"hidden"`
+}
+
+// POST /api/native/heartbeat — liveness beat from the page inside the desktop
+// webview (nativeShell mode only sends it). Desktop only, loopback-gated.
+func (s *Server) handleNativeHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	// Body is optional-tolerant like the other native handlers, but the default
+	// must claim NO frame evidence: the request alone proves JS is alive and
+	// says nothing about rendering. Defaulting FrameAgeMS to its zero value
+	// would read as "a frame just landed" — the strongest health signal —
+	// letting a malformed beat mask a black window.
+	req := nativeHeartbeatRequest{FrameAgeMS: -1}
+	_ = readBodyJSON(r, &req)
+	s.cfg.Native.Heartbeat(req.FrameAgeMS, req.Hidden)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// POST /api/native/window/close — close the desktop window. The app's ShouldQuit
+// decides whether the hub actually terminates or keeps running in the tray.
+// Desktop only, loopback-gated.
+func (s *Server) handleNativeClose(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	s.cfg.Native.Close()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// GET /api/native/window/state — report whether the desktop window is currently
+// maximised. Lets the frontend keep its maximise icon in sync after Aero Snap,
+// keyboard shortcuts, etc. Desktop only, loopback-gated.
+func (s *Server) handleNativeWindowState(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"maximised": s.cfg.Native.WindowState()})
+}
+
+type nativeOpenExternalRequest struct {
+	URL string `json:"url"`
+}
+
+// POST /api/native/open-external — open a URL with the system's default
+// handler (desktop only). The update badge calls this in installer mode to
+// reach the release download page; chat links route through it too. Loopback-
+// gated like the other native routes, and restricted to an allowlist of
+// user-facing schemes (http/https for the browser, mailto/tel for the mail and
+// dialer apps) so the endpoint can't be coerced into launching an arbitrary
+// local handler (file://, custom app schemes).
+// openExternalSchemeAllowed reports whether a URL scheme is safe to hand to the
+// system's default handler: the browser (http/https) and the mail/dialer apps
+// (mailto/tel). Everything else — file://, custom app schemes — is rejected so
+// the loopback endpoint can't be turned into a local-handler launcher.
+func openExternalSchemeAllowed(scheme string) bool {
+	switch scheme {
+	case "http", "https", "mailto", "tel":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) handleNativeOpenExternal(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	var req nativeOpenExternalRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	u, err := url.Parse(req.URL)
+	if err != nil || !openExternalSchemeAllowed(u.Scheme) {
+		writeError(w, http.StatusBadRequest, "only http(s), mailto, and tel URLs may be opened")
+		return
+	}
+	if err := s.cfg.Native.OpenExternal(req.URL); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+type nativeOpenFolderRequest struct {
+	SessionID string `json:"session_id"`
+	GroupID   string `json:"group_id"`
+	// SourceDir, with GroupID, asks for one of that project's mounted source
+	// folders instead of its workspace. It selects among the project's own
+	// records — see the note below on why that is not the same as accepting a
+	// path.
+	SourceDir string `json:"source_dir,omitempty"`
+}
+
+// POST /api/native/open-folder — reveal a session's or a project's directory in
+// the OS file manager (desktop only). Backs the sidebar's "Open folder" action.
+//
+// The caller names a row, never a path. For a session that is sessionCwdByID —
+// the same resolution every other surface uses. For a project it is the
+// workspace, or, when source_dir names one of that project's mounted folders,
+// that folder: a project's work lives in the folders it mounts, and a menu
+// entry that could only ever reach the (usually empty) workspace was taking
+// people somewhere they had no reason to go.
+//
+// source_dir is a selector, not a path. It must match a folder already in this
+// project's source_dirs, and what gets opened is the registry's own spelling of
+// it, never the caller's string — so this stays "take me to where this row's
+// work happens" and does not become an "open any directory on this machine"
+// primitive with a caller-controlled string on its way to the platform opener.
+//
+// Loopback-gated like the other native routes: opening a window on the desktop
+// host is never something a remote peer gets to do.
+func (s *Server) handleNativeOpenFolder(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	var req nativeOpenFolderRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+
+	var dir string
+	switch {
+	case strings.TrimSpace(req.GroupID) != "":
+		gid := strings.TrimSpace(req.GroupID)
+		if src := strings.TrimSpace(req.SourceDir); src != "" {
+			dir = projectSourceDirByGroupID(gid, src)
+			if dir == "" {
+				writeError(w, http.StatusNotFound, "that project does not mount that source folder")
+				return
+			}
+			break
+		}
+		dir = projectDirByGroupID(gid)
+		if dir == "" {
+			writeError(w, http.StatusNotFound, "no project with that id, or it has no working directory")
+			return
+		}
+	case strings.TrimSpace(req.SessionID) != "":
+		id := strings.TrimSpace(req.SessionID)
+		// Existence check first: an unknown id would otherwise resolve to the
+		// server's default directory, quietly opening the wrong folder.
+		if _, err := agent.LoadSession(id); err != nil {
+			writeError(w, http.StatusNotFound, "no session with that id")
+			return
+		}
+		dir = s.sessionCwdByID(id)
+	default:
+		writeError(w, http.StatusBadRequest, "session_id or group_id is required")
+		return
+	}
+
+	// The dir is octo's own record, but records outlive directories: a project
+	// whose folder was deleted or moved still carries the old path.
+	info, err := os.Stat(dir)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("directory is not accessible: %s (%v)", dir, unwrapPathError(err)))
+		return
+	}
+	if !info.IsDir() {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("not a directory: %s", dir))
+		return
+	}
+	if err := s.cfg.Native.OpenFolder(dir); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": dir})
+}
+
+type nativeSaveFileRequest struct {
+	Name    string `json:"name"`
+	Content string `json:"content"`
+	// Encoding defaults to "utf8" (content written as-is). When "base64",
+	// content is decoded to bytes before writing — used for binary blobs
+	// (e.g. skill zip exports) that would otherwise not survive a UTF-8
+	// JSON round-trip.
+	Encoding string `json:"encoding"`
+}
+
+// POST /api/native/save-file — show the OS save dialog (desktop only), write
+// the posted content to the chosen path, and return it. The artifact panel
+// calls this instead of an in-page blob download: the page is octo-served, so
+// the webview has no download delegate and a blob <a download> click does
+// nothing. Loopback-gated like the other native routes; registered only with a
+// bridge.
+func (s *Server) handleNativeSaveFile(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "native dialogs are available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	var req nativeSaveFileRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	content := req.Content
+	if req.Encoding == "base64" {
+		decoded, err := base64.StdEncoding.DecodeString(req.Content)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid base64 content")
+			return
+		}
+		content = string(decoded)
+	}
+	path, cancelled, err := s.cfg.Native.SaveFile(r.Context(), req.Name, content)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path":      path,
+		"cancelled": cancelled,
+	})
+}
+
+// POST /api/native/print — open the OS print dialog for the desktop window.
+// Backs the transcript's PDF export: the print stylesheet lays the conversation
+// out and the webview's own engine paginates it. Returns once the dialog is up,
+// not once printing finishes, so the frontend must keep the transcript on screen
+// afterwards. Loopback-gated like the other native routes; registered only with
+// a bridge.
+func (s *Server) handleNativePrint(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "native dialogs are available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	if err := s.cfg.Native.Print(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}

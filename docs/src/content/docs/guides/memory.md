@@ -1,0 +1,113 @@
+---
+title: Give it memory
+description: Cross-session memory as plain markdown files, stored locally.
+---
+
+octo remembers your preferences, project conventions, and past corrections across sessions —
+stored locally in `~/.octo/memories/<project-slug>/`, never in the cloud.
+
+## How it works
+
+There's no dedicated `remember`/`forget` tool and no code-driven consolidation step. The agent
+manages memory the same way it manages any file — with `read_file` / `write_file` / `edit_file` —
+keeping to one convention:
+
+- `MEMORY.md` — the index. Loaded into the system prompt every session (first 200 lines / 25KB,
+  whichever comes first — mirrors Claude Code's own injection cap).
+- `<topic>.md` — detail files the agent creates and reads on demand, linked from the index.
+
+The whole `~/.octo/memories` tree gets an automatic `allow` rule for `write_file`/`edit_file` in the
+[permission engine](/docs/reference/permissions/), so the agent manages its notes without a prompt on
+every write — including filing a fact into *another* project's memory when you ask it to work on a
+repo other than the current directory. Everything outside that tree is still gated normally, and
+`--no-memory` withdraws the rule along with the injection.
+
+```bash
+octo memory list           # list the project's and inherited memory files
+octo memory path           # print the project's and inherited memory directories
+octo memory path <dir>     # …for another directory (how the agent resolves another project's memory)
+octo --no-memory           # disable memory injection for a single session
+```
+
+## Scope
+
+Memory is scoped to the **project**, and what counts as a project is what you made one — not what
+git thinks. Plenty of real work lives in directories git has never heard of, and plenty of checkouts
+are passed through rather than worked on.
+
+Where that project comes from depends on how you're running octo:
+
+- **Web UI / desktop / IM** — from the project a session is filed under (the *Projects* section of
+  the sidebar: a group with a working directory). Every session in a project reads and writes that
+  project's notes. A loose task, filed under no project, uses the shared set below — which is the
+  point: such a session is often working on code somewhere else entirely ("fix the login bug in
+  project X"), and notes buried under a directory nothing else opens would be invisible to the
+  session that later works inside project X.
+- **CLI / TUI** — the directory you're standing in *is* the project; you `cd` somewhere to work on
+  it. A session you resume with `-c` that belongs to a project in the Web UI gets that project's
+  memory instead, wherever you launched octo from.
+
+Those two rules can give the same directory different answers, and it's worth knowing when. A
+checkout you work in from the CLI has memory of its own there — but a web session merely *pointed at*
+that directory is a task, and reads the shared set instead. Make it a project (in the sidebar's
+*Projects* section) and both ends agree. `octo memory list` says so when it notices: if no project
+points at the directory you're in, it tells you those notes are CLI-only.
+
+A second, home-level index (`~/.octo/memories/<home-slug>/MEMORY.md`) is inherited into *every*
+project, injected **before** the project's own index — it's the place for things that aren't about
+one project, like how you like to work; project-specific facts belong in the project's own memory.
+Running from your home directory needs no special case: home's own directory *is* that shared set.
+
+## Two rule tiers, beyond plain notes
+
+`MEMORY.md` supports two optional sections that behave differently from a plain pointer index:
+
+- **Always-apply rules** — part of the system prompt like the rest of `MEMORY.md`; restated once the conversation has grown far past it (about 100k tokens) so they stay close to what you're doing, and right away if the session's prompt was frozen before the rule was added. For something that must never be missed.
+- **Triggered rules** — each written as a rule plus a set of trigger keywords; recalled once per
+  session the first time one of its keywords appears in what you type (English keywords match on
+  word boundaries, so `deploy` doesn't fire on `deployment`; Chinese keywords match as a substring).
+
+Both are delivered as a reminder attached to your message rather than edited into the system
+prompt, so the cached prompt prefix stays byte-stable. A plain index with neither section costs
+nothing extra beyond the index itself.
+
+## The save-nudge
+
+After a `terminal` call whose command matches `gh pr create` or `gh pr merge` succeeds, octo appends
+a one-time reminder to that tool's result suggesting the model check whether anything from the just-
+landed work is durable enough to record — a settled decision, a ruled-out approach, a constraint
+future sessions need to respect. It fires at most once per user turn, so a long streak of git
+commands doesn't nag repeatedly; see it listed alongside every other configured hook via
+[`octo hooks list`](/docs/guides/hooks/).
+
+## When memory changes take effect
+
+The system prompt is composed once and then reused as is. The web UI and IM compose it the first
+time a session takes a turn and store it with the session, so resuming the session later, or an IM
+chat being rebound to it, picks up that same frozen prompt. The CLI composes it each time `octo`
+starts, resuming included, and keeps it for the life of that process. `/reload` recomposes it on
+the spot, over any transport. This is deliberate, not an oversight: recomposing on every turn would
+vary the text on anything that can change mid-session — the memory file included — and invalidate
+the provider's prompt-cache prefix on that turn and every one after.
+
+So what you tell the agent mid-session is already live in that conversation's own history — it
+doesn't need a fresh read of `MEMORY.md` to know it. What the agent *writes* to memory during a
+session surfaces in the next prompt composed — normally the *next* session, or after `/reload` —
+which is exactly when a plain
+index file is supposed to matter — for a conversation that hasn't lived through the one where it was
+learned.
+
+## What ends up in it
+
+In practice the agent uses this to track things that aren't recoverable from the code itself:
+who's doing what and why, standing preferences you've stated ("always use worktrees for this
+repo"), and corrections you've given more than once. It does not duplicate what `git log` or the
+code already says.
+
+:::tip
+If `MEMORY.md` grows past the injection budget, octo appends a truncation warning rather than
+silently dropping content — a signal that it's time to consolidate detail into topic files.
+:::
+
+Next: memory pairs well with [hooks](/docs/guides/hooks/) for other side effects beyond the built-in
+save-nudge.

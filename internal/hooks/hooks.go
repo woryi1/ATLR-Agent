@@ -1,0 +1,316 @@
+// Package hooks implements C9 Phase 3 turn-boundary hooks. External
+// retrieval layers (notably Hindsight) plug into octo by registering a
+// pre-turn command (called before every REPL turn; stdout is injected
+// as additional context) and/or a post-turn command (called after,
+// receives the user input + assistant reply for retention). The
+// surface is the same shell-out pattern Claude Code's UserPromptSubmit
+// hook uses, so existing Hindsight scripts work with octo unchanged.
+//
+// Configuration is env-var driven in v1:
+//
+//	OCTO_HOOK_PRE_TURN   = /path/to/pre-script   (optional)
+//	OCTO_HOOK_POST_TURN  = /path/to/post-script  (optional)
+//	OCTO_HOOK_TIMEOUT    = 5s                    (optional, default below)
+//
+// A future PR may add ~/.octo/hooks.yml for layered config, but env vars
+// cover the v1 "advanced user wiring Hindsight" use case without YAML
+// parsing surface area.
+//
+// Hook protocol (stdin → script → stdout):
+//
+//	pre-turn:  stdin JSON {"user_input": "..."}
+//	           stdout JSON {"additional_context": "..."}   OR  plain text
+//	           non-empty stdout → injected into the user message
+//	           exit non-zero → ignored (logged), turn proceeds without injection
+//	post-turn: stdin JSON {"user_input": "...", "assistant_reply": "..."}
+//	           stdout ignored (fire-and-forget on success);
+//	           non-zero exit → logged but never blocks the next prompt.
+package hooks
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/executil"
+)
+
+// DefaultTimeout caps how long the REPL is willing to wait for a hook.
+// Pre-turn hooks block the user's prompt response, so the budget is
+// tight; post-turn hooks block the next prompt, also tight. 5s is
+// generous for an embedding lookup or a write to a local DB.
+const DefaultTimeout = 5 * time.Second
+
+// timeoutCeiling caps the env-supplied OCTO_HOOK_TIMEOUT so a fat-
+// fingered value doesn't hang the REPL indefinitely. 30 seconds is
+// well past any reasonable retrieval call.
+const timeoutCeiling = 30 * time.Second
+
+// Runner executes the configured pre-turn / post-turn hooks. The zero
+// Runner is a no-op — pre/post calls return cleanly with no work done,
+// so callers don't have to branch on "is a hook configured" themselves.
+//
+// One Runner per REPL session; safe to share across the loop.
+type Runner struct {
+	PreTurnCmd  string        // empty → no pre-turn hook
+	PostTurnCmd string        // empty → no post-turn hook
+	Timeout     time.Duration // zero → DefaultTimeout
+}
+
+// LoadFromEnv reads the hook configuration from the standard env vars.
+// Always returns a Runner; an unconfigured environment yields a zero
+// Runner whose Pre and Post are no-ops.
+func LoadFromEnv() *Runner {
+	r := &Runner{
+		PreTurnCmd:  strings.TrimSpace(os.Getenv("OCTO_HOOK_PRE_TURN")),
+		PostTurnCmd: strings.TrimSpace(os.Getenv("OCTO_HOOK_POST_TURN")),
+	}
+	if raw := strings.TrimSpace(os.Getenv("OCTO_HOOK_TIMEOUT")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			if d > timeoutCeiling {
+				d = timeoutCeiling
+			}
+			r.Timeout = d
+		}
+	}
+	return r
+}
+
+// Configured reports whether at least one hook is wired. Used by the
+// REPL to skip the "running hook…" trace lines when no hooks are
+// configured (the common case for users who don't run Hindsight).
+func (r *Runner) Configured() bool {
+	if r == nil {
+		return false
+	}
+	return r.PreTurnCmd != "" || r.PostTurnCmd != ""
+}
+
+// timeout returns the configured per-hook deadline.
+func (r *Runner) timeout() time.Duration {
+	if r != nil && r.Timeout > 0 {
+		return r.Timeout
+	}
+	return DefaultTimeout
+}
+
+// Pre runs the pre-turn hook and returns the additional context to
+// inject into the user's message. Returns "" with no error when no
+// hook is configured (the no-op path). Hook failures are non-fatal:
+// they return an error so the caller can log it, but the user's turn
+// proceeds as if no context was added.
+//
+// Output protocol: stdout is interpreted as JSON first; if it parses
+// as {"additional_context": "..."}, that field is used. If it doesn't
+// parse, stdout is used verbatim. This lets scripts emit either a
+// structured response (recommended) or a quick `echo "extra context"`.
+func (r *Runner) Pre(ctx context.Context, userInput string) (string, error) {
+	if r == nil || r.PreTurnCmd == "" {
+		return "", nil
+	}
+	payload, err := json.Marshal(map[string]any{"user_input": userInput})
+	if err != nil {
+		return "", err
+	}
+	stdout, err := r.run(ctx, r.PreTurnCmd, payload)
+	if err != nil {
+		return "", err
+	}
+	return parsePreOutput(stdout), nil
+}
+
+// Post runs the post-turn hook in a fire-and-forget fashion: errors are
+// returned so the caller can log them but never propagated up the chain
+// — a flaky retain step shouldn't block the next user prompt. The hook
+// still runs synchronously (within the timeout) so a misbehaving script
+// can't pile up unbounded background goroutines.
+//
+// Output is ignored: the post hook is for side effects (writing to a
+// retrieval index), not for shaping the next turn.
+func (r *Runner) Post(ctx context.Context, userInput, assistantReply string) error {
+	if r == nil || r.PostTurnCmd == "" {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]any{
+		"user_input":      userInput,
+		"assistant_reply": assistantReply,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = r.run(ctx, r.PostTurnCmd, payload)
+	return err
+}
+
+// run executes cmd, piping payload to its stdin, with a deadline. The command
+// is invoked through the platform shell — POSIX `sh -c` on macOS/Linux,
+// PowerShell on Windows (same selection the terminal tool makes) — so users can
+// write `OCTO_HOOK_PRE_TURN="./script | filter"` pipelines without quoting the
+// shell themselves, in that platform's syntax.
+func (r *Runner) run(ctx context.Context, cmd string, stdin []byte) ([]byte, error) {
+	return execShell(ctx, cmd, stdin, r.timeout())
+}
+
+// execShell runs cmd through the platform shell with stdin piped in, bounded by
+// deadline. Shared by the legacy Runner and the Engine so the timeout/kill/
+// stderr-tail behaviour stays identical across both. On a non-zero exit it
+// returns whatever stdout was captured plus an error whose wording distinguishes
+// a timeout from a plain failure (with the stderr tail folded in) to help users
+// debug hook wiring.
+func execShell(ctx context.Context, cmd string, stdin []byte, deadline time.Duration) ([]byte, error) {
+	return execShellDir(ctx, cmd, stdin, deadline, "")
+}
+
+// execShellDir is execShell with an explicit working directory. An empty dir
+// inherits the process cwd. The async path passes the hook's originating cwd so
+// a relative command runs where it was configured, not in whatever process
+// later claims a spilled item.
+func execShellDir(ctx context.Context, cmd string, stdin []byte, deadline time.Duration, dir string) ([]byte, error) {
+	res := runShellRaw(ctx, cmd, stdin, deadline, dir)
+	if res.timedOut {
+		return res.stdout, fmt.Errorf("hooks: %s timed out after %s", cmd, deadline)
+	}
+	if res.runErr != nil {
+		if tail := strings.TrimSpace(string(res.stderr)); tail != "" {
+			return res.stdout, fmt.Errorf("hooks: %s: %w (stderr: %s)", cmd, res.runErr, oneLineCap(tail, 200))
+		}
+		return res.stdout, fmt.Errorf("hooks: %s: %w", cmd, res.runErr)
+	}
+	return res.stdout, nil
+}
+
+// shellResult is the low-level outcome of running a hook command: captured
+// stdout/stderr, the process exit code, and flags distinguishing a deadline
+// kill from a normal non-zero exit. Callers that only need "did it succeed" use
+// execShell; the PreToolUse decision path needs the exit code (2 = block).
+type shellResult struct {
+	stdout   []byte
+	stderr   []byte
+	exitCode int  // 0 on success; the process code on a normal exit; -1 if it never ran
+	timedOut bool // the deadline fired and the process was killed
+	runErr   error
+}
+
+// runShellRaw runs cmd through the platform shell with stdin piped in, bounded
+// by deadline, and reports the full outcome. It is the single place the shell
+// selection, WaitDelay teardown, and timeout live.
+func runShellRaw(ctx context.Context, cmd string, stdin []byte, deadline time.Duration, dir string) shellResult {
+	rctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
+	c := shellCmd(rctx, cmd)
+	if dir != "" {
+		c.Dir = dir
+	}
+	c.Stdin = bytes.NewReader(stdin)
+	var out, errBuf bytes.Buffer
+	c.Stdout = &out
+	c.Stderr = &errBuf
+	// WaitDelay (Go 1.20+) bounds how long Run blocks after the process is
+	// killed waiting for its stdio pipes to close. Without it, a `sh -c`
+	// whose child (e.g. `sleep`) keeps the pipes open survives the SIGKILL
+	// on the shell — Run hangs until the child terminates naturally. 1s
+	// is plenty for the kernel to tear down the process group.
+	c.WaitDelay = time.Second
+	err := c.Run()
+	res := shellResult{stdout: out.Bytes(), stderr: errBuf.Bytes()}
+	if err == nil {
+		return res
+	}
+	if errors.Is(rctx.Err(), context.DeadlineExceeded) {
+		res.timedOut = true
+		res.runErr = err
+		return res
+	}
+	res.runErr = err
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		res.exitCode = ee.ExitCode()
+	} else {
+		res.exitCode = -1 // never started (e.g. shell not found)
+	}
+	return res
+}
+
+// shellCmd wraps cmd in the platform shell: PowerShell on Windows, POSIX sh -c
+// elsewhere. The shell comes from executil.PowerShell — the same selection the
+// terminal tool makes — so a hook script behaves like a command the terminal
+// tool would run rather than landing on a different PowerShell.
+func shellCmd(ctx context.Context, cmd string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		shell := executil.PowerShell()
+		c := exec.CommandContext(ctx, shell, "-NoProfile", "-NonInteractive", "-Command", executil.PowerShellUTF8EncodingPrefix+cmd)
+		executil.SetNoWindow(c)
+		return c
+	}
+	return exec.CommandContext(ctx, "sh", "-c", cmd)
+}
+
+// parsePreOutput accepts either a JSON object with an additional_context
+// field, or a raw text payload. Empty / whitespace-only stdout yields "".
+func parsePreOutput(stdout []byte) string {
+	trimmed := strings.TrimSpace(string(stdout))
+	if trimmed == "" {
+		return ""
+	}
+	// Try the structured form first.
+	if strings.HasPrefix(trimmed, "{") {
+		var obj struct {
+			AdditionalContext string `json:"additional_context"`
+		}
+		if err := json.Unmarshal([]byte(trimmed), &obj); err == nil {
+			return strings.TrimSpace(obj.AdditionalContext)
+		}
+	}
+	// Fall through to raw stdout. The script that printed it gets to
+	// choose its own formatting — newlines are preserved.
+	return trimmed
+}
+
+// InjectContext wraps additional context (from a pre-turn hook) and the
+// user's original message into a single string to send to the model.
+// Centralized here so cmd/octo doesn't reinvent the framing each turn —
+// and so the surface stays stable if we decide to relocate the hook
+// output (e.g. into the system prompt instead of the user message).
+//
+// Format: original message, then a divider, then a labelled block so
+// the model knows where the user stopped speaking and the retrieval
+// layer started.
+func InjectContext(userInput, additionalContext string) string {
+	additionalContext = strings.TrimSpace(additionalContext)
+	if additionalContext == "" {
+		return userInput
+	}
+	var b strings.Builder
+	b.WriteString(userInput)
+	b.WriteString("\n\n---\nAdditional context (from pre-turn hook):\n")
+	b.WriteString(additionalContext)
+	return b.String()
+}
+
+// oneLineCap collapses s to a single line and truncates to max runes
+// for stderr-tail rendering. Multi-line script errors would otherwise
+// spam the REPL.
+func oneLineCap(s string, max int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) > max {
+		s = s[:max] + "…"
+	}
+	return s
+}
+
+// devNull is a writer that discards everything. Some test helpers want
+// to silence the runner without touching its public Out surface.
+var _ io.Writer = devNull{}
+
+type devNull struct{}
+
+func (devNull) Write(p []byte) (int, error) { return len(p), nil }

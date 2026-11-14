@@ -1,0 +1,3276 @@
+package server
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/config"
+	"github.com/open-octo/octo-agent/internal/datahome"
+	"github.com/open-octo/octo-agent/internal/skills"
+	"github.com/open-octo/octo-agent/internal/tools"
+)
+
+// serveLoopback dispatches through the given handler as a local browser
+// would: loopback peer, local Host — so handler tests exercise their
+// endpoint, not the auth middleware. Auth-specific tests craft their own
+// RemoteAddr/Host (see auth_test.go).
+func serveLoopback(h http.Handler, w http.ResponseWriter, req *http.Request) {
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Host = "127.0.0.1:8080"
+	h.ServeHTTP(w, req)
+}
+
+func TestHandleHealth(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["status"] != "ok" {
+		t.Fatalf("status = %q, want ok", body["status"])
+	}
+}
+
+func TestHandleListSessions(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var body sessionListResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Sessions == nil {
+		t.Fatal("expected non-nil sessions slice")
+	}
+}
+
+func TestHandleGetSession_NotFound(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/nonexistent", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestHandleDeleteSession(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "")
+	sess.Messages = []agent.Message{{Role: agent.RoleUser, Content: "hi"}}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	// Register a fake connection to capture the global session_deleted broadcast.
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 256),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/sessions/"+sess.ID, nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if _, err := agent.LoadSession(sess.ID); err == nil {
+		t.Fatal("session still loadable after delete")
+	}
+
+	select {
+	case b := <-conn.send:
+		var ev map[string]any
+		if err := json.Unmarshal(b, &ev); err != nil {
+			t.Fatalf("broadcast event unmarshal: %v", err)
+		}
+		if ev["type"] != "session_deleted" {
+			t.Fatalf("broadcast type = %q, want session_deleted", ev["type"])
+		}
+		if got, want := ev["session_id"], sess.ID; got != want {
+			t.Fatalf("broadcast session_id = %q, want %q", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no session_deleted broadcast received")
+	}
+}
+
+// TestHandleBranchSession verifies POST /api/sessions/{id}/branch:
+// 200 with a new session whose history is copied up to message_index (an
+// exclusive count, so len(Messages) copies the whole transcript), 400 when the
+// index is out of range or lands anywhere but a turn boundary (a prefix ending
+// on an assistant tool_use would orphan it — issue #1899), and 404 when the
+// source does not exist.
+func TestHandleBranchSession(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "sys")
+	sess.Messages = []agent.Message{
+		{Role: agent.RoleUser, Content: "hello"},
+		{Role: agent.RoleAssistant, Content: "hi"},
+		{Role: agent.RoleUser, Content: "branch here"},
+		{Role: agent.RoleAssistant, Blocks: []agent.ContentBlock{
+			{Type: "tool_use", ID: "tu-1", Name: "terminal", Input: map[string]any{"command": "ls"}},
+		}},
+		{Role: agent.RoleUser, Blocks: []agent.ContentBlock{
+			{Type: "tool_result", ToolUseID: "tu-1", Result: "file.txt"},
+		}},
+		{Role: agent.RoleAssistant, Content: "ok"},
+		// Steer-shaped user message: blocks-only text, no Content — the closest
+		// legitimate neighbour of the rejected shapes above.
+		{Role: agent.RoleUser, Blocks: []agent.ContentBlock{{Type: "text", Text: "steer"}}},
+		{Role: agent.RoleAssistant, Content: "done"},
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	// 404 — source session not found
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/does-not-exist/branch",
+		strings.NewReader(`{"message_index":0}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("missing session: status = %d, want 404", w.Code)
+	}
+
+	// 400 — index out of range
+	req = httptest.NewRequest(http.MethodPost, "/api/sessions/"+sess.ID+"/branch",
+		strings.NewReader(`{"message_index":99}`))
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("out-of-range: status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+
+	// 400 — the prefix would stop mid-turn, on the user message
+	req = httptest.NewRequest(http.MethodPost, "/api/sessions/"+sess.ID+"/branch",
+		strings.NewReader(`{"message_index":1}`))
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("mid-turn index: status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+
+	// 400 — the prefix would end on the assistant tool_use with no answering
+	// result
+	req = httptest.NewRequest(http.MethodPost, "/api/sessions/"+sess.ID+"/branch",
+		strings.NewReader(`{"message_index":4}`))
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("tool_use index: status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+
+	// 200 — cutting right after the reply that closed the tool exchange
+	req = httptest.NewRequest(http.MethodPost, "/api/sessions/"+sess.ID+"/branch",
+		strings.NewReader(`{"message_index":6}`))
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("post-tool-exchange index: status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	// 400 — a prefix stopping on the steer message has the same problem as any
+	// other mid-turn cut
+	req = httptest.NewRequest(http.MethodPost, "/api/sessions/"+sess.ID+"/branch",
+		strings.NewReader(`{"message_index":7}`))
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("steer-tail index: status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+
+	// 200 — message_index == len(Messages) copies the whole transcript: this is
+	// what "branch off the latest reply" sends
+	req = httptest.NewRequest(http.MethodPost, "/api/sessions/"+sess.ID+"/branch",
+		strings.NewReader(`{"message_index":8}`))
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("full-length index: status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	// 200 — valid branch
+	req = httptest.NewRequest(http.MethodPost, "/api/sessions/"+sess.ID+"/branch",
+		strings.NewReader(`{"message_index":2}`))
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Session struct {
+			ID     string `json:"id"`
+			Title  string `json:"title"`
+			Model  string `json:"model"`
+			Source string `json:"source"`
+		} `json:"session"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v; body=%s", err, w.Body.String())
+	}
+	if resp.Session.ID == sess.ID {
+		t.Fatal("branch returned the same session id")
+	}
+
+	// Branch was saved and carries the copied prefix + lineage.
+	branch, err := agent.LoadSession(resp.Session.ID)
+	if err != nil {
+		t.Fatalf("load branch: %v", err)
+	}
+	if len(branch.Messages) != 2 {
+		t.Fatalf("branch Messages len = %d, want 2 (message_index is an exclusive count)", len(branch.Messages))
+	}
+	if branch.BranchedFrom != sess.ID {
+		t.Fatalf("BranchedFrom = %q, want %q", branch.BranchedFrom, sess.ID)
+	}
+	if branch.System != "sys" {
+		t.Fatalf("System = %q, want sys", branch.System)
+	}
+
+	// Source session was untouched.
+	srcReloaded, err := agent.LoadSession(sess.ID)
+	if err != nil {
+		t.Fatalf("reload source: %v", err)
+	}
+	if len(srcReloaded.Messages) != 8 {
+		t.Fatalf("source Messages len = %d, want 8 (untouched)", len(srcReloaded.Messages))
+	}
+}
+
+// TestLastBranchableIndex covers what the `complete` event tells the browser
+// about the reply it just streamed: the reply's own index when the turn closed
+// cleanly, and -1 (field omitted) for every tail the branch endpoint would
+// reject anyway.
+func TestLastBranchableIndex(t *testing.T) {
+	toolUse := agent.NewToolUseMessage([]agent.ContentBlock{
+		agent.NewToolUseBlock("call_1", "terminal", map[string]any{"command": "ls"}),
+	})
+	tests := []struct {
+		name string
+		msgs []agent.Message
+		want int
+	}{
+		{"empty", nil, -1},
+		{"ends on reply", []agent.Message{
+			{Role: agent.RoleUser, Content: "hi"},
+			{Role: agent.RoleAssistant, Content: "hello"},
+		}, 1},
+		{"ends on unanswered user turn", []agent.Message{
+			{Role: agent.RoleUser, Content: "hi"},
+		}, -1},
+		{"ends on unanswered tool_use", []agent.Message{
+			{Role: agent.RoleUser, Content: "hi"},
+			toolUse,
+		}, -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := agent.NewSession("stub-model", "")
+			sess.Messages = tt.msgs
+			if got := lastBranchableIndex(sess); got != tt.want {
+				t.Errorf("lastBranchableIndex() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHandleEditMessage verifies POST /api/sessions/{id}/edit_message:
+// history is truncated to just before the edited user message and a fresh
+// turn reruns with the new content, so the edited prompt lands in history
+// exactly once (the old rewrite-in-place + caller-resend contract appended
+// it twice) followed by a regenerated reply.
+func TestHandleEditMessage(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "sys")
+	sess.Title = "fixed title"
+	sess.Messages = []agent.Message{
+		{Role: agent.RoleUser, Content: "one"},
+		{Role: agent.RoleAssistant, Content: "two"},
+		{Role: agent.RoleUser, Content: "three"},
+		{Role: agent.RoleAssistant, Blocks: []agent.ContentBlock{
+			{Type: "tool_use", ID: "tu-1", Name: "terminal", Input: map[string]any{"command": "ls"}},
+		}},
+		{Role: agent.RoleUser, Blocks: []agent.ContentBlock{
+			{Type: "tool_result", ToolUseID: "tu-1", Result: "file.txt"},
+		}},
+		{Role: agent.RoleAssistant, Content: "four"},
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.initWS()
+	srv.turnRunning = make(map[string]bool)
+
+	// 400 — out of range (len is tolerated as "already rolled back"; past it is not)
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/"+sess.ID+"/edit_message",
+		strings.NewReader(`{"message_index":99,"new_content":"x"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("out-of-range: status = %d, want 400", w.Code)
+	}
+
+	// 400 — index names an assistant message; only user prompts are editable
+	req = httptest.NewRequest(http.MethodPost, "/api/sessions/"+sess.ID+"/edit_message",
+		strings.NewReader(`{"message_index":1,"new_content":"x"}`))
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("assistant-index: status = %d, want 400", w.Code)
+	}
+
+	// 400 — index names a tool_result message (user role, but not a real user
+	// turn): truncating there would orphan the assistant tool_use before it
+	req = httptest.NewRequest(http.MethodPost, "/api/sessions/"+sess.ID+"/edit_message",
+		strings.NewReader(`{"message_index":4,"new_content":"x"}`))
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("tool_result-index: status = %d, want 400", w.Code)
+	}
+
+	// 200 — edit the second user prompt; the rerun regenerates from it
+	req = httptest.NewRequest(http.MethodPost, "/api/sessions/"+sess.ID+"/edit_message",
+		strings.NewReader(`{"message_index":2,"new_content":"REWRITTEN"}`))
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	// The rerun is async — wait for the regenerated reply to persist.
+	var reloaded *agent.Session
+	waitFor(t, func() bool {
+		var err error
+		reloaded, err = agent.LoadSession(sess.ID)
+		return err == nil && len(reloaded.Messages) == 4 &&
+			reloaded.Messages[3].Role == agent.RoleAssistant
+	})
+	if reloaded.Messages[2].Content != "REWRITTEN" {
+		t.Fatalf("edited prompt = %q, want REWRITTEN (exactly, no reminder prefix)", reloaded.Messages[2].Content)
+	}
+	if reloaded.Messages[3].Content != "stub reply" {
+		t.Fatalf("regenerated reply = %q, want stub reply", reloaded.Messages[3].Content)
+	}
+	// Exactly once — the old contract left a rewritten copy AND a resent copy.
+	count := 0
+	for _, m := range reloaded.Messages {
+		if m.Content == "REWRITTEN" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("edited prompt appears %d times, want exactly 1", count)
+	}
+}
+
+// TestHandleEditMessage_RefusesUntrustedIndex: an edit truncates history on
+// disk, so an index the server can't trust must be refused before anything is
+// cut. A missing index used to decode as 0 and wipe the whole transcript; a
+// stale one (the browser's indices drift after a mid-turn compaction) cut at
+// whatever plain user message happened to sit there.
+func TestHandleEditMessage_RefusesUntrustedIndex(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "sys")
+	sess.Title = "fixed title"
+	sess.Messages = []agent.Message{
+		{Role: agent.RoleUser, Content: "one"},
+		{Role: agent.RoleAssistant, Content: "two"},
+		{Role: agent.RoleUser, Content: "<system-reminder>model-only</system-reminder>\n\nthree\n\n[Attached file: /tmp/notes.pdf]"},
+		{Role: agent.RoleAssistant, Content: "four"},
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.initWS()
+	srv.turnRunning = make(map[string]bool)
+
+	post := func(body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/sessions/"+sess.ID+"/edit_message", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		serveLoopback(srv.mux, w, req)
+		return w.Code
+	}
+	assertUntouched := func(what string) {
+		t.Helper()
+		got, err := agent.LoadSession(sess.ID)
+		if err != nil {
+			t.Fatalf("%s: load: %v", what, err)
+		}
+		if len(got.Messages) != 4 {
+			t.Fatalf("%s: history has %d messages, want the original 4", what, len(got.Messages))
+		}
+	}
+
+	if code := post(`{"new_content":"x"}`); code != http.StatusBadRequest {
+		t.Fatalf("missing index: status = %d, want 400", code)
+	}
+	assertUntouched("missing index")
+
+	if code := post(`{"message_index":-2,"new_content":"x"}`); code != http.StatusBadRequest {
+		t.Fatalf("negative index: status = %d, want 400", code)
+	}
+	assertUntouched("negative index")
+
+	if code := post(`{"message_index":0,"new_content":"x","original_content":"three"}`); code != http.StatusConflict {
+		t.Fatalf("mismatched content: status = %d, want 409", code)
+	}
+	assertUntouched("mismatched content")
+
+	// The browser shows the text without the reminder or the attachment note;
+	// that is what it sends back, and it must match.
+	if code := post(`{"message_index":2,"new_content":"REWRITTEN","original_content":"three"}`); code != http.StatusOK {
+		t.Fatalf("matching content: status = %d, want 200", code)
+	}
+	waitFor(t, func() bool {
+		got, err := agent.LoadSession(sess.ID)
+		return err == nil && len(got.Messages) == 4 && got.Messages[2].Content == "REWRITTEN" &&
+			got.Messages[3].Role == agent.RoleAssistant
+	})
+}
+
+// TestHandleDeleteSession_InterruptsActiveTurn is the regression guard for
+// the zombie-modal-resurrects-the-deleted-file bug: deleting a session must
+// cancel its registered turn (e.g. one blocked in ask_user_question) before
+// removing the file, otherwise the turn can keep running — and resave — a
+// session the delete already removed.
+func TestHandleDeleteSession_InterruptsActiveTurn(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "")
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.interrupts = map[string]context.CancelFunc{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	srv.registerInterrupt(sess.ID, cancel)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/sessions/"+sess.ID, nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("delete must cancel the session's registered interrupt")
+	}
+
+	srv.interruptMu.Lock()
+	_, still := srv.interrupts[sess.ID]
+	srv.interruptMu.Unlock()
+	if still {
+		t.Error("interrupt entry must be removed after delete")
+	}
+}
+
+func TestHandleDeleteSessions_Batch(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	var ids []string
+	for i := 0; i < 3; i++ {
+		sess := agent.NewSession("stub-model", "")
+		sess.Messages = []agent.Message{{Role: agent.RoleUser, Content: "hi"}}
+		if err := sess.Save(); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		ids = append(ids, sess.ID)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	// Register a fake connection to capture the global session_deleted broadcasts.
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 256),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+
+	payload, _ := json.Marshal(deleteSessionsRequest{IDs: ids})
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/delete", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Deleted []string          `json:"deleted"`
+		Failed  map[string]string `json:"failed"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Deleted) != 3 {
+		t.Fatalf("deleted = %v, want 3", body.Deleted)
+	}
+	for _, id := range ids {
+		if _, err := agent.LoadSession(id); err == nil {
+			t.Errorf("session %s still loadable after batch delete", id)
+		}
+	}
+
+	deletedBroadcasts := make(map[string]bool)
+	deadline := time.After(2 * time.Second)
+broadcastDrain:
+	for len(deletedBroadcasts) < len(ids) {
+		select {
+		case b := <-conn.send:
+			var ev map[string]any
+			if err := json.Unmarshal(b, &ev); err != nil {
+				continue
+			}
+			if ev["type"] == "session_deleted" {
+				deletedBroadcasts[ev["session_id"].(string)] = true
+			}
+		case <-deadline:
+			break broadcastDrain
+		}
+	}
+	for _, id := range ids {
+		if !deletedBroadcasts[id] {
+			t.Errorf("missing session_deleted broadcast for %s", id)
+		}
+	}
+}
+
+func TestHandleDeleteSessions_EmptyIDs(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/delete", bytes.NewReader([]byte(`{"ids":[]}`)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleCreateChat_MissingMessage(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	body := bytes.NewReader([]byte(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/chat", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleTurn_MissingSession(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	body := bytes.NewReader([]byte(`{"message":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/chat/nonexistent/turn", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestStaticHandler_IndexFallback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.http.Handler, w, req)
+
+	// The static handler must serve the SPA entrypoint at "/" with a 200 and
+	// HTML body. It must never reply with a redirect: http.FileServer's
+	// "/index.html" → "./" canonicalisation would bounce "/" back to itself
+	// in an infinite loop, leaving the UI unable to load.
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("Content-Type = %q, want text/html", ct)
+	}
+	if !strings.Contains(w.Body.String(), "<html") {
+		t.Fatalf("expected HTML body, got %q", w.Body.String())
+	}
+}
+
+func TestStaticHandler_APIFallback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/unknown", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.http.Handler, w, req)
+
+	// The mux handles API 404s; accept 404 Not Found.
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestCORS(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false, CORSOrigins: []string{"http://localhost:3000"}})
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/health", nil)
+	req.Header.Set("Origin", "http://localhost:3000")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.http.Handler, w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:3000" {
+		t.Fatalf("CORS origin = %q, want http://localhost:3000", got)
+	}
+}
+
+func TestCORS_DisallowedOrigin(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false, CORSOrigins: []string{"http://localhost:3000"}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	req.Header.Set("Origin", "http://evil.com")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.http.Handler, w, req)
+
+	if w.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatal("expected no CORS header for disallowed origin")
+	}
+}
+
+// TestCORS_VSCodeWebview covers the octo VS Code extension's default local
+// path: its REST fetch()es carry a vscode-webview:// Origin and must get a
+// reflected Access-Control-Allow-Origin without any --cors flag configured.
+func TestCORS_VSCodeWebview(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/health", nil)
+	req.Header.Set("Origin", "vscode-webview://1a2b3c4d5e6f7890abcdef1234567890")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.http.Handler, w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "vscode-webview://1a2b3c4d5e6f7890abcdef1234567890" {
+		t.Fatalf("CORS origin = %q, want the vscode-webview origin reflected", got)
+	}
+}
+
+// TestCORS_ObsidianDesktop covers the Obsidian desktop plugin's default local
+// path: its REST calls carry Origin app://obsidian.md and must get a reflected
+// Access-Control-Allow-Origin without any --cors flag configured.
+func TestCORS_ObsidianDesktop(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/health", nil)
+	req.Header.Set("Origin", "app://obsidian.md")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.http.Handler, w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "app://obsidian.md" {
+		t.Fatalf("CORS origin = %q, want the obsidian desktop origin reflected", got)
+	}
+}
+
+// TestCORS_ObsidianLookalikeRejected asserts the allowance is scoped to the
+// exact app://obsidian.md literal, not any origin that merely prefixes it.
+func TestCORS_ObsidianLookalikeRejected(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	req.Header.Set("Origin", "app://obsidian.md.evil.com")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.http.Handler, w, req)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("expected no CORS header for lookalike origin, got %q", got)
+	}
+}
+
+// TestCORS_VSCodeWebviewLookalikeRejected asserts the allowance is scoped to
+// the vscode-webview: URL scheme, not any origin containing that string.
+func TestCORS_VSCodeWebviewLookalikeRejected(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	req.Header.Set("Origin", "http://vscode-webview.evil.com")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.http.Handler, w, req)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("expected no CORS header for lookalike origin, got %q", got)
+	}
+}
+
+func TestCORS_WildcardDoesNotReflectOrigin(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false, CORSOrigins: []string{"*"}})
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/health", nil)
+	req.Header.Set("Origin", "http://evil.com")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.http.Handler, w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("CORS origin = %q, want *", got)
+	}
+	if got := w.Header().Get("Vary"); got != "Origin" {
+		t.Fatalf("Vary = %q, want Origin", got)
+	}
+}
+
+// mustAccessKey resolves the test server's key without ever persisting —
+// generation is in-memory only here; only server.New writes config.yml.
+func mustAccessKey(cfg Config) string {
+	key, _ := resolveAccessKey(cfg.AccessKey, config.Config{})
+	return key
+}
+
+// mustWorkspaceDir resolves the test server's default workspace dir straight
+// from cfg.WorkspaceDir, bypassing ~/.octo/config.yml — mirrors mustAccessKey.
+func mustWorkspaceDir(cfg Config) string {
+	dir, _ := tools.ResolveWorkspaceDir(cfg.WorkspaceDir)
+	return dir
+}
+
+// prepareToolTurnCtx returns a ctx stamped with a test session id, as every
+// production caller of prepareToolTurn does (runTurn, the WS turn loop, cron
+// ticks — they stamp both the server-layer ctxKeySessionID and the tools-layer
+// tools.WithSessionID), and registers cleanup for the per-session state the
+// call creates.
+func prepareToolTurnCtx(t *testing.T, name string) context.Context {
+	t.Helper()
+	sid := "ptt-" + name
+	t.Cleanup(func() {
+		tools.CloseSessionSubAgentManager(sid)
+		tools.CloseSessionReadTracker(sid)
+		tools.CloseSessionTaskStore(sid)
+	})
+	ctx := context.WithValue(context.Background(), ctxKeySessionID{}, sid)
+	return tools.WithSessionID(ctx, sid)
+}
+
+// mustServer creates a Server for testing. It skips tests that need a real
+// provider by using a stub sender.
+func mustServer(t *testing.T, cfg Config) *Server {
+	t.Helper()
+
+	// Create a minimal server with stubbed provider.
+	srv := &Server{
+		cfg:                 cfg,
+		mux:                 http.NewServeMux(),
+		model:               "stub-model",
+		system:              "",
+		skillReg:            skills.Discover(),
+		skillsManifest:      "",
+		cwd:                 "",
+		envCtx:              "",
+		workspaceDir:        mustWorkspaceDir(cfg),
+		turnLocks:           map[string]*sync.Mutex{},
+		sender:              &stubSender{},
+		accessKey:           mustAccessKey(cfg),
+		entryBindings:       make(map[string]*cachedEntryBinding),
+		sessionBindingLocks: map[string]*sync.Mutex{},
+		sessionAgents:       make(map[string]*agent.Agent),
+		steerQueues:         make(map[string][]queuedTurn),
+		wsHub:               newWSHub(),
+		// Created here for the same reason New does it: the store watch selects
+		// on it, so it must exist before that goroutine can start. Assigning it
+		// afterwards would be a write racing that read.
+		watchStop: make(chan struct{}),
+	}
+	srv.registerRoutes()
+	// Same chain as New: host routing outside, CORS inside, so tests that
+	// exercise either hit the right layer.
+	srv.http = &http.Server{Handler: srv.hostRouter(srv.corsMiddleware(srv.mux))}
+
+	// Drain in-flight turn goroutines before the test's t.TempDir()/t.Setenv()
+	// cleanups run. A WS turn (runAgentTurnLoop) persists the session and its
+	// fire-and-forget title goroutine writes the session file again — both can
+	// outlive the "complete" event a test waits on. If one is still writing
+	// when t.TempDir() runs RemoveAll, POSIX unlinks the open file fine but
+	// Windows refuses ("the directory is not empty"); a goroutine leaked past
+	// one test also corrupts the next test's session state. The turn loop is
+	// tracked by the drain gate (begin/end in runAgentTurnLoop); the title
+	// goroutine by titlePending. Restart tests that call drain.begin() to
+	// simulate a stuck turn already call end()/Restart() before returning, so
+	// this never blocks. With stub senders every goroutine finishes in
+	// milliseconds; the timeouts are just a backstop.
+	t.Cleanup(func() {
+		srv.drain.drain(10 * time.Second)
+
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			srv.titleMu.Lock()
+			pending := len(srv.titlePending)
+			srv.titleMu.Unlock()
+			if pending == 0 {
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	})
+	return srv
+}
+
+// stubSender is a no-network agent.Sender for tests. It satisfies the full
+// tool-aware surface so the agent loop never degrades, and always replies
+// "stub reply".
+type stubSender struct{}
+
+func (stubSender) SendMessages(_ context.Context, _, _ string, _ []agent.Message, _ int) (agent.Reply, error) {
+	return agent.Reply{Content: "stub reply"}, nil
+}
+
+func (stubSender) StreamMessages(_ context.Context, _, _ string, _ []agent.Message, _ int, onChunk func(string), _ func(string)) (agent.Reply, error) {
+	if onChunk != nil {
+		onChunk("stub reply")
+	}
+	return agent.Reply{Content: "stub reply"}, nil
+}
+
+func (stubSender) SendMessagesWithTools(_ context.Context, _, _ string, _ []agent.Message, _ int, _ []agent.ToolDefinition) (agent.Reply, error) {
+	return agent.Reply{Content: "stub reply"}, nil
+}
+
+func (stubSender) StreamMessagesWithTools(_ context.Context, _, _ string, _ []agent.Message, _ int, _ []agent.ToolDefinition, onChunk func(string), _ agent.ToolInputDeltaFunc, _ agent.ThinkingDeltaFunc) (agent.Reply, error) {
+	if onChunk != nil {
+		onChunk("stub reply")
+	}
+	return agent.Reply{Content: "stub reply"}, nil
+}
+
+// recordingSender captures the tool definitions the agent layer forwarded so a
+// test can assert the full tool set reached the wire.
+type recordingSender struct{ lastTools []agent.ToolDefinition }
+
+func (s *recordingSender) SendMessages(_ context.Context, _, _ string, _ []agent.Message, _ int) (agent.Reply, error) {
+	return agent.Reply{Content: "ok"}, nil
+}
+
+func (s *recordingSender) StreamMessages(_ context.Context, _, _ string, _ []agent.Message, _ int, onChunk func(string), _ func(string)) (agent.Reply, error) {
+	if onChunk != nil {
+		onChunk("ok")
+	}
+	return agent.Reply{Content: "ok"}, nil
+}
+
+func (s *recordingSender) SendMessagesWithTools(_ context.Context, _, _ string, _ []agent.Message, _ int, toolDefs []agent.ToolDefinition) (agent.Reply, error) {
+	s.lastTools = toolDefs
+	return agent.Reply{Content: "ok"}, nil
+}
+
+func (s *recordingSender) StreamMessagesWithTools(_ context.Context, _, _ string, _ []agent.Message, _ int, toolDefs []agent.ToolDefinition, onChunk func(string), _ agent.ToolInputDeltaFunc, _ agent.ThinkingDeltaFunc) (agent.Reply, error) {
+	s.lastTools = toolDefs
+	if onChunk != nil {
+		onChunk("ok")
+	}
+	return agent.Reply{Content: "ok"}, nil
+}
+
+// TestEnsureSender_LazyInitDoesNotDeadlock guards the onboarding-completion
+// path: a server that booted without a key (sender nil) builds the sender on
+// the first turn via ensureSender. ensureSender holds senderMu while it sets
+// the sender, then enables the sub-agent tools — and enableSubAgentTools reads
+// the default sender back through defaultSenderAndModel, which also takes
+// senderMu. Because senderMu is not reentrant, doing that work while still
+// holding the lock self-deadlocks and hangs every subsequent turn (only the
+// lazy path; New() enables tools before locking, which is why restarting the
+// server worked around it). This test fails (times out) if the lock is held
+// across enableSubAgentTools again.
+func TestEnsureSender_LazyInitDoesNotDeadlock(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("OPENAI_API_KEY", "")
+
+	// Boot with no config → onboarding mode (sender nil), tools enabled so the
+	// ensureSender path reaches enableSubAgentTools.
+	srv, err := New(Config{Addr: "127.0.0.1:0", Tools: true, NoChannel: true, NoMemory: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if srv.getSender() != nil {
+		t.Fatal("expected nil sender on keyless start (onboarding mode)")
+	}
+
+	// Simulate onboard saving a keyed model, the way the setup form does.
+	cfgPath := filepath.Join(tmp, ".octo", "config.yml")
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgYAML := "models:\n" +
+		"  - name: t\n" +
+		"    provider: openai\n" +
+		"    model: gpt-test\n" +
+		"    base_url: http://127.0.0.1:1/v1\n" +
+		"    api_key: sk-test\n" +
+		"default_model: t\n"
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- srv.ensureSender() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ensureSender: %v", err)
+		}
+		if srv.getSender() == nil {
+			t.Fatal("sender still nil after ensureSender")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ensureSender deadlocked (senderMu held across enableSubAgentTools)")
+	}
+}
+
+// TestEnsureSender_GoalsEnabledVisibleAtomicallyWithSender guards against a
+// narrow race: initChannels/reloadChannel gate solely on getSender() != nil
+// and, on first construction, lock in s.goalsEnabled into the channel
+// manager via SetGoalsEnabled — permanently, since reloadChannel only
+// re-syncs when it builds a fresh manager. enableSubAgentTools (which used to
+// be the only place s.goalsEnabled got set) has to run after senderMu is
+// unlocked to avoid a reentrant-lock deadlock (see
+// TestEnsureSender_LazyInitDoesNotDeadlock), which left a gap where a
+// concurrent reader could observe a non-nil sender before goalsEnabled was
+// synced. The fix stages goalsEnabled (now an atomic.Bool) into the same
+// senderMu-guarded critical section that sets s.sender, before the unlock —
+// so this test asserts the invariant structurally: reading sender under
+// senderMu and goalsEnabled via Load() must never observe sender != nil with
+// goalsEnabled still false. Unlike a sleep-based race test, this is
+// deterministic on the fixed code: Store(true) happens-before the Unlock
+// that any subsequent Lock() (including the poller's) synchronizes with, so
+// no interleaving can observe one without the other.
+func TestEnsureSender_GoalsEnabledVisibleAtomicallyWithSender(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("OPENAI_API_KEY", "")
+
+	srv, err := New(Config{Addr: "127.0.0.1:0", Tools: true, NoChannel: true, NoMemory: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	cfgPath := filepath.Join(tmp, ".octo", "config.yml")
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// goal.enabled defaults to true (config.Config.GoalEnabled), left unset here.
+	cfgYAML := "models:\n" +
+		"  - name: t\n" +
+		"    provider: openai\n" +
+		"    model: gpt-test\n" +
+		"    base_url: http://127.0.0.1:1/v1\n" +
+		"    api_key: sk-test\n" +
+		"default_model: t\n"
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	violation := make(chan struct{})
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			srv.senderMu.Lock()
+			sender := srv.sender
+			srv.senderMu.Unlock()
+			enabled := srv.goalsEnabled.Load()
+			if sender != nil {
+				if !enabled {
+					close(violation)
+				}
+				return
+			}
+		}
+	}()
+
+	if err := srv.ensureSender(); err != nil {
+		t.Fatalf("ensureSender: %v", err)
+	}
+	close(stop)
+
+	select {
+	case <-violation:
+		t.Fatal("observed sender != nil with goalsEnabled still false — the channel-manager goal.enabled race is back")
+	case <-time.After(2 * time.Second):
+		// The poller never caught sender==nil-but-about-to-flip in time to
+		// race meaningfully; that's fine — the structural guarantee holds
+		// regardless of whether this run actually raced the two goroutines.
+	}
+}
+
+// ─── New API tests ──────────────────────────────────────────────────────────
+
+func TestHandleOnboardStatus(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	req := httptest.NewRequest(http.MethodGet, "/api/onboard/status", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["needs_onboard"] == nil {
+		t.Fatal("expected needs_onboard field")
+	}
+	// The status response must be uncacheable: the desktop webview heuristically
+	// caches GET 200s, and a stale phase re-launches /onboard on reopen (#1660).
+	if cc := w.Header().Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+		t.Errorf("Cache-Control = %q, want it to contain no-store", cc)
+	}
+}
+
+func TestHandleListProviders(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	req := httptest.NewRequest(http.MethodGet, "/api/providers", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	providers, ok := body["providers"].([]any)
+	if !ok || len(providers) == 0 {
+		t.Fatal("expected non-empty providers list")
+	}
+}
+
+func TestHandleGetConfig(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var body configResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Language != "en" && body.Language != "" {
+		t.Fatalf("language = %q, want en or empty", body.Language)
+	}
+}
+
+func TestHandleTestConfig(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	payload, _ := json.Marshal(testConfigRequest{Model: "gpt-4", BaseURL: "https://api.openai.com/v1"})
+	req := httptest.NewRequest(http.MethodPost, "/api/config/test", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	// Without an API key in env, this returns ok=false because we require a key for validation.
+	if body["ok"] != false {
+		t.Fatalf("ok = %v, want false", body["ok"])
+	}
+}
+
+// Editing a model and hitting Test sends no api_key (the panel never prefills
+// the key input). The server must reuse the stored key of the matching entry
+// instead of failing with "no API key provided".
+func TestHandleTestConfig_ReusesStoredKey(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("OPENAI_API_KEY", "")
+
+	var gotAuth string
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer mock.Close()
+
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "openai", BaseURL: mock.URL, APIKey: "stored-key", Models: []config.EndpointModel{{Model: "gpt-4o-mini"}}},
+		},
+		Default: "ep-a::gpt-4o-mini",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/test",
+		`{"model":"gpt-4o-mini","base_url":"`+mock.URL+`","provider":"openai"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["ok"] != true {
+		t.Fatalf("ok = %v, want true (should reuse stored key); msg=%v", body["ok"], body["message"])
+	}
+	if gotAuth != "Bearer stored-key" {
+		t.Errorf("Authorization = %q, want Bearer stored-key (stored key reused)", gotAuth)
+	}
+}
+
+// Real requests read the vendor env var before the stored key, so with the
+// key field left empty the test must try the env key: a stored key the env
+// shadows would otherwise test green while chat uses a different key.
+func TestHandleTestConfig_EnvKeyBeforeStoredKey(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("OPENAI_API_KEY", "env-key")
+
+	var gotAuth []string
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer mock.Close()
+
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "openai", BaseURL: mock.URL, APIKey: "stored-key", Models: []config.EndpointModel{{Model: "gpt-4o-mini"}}},
+		},
+		Default: "ep-a::gpt-4o-mini",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	// Empty and masked key fields both mean "unchanged".
+	for _, field := range []string{``, `,"api_key":"sk-a****wxyz"`} {
+		gotAuth = nil
+		w := doJSON(t, srv, http.MethodPost, "/api/config/test",
+			`{"model":"gpt-4o-mini","base_url":"`+mock.URL+`","provider":"openai"`+field+`}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+		}
+		if len(gotAuth) != 1 || gotAuth[0] != "Bearer env-key" {
+			t.Errorf("key field %q: Authorization = %v, want [Bearer env-key]", field, gotAuth)
+		}
+	}
+
+	// A key typed into the form is what the user asked to test.
+	gotAuth = nil
+	doJSON(t, srv, http.MethodPost, "/api/config/test",
+		`{"model":"gpt-4o-mini","base_url":"`+mock.URL+`","provider":"openai","api_key":"typed-key"}`)
+	if len(gotAuth) != 1 || gotAuth[0] != "Bearer typed-key" {
+		t.Errorf("typed key: Authorization = %v, want [Bearer typed-key]", gotAuth)
+	}
+}
+
+func TestHandleToggleSkill(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	// Create a real skill so the toggle has something to act on.
+	skillDir := filepath.Join(tmp, ".octo", "skills", "test-skill")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: test\ndescription: a test skill\n---\nbody"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	// Replace the skillReg with one that sees our temp skill.
+	srv.skillReg = skills.Discover()
+	srv.skillsManifest = skills.RenderManifest(srv.skillReg)
+
+	// Toggle off (disable).
+	req := httptest.NewRequest(http.MethodPatch, "/api/skills/test-skill/toggle", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["enabled"] != false {
+		t.Fatalf("enabled = %v, want false", body["enabled"])
+	}
+
+	// Verify config was persisted.
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Tools.DisabledSkills) != 1 || cfg.Tools.DisabledSkills[0] != "test-skill" {
+		t.Fatalf("disabled skills = %v, want [test-skill]", cfg.Tools.DisabledSkills)
+	}
+
+	// Toggle back on (enable).
+	req = httptest.NewRequest(http.MethodPatch, "/api/skills/test-skill/toggle", nil)
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["enabled"] != true {
+		t.Fatalf("enabled = %v, want true", body["enabled"])
+	}
+
+	cfg, _ = config.Load()
+	if len(cfg.Tools.DisabledSkills) != 0 {
+		t.Fatalf("disabled skills = %v, want empty", cfg.Tools.DisabledSkills)
+	}
+}
+
+func TestHandleToggleSkill_NotFound(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	req := httptest.NewRequest(http.MethodPatch, "/api/skills/nonexistent/toggle", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+// TestHandleListSkills_RescansDisk is the regression guard for the stale
+// skill panel: the registry is discovered once at server start, so without a
+// per-request re-scan a skill directory deleted (or added) on disk would stay
+// wrong in the panel until the server restarts.
+func TestHandleListSkills_RescansDisk(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	hasSkill := func(name string) bool {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/skills", nil)
+		w := httptest.NewRecorder()
+		serveLoopback(srv.mux, w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+		}
+		var body struct {
+			Skills []struct {
+				Name string `json:"name"`
+			} `json:"skills"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		for _, sk := range body.Skills {
+			if sk.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	// A skill dropped on disk AFTER server start must show up without restart.
+	skillDir := filepath.Join(tmp, ".octo", "skills", "ghost")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"),
+		[]byte("---\nname: ghost\ndescription: appears and disappears\n---\nbody"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !hasSkill("ghost") {
+		t.Fatal("skill added on disk after start not listed; list handler did not re-scan")
+	}
+
+	// A skill deleted on disk must vanish from the next list response.
+	if err := os.RemoveAll(skillDir); err != nil {
+		t.Fatal(err)
+	}
+	if hasSkill("ghost") {
+		t.Fatal("skill deleted on disk still listed; panel would show a ghost entry until restart")
+	}
+}
+
+func TestHandleBenchmark_Success(t *testing.T) {
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-session/benchmark", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var body benchmarkResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.OK {
+		t.Fatalf("ok = false, want true")
+	}
+	if len(body.Results) != 1 {
+		t.Fatalf("results = %d, want 1", len(body.Results))
+	}
+	res := body.Results[0]
+	if !res.OK {
+		t.Fatalf("result.ok = false, want true")
+	}
+	if res.ModelID != "stub-model" {
+		t.Fatalf("model_id = %q, want stub-model", res.ModelID)
+	}
+	// stubSender fires the chunk immediately, so TTFT should be ≥ 0 and very small.
+	if res.TTFTMs < 0 {
+		t.Fatalf("ttft_ms = %d, want >= 0", res.TTFTMs)
+	}
+}
+
+func TestHandleGetMemory_NotFound(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	req := httptest.NewRequest(http.MethodGet, "/api/memories/nonexistent.md", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestHandleGetMemories_DedupesProjectAndHomeDir(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	// Simulate a setup where the project memory directory is the same as the
+	// inherited home memory directory. Without deduplication the endpoint
+	// returns the same file twice, which causes the front-end {#each} keyed by
+	// path to throw a duplicate-key error and freeze on "Loading memories…".
+	// The coincident directory IS the home/global tier, so it must be listed
+	// once as "inherited" — labeling it "project" was the pre-sessionMemDir
+	// mislabel.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "MEMORY.md"), []byte("# test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv.homeMemDir = dir
+
+	req := httptest.NewRequest(http.MethodGet, "/api/memories", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var body struct {
+		Files []struct {
+			Name   string `json:"name"`
+			Path   string `json:"path"`
+			Source string `json:"source"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Files) != 1 {
+		t.Fatalf("got %d files, want 1: %+v", len(body.Files), body.Files)
+	}
+	if body.Files[0].Source != "inherited" {
+		t.Fatalf("source = %q, want inherited", body.Files[0].Source)
+	}
+}
+
+func TestHandleVersion_Identity(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	req := httptest.NewRequest(http.MethodGet, "/api/version", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["version"] == "" || body["current"] == "" {
+		t.Errorf("version/current missing: %v", body)
+	}
+	if body["cli_command"] != "octo" {
+		t.Errorf("cli_command = %v, want the constant octo", body["cli_command"])
+	}
+	// This build carries no update channel: the online-check fields must be gone
+	// so no client can render an update prompt.
+	for _, k := range []string{"latest", "needs_update", "download_url", "self_update", "upgrade_mode"} {
+		if _, ok := body[k]; ok {
+			t.Errorf("%s must not be served by /api/version: %v", k, body)
+		}
+	}
+	// os_version is always present; it carries a value only on darwin, where the
+	// frontend aligns the titlebar rows to the traffic lights' axis. On the CI
+	// mac this is a real version ("26.5.2"-shaped), elsewhere empty.
+	v, ok := body["os_version"].(string)
+	if !ok {
+		t.Fatalf("os_version missing or not a string: %v", body)
+	}
+	if runtime.GOOS == "darwin" && v == "" {
+		t.Errorf("os_version empty on darwin, want the kern.osproductversion value")
+	}
+	if runtime.GOOS != "darwin" && v != "" {
+		t.Errorf("os_version = %q on %s, want empty", v, runtime.GOOS)
+	}
+}
+
+func TestHandleVersion_ProfileContract(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		profile     string
+		wantPresent bool
+	}{
+		{name: "named profile", profile: "work", wantPresent: true},
+		{name: "default profile", profile: "", wantPresent: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			t.Setenv("USERPROFILE", tmp)
+			t.Setenv(datahome.ProfileEnv, tt.profile)
+
+			srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+			req := httptest.NewRequest(http.MethodGet, "/api/version", nil)
+			w := httptest.NewRecorder()
+			serveLoopback(srv.mux, w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			profile, present := body["profile"]
+			if present != tt.wantPresent {
+				t.Fatalf("profile present = %v, want %v; body=%v", present, tt.wantPresent, body)
+			}
+			if tt.wantPresent && profile != tt.profile {
+				t.Errorf("profile = %v, want %q", profile, tt.profile)
+			}
+		})
+	}
+}
+
+func TestHandleVersion_CacheHeaders(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	req := httptest.NewRequest(http.MethodGet, "/api/version", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	cc := w.Header().Get("Cache-Control")
+	if !strings.Contains(cc, "no-store") || !strings.Contains(cc, "no-cache") {
+		t.Errorf("Cache-Control = %q, want no-store and no-cache", cc)
+	}
+	if got, want := w.Header().Get("Pragma"), "no-cache"; got != want {
+		t.Errorf("Pragma = %q, want %q", got, want)
+	}
+}
+
+func TestHandleUpdateSessionReasoningEffort(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "")
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	payload, _ := json.Marshal(updateSessionReasoningEffortRequest{ReasoningEffort: "high"})
+	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/"+sess.ID+"/reasoning_effort", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["ok"] != true {
+		t.Fatalf("ok = %v, want true", body["ok"])
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PR5: reasoning is global — read cfg.ReasoningEffort directly.
+	if got := cfg.ReasoningEffort; got != "high" {
+		t.Fatalf("reasoning_effort = %q, want high", got)
+	}
+}
+
+// entryForSession must resolve the SAME entry senderForSession does: the
+// session's own ModelConfig when it's still configured, else the default
+// entry — including graceful fallback when a session references a model
+// that's since been removed from config.
+func TestEntryForSession(t *testing.T) {
+	cfg := config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", Models: []config.EndpointModel{{Model: "model-a"}, {Model: "model-b"}}},
+		},
+		Default: "ep-a::model-a",
+	}
+
+	cases := []struct {
+		name      string
+		sess      *agent.Session
+		wantModel string
+	}{
+		{"nil session falls back to default", nil, "model-a"},
+		{"unbound session falls back to default", &agent.Session{}, "model-a"},
+		{"bound to a configured non-default model", &agent.Session{ModelConfig: "model-b"}, "model-b"},
+		{"bound to a since-deleted model falls back to default", &agent.Session{ModelConfig: "model-gone"}, "model-a"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := entryForSession(cfg, c.sess); got.Model != c.wantModel {
+				t.Errorf("entryForSession(...).Model = %q, want %q", got.Model, c.wantModel)
+			}
+		})
+	}
+}
+
+func TestHandleUpdateSessionPermissionMode(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "")
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	// A second, unrelated session to prove a change to sess doesn't leak.
+	other := agent.NewSession("stub-model", "")
+	if err := other.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	patch := func(id, mode string) *httptest.ResponseRecorder {
+		payload, _ := json.Marshal(updateSessionPermissionModeRequest{PermissionMode: mode})
+		req := httptest.NewRequest(http.MethodPatch, "/api/sessions/"+id+"/permission_mode", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		serveLoopback(srv.mux, w, req)
+		return w
+	}
+
+	if w := patch(sess.ID, "auto"); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	// The change is per-session: sess's own PermissionMode is persisted...
+	got, err := agent.LoadSession(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PermissionMode != "auto" {
+		t.Fatalf("session PermissionMode = %q, want auto", got.PermissionMode)
+	}
+	// ...the unrelated session is untouched...
+	if gotOther, err := agent.LoadSession(other.ID); err != nil {
+		t.Fatal(err)
+	} else if gotOther.PermissionMode != "" {
+		t.Fatalf("other session PermissionMode = %q, want unset", gotOther.PermissionMode)
+	}
+	// ...and the global default is left alone, so a brand-new session still
+	// inherits whatever it was before, not sess's now-independent mode.
+	if cfg, err := config.Load(); err != nil {
+		t.Fatal(err)
+	} else if cfg.PermissionMode != "" {
+		t.Fatalf("global cfg.PermissionMode = %q, want unset", cfg.PermissionMode)
+	}
+
+	// Cycling back to interactive persists too.
+	if w := patch(sess.ID, "interactive"); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if got, err := agent.LoadSession(sess.ID); err != nil {
+		t.Fatal(err)
+	} else if got.PermissionMode != "interactive" {
+		t.Fatalf("session PermissionMode = %q, want interactive", got.PermissionMode)
+	}
+
+	// An unknown mode is rejected.
+	if w := patch(sess.ID, "bogus"); w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// A working directory is a project's property, not a session's. The endpoint
+// stays registered so a direct API caller or an older client is told what to do
+// instead of getting a 404 — the three tests that used to live here covered the
+// per-session setter (success, a missing directory, a file instead of a
+// directory), all of which are now unreachable by design.
+func TestHandleUpdateSessionWorkingDir_RefusedForATask(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "")
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	payload, _ := json.Marshal(map[string]string{"working_dir": tmp})
+	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/"+sess.ID+"/working_dir", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", w.Code, w.Body.String())
+	}
+	// The session must be left alone, not partially updated.
+	got, err := agent.LoadSession(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WorkingDir == tmp {
+		t.Error("the refused directory was persisted anyway")
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	msg, _ := body["error"].(string)
+	if !strings.Contains(msg, "project") {
+		t.Errorf("error = %q, want it to point at projects", msg)
+	}
+}
+
+// A session already in a project gets the more specific message: change it on
+// the project, which is where the directory lives.
+func TestHandleUpdateSessionWorkingDir_RefusedForAProjectMember(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "")
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	g, err := createSessionGroupNamed("Alpha", t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := addSessionToGroup(g.ID, sess.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(map[string]string{"working_dir": tmp})
+	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/"+sess.ID+"/working_dir", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if msg, _ := body["error"].(string); !strings.Contains(msg, "Alpha") {
+		t.Errorf("error = %q, want it to name the project", msg)
+	}
+}
+
+func TestHandleUpdateSessionAgentProfile_ZeroTurns(t *testing.T) {
+	srv := curatedTestServer(t)
+
+	sess := agent.NewSession("stub-model", "")
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	payload, _ := json.Marshal(updateSessionAgentProfileRequest{AgentProfile: "test-expert"})
+	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/"+sess.ID+"/agent_profile", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["agent_profile"] != "test-expert" {
+		t.Fatalf("response agent_profile = %v, want %q", body["agent_profile"], "test-expert")
+	}
+
+	got, err := agent.LoadSession(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AgentID != "test-expert" {
+		t.Fatalf("session AgentID = %q, want %q", got.AgentID, "test-expert")
+	}
+}
+
+func TestHandleUpdateSessionAgentProfile_RejectsAfterFirstTurn(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "")
+	sess.Messages = []agent.Message{agent.NewUserMessage("hi"), agent.NewAssistantMessage("ok")}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	payload, _ := json.Marshal(updateSessionAgentProfileRequest{AgentProfile: "default"})
+	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/"+sess.ID+"/agent_profile", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleUpdateSessionAgentProfile_UnknownAgentRejected(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "")
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	payload, _ := json.Marshal(updateSessionAgentProfileRequest{AgentProfile: "no-such-agent"})
+	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/"+sess.ID+"/agent_profile", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleUpdateSessionModel_RawStringIsPerSession(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "")
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	payload, _ := json.Marshal(updateSessionModelRequest{ModelID: "kimi-for-coding"})
+	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/"+sess.ID+"/model", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["ok"] != true {
+		t.Fatalf("ok = %v, want true", body["ok"])
+	}
+
+	// The switch is per-session: the session carries the new model, the
+	// server default and the persisted config stay untouched.
+	got, err := agent.LoadSession(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != "kimi-for-coding" || got.ModelConfig != "" {
+		t.Fatalf("session = (%q, %q), want (kimi-for-coding, \"\")", got.Model, got.ModelConfig)
+	}
+	if srv.model != "stub-model" {
+		t.Fatalf("server default model changed to %q — must stay stub-model", srv.model)
+	}
+	cfg, _ := config.Load()
+	// PR5: Config.Models is deleted — the per-session switch never writes the
+	// global config (it just sets sess.ModelConfig, a session field).
+	if len(cfg.Endpoints) != 0 {
+		t.Fatalf("global config written by a per-session switch: %+v", cfg.Endpoints)
+	}
+}
+
+func TestHandleUpdateSessionModel_EntryNameBindsSession(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	seed := config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-anthropic", Provider: "anthropic", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+			{ID: "ep-kimi", Provider: "kimi", APIKey: "sk-kimi", Models: []config.EndpointModel{{Model: "kimi-k2.6"}}},
+		},
+		Default: "ep-anthropic::claude-sonnet-4-6",
+	}
+	if err := seed.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	sess := agent.NewSession("claude-sonnet-4-6", "")
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	payload, _ := json.Marshal(updateSessionModelRequest{ModelID: "kimi-k2.6"})
+	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/"+sess.ID+"/model", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	got, err := agent.LoadSession(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ModelConfig != "kimi-k2.6" || got.Model != "kimi-k2.6" {
+		t.Fatalf("session = (%q, %q), want (kimi-k2.6, kimi-k2.6)", got.Model, got.ModelConfig)
+	}
+	cfg, _ := config.Load()
+	if cfg.Default != "ep-anthropic::claude-sonnet-4-6" {
+		t.Fatalf("global default changed to %q — must stay ep-anthropic::claude-sonnet-4-6", cfg.Default)
+	}
+
+	// The bound session's turns resolve to the entry's sender and model;
+	// an unbound session stays on the server default.
+	sender, model := srv.senderForSession(got)
+	if model != "kimi-k2.6" {
+		t.Errorf("senderForSession model = %q, want kimi-k2.6", model)
+	}
+	if sender == srv.sender {
+		t.Error("bound session must not ride the default sender")
+	}
+	plain := agent.NewSession("stub-model", "")
+	if sender2, model2 := srv.senderForSession(plain); sender2 != srv.sender || model2 != "stub-model" {
+		t.Errorf("unbound session = (%v, %q), want default sender + stub-model", sender2, model2)
+	}
+
+	// Deleting the bound endpoint's model degrades to the default sender
+	// instead of failing the turn. PR5: the delete route is now
+	// /api/config/endpoints/{id}/models/{model} (old /api/config/models is gone).
+	if w := doJSON(t, srv, http.MethodDelete, "/api/config/endpoints/ep-kimi/models/kimi-k2.6", ""); w.Code != http.StatusOK {
+		t.Fatalf("DELETE = %d: %s", w.Code, w.Body.String())
+	}
+	if sender3, _ := srv.senderForSession(got); sender3 != srv.sender {
+		t.Error("stale binding must fall back to the default sender")
+	}
+}
+
+// TestHandleGetSessionMessages_IncludesToolCalls verifies that assistant
+// messages carrying tool_use blocks are translated into tool_call events in
+// the history response.
+func TestHandleGetSessionMessages_IncludesToolCalls(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "")
+	sess.Messages = []agent.Message{
+		{Role: agent.RoleUser, Content: "list files"},
+		agent.NewToolUseMessage([]agent.ContentBlock{
+			agent.NewToolUseBlock("call_1", "terminal", map[string]any{"command": "ls"}),
+		}),
+		agent.NewToolResultMessage([]agent.ContentBlock{
+			agent.NewToolResultBlock("call_1", "file.txt\n", false),
+		}),
+		agent.NewAssistantMessage("Here are the files: file.txt"),
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sess.ID+"/messages", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	var body struct {
+		HasMore bool             `json:"has_more"`
+		Events  []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+
+	var toolCallCount int
+	for _, ev := range body.Events {
+		if ev["type"] == "tool_call" {
+			toolCallCount++
+		}
+	}
+	if toolCallCount != 1 {
+		t.Fatalf("tool_call events = %d, want 1; events=%v", toolCallCount, body.Events)
+	}
+}
+
+// TestHandleGetSessionMessages_ToolEventTimestamps verifies the created_at
+// stamps that let a reloaded transcript show real tool durations: taken from
+// the message's CreatedAt when set, and omitted entirely for pre-CreatedAt
+// session files (rather than reusing the index fallback, which would be a
+// bogus near-1970 timestamp).
+func TestHandleGetSessionMessages_ToolEventTimestamps(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	stampedCall := agent.NewToolUseMessage([]agent.ContentBlock{
+		agent.NewToolUseBlock("call_1", "terminal", map[string]any{"command": "ls"}),
+	})
+	stampedResult := agent.NewToolResultMessage([]agent.ContentBlock{
+		agent.NewToolResultBlock("call_1", "file.txt\n", false),
+	})
+	sess := agent.NewSession("stub-model", "")
+	sess.Messages = []agent.Message{
+		{Role: agent.RoleUser, Content: "list files"},
+		stampedCall,
+		stampedResult,
+		// Pre-CreatedAt shape: literal messages carrying no timestamp.
+		{Role: agent.RoleAssistant, Blocks: []agent.ContentBlock{
+			agent.NewToolUseBlock("call_2", "read_file", map[string]any{"path": "go.mod"}),
+		}},
+		{Role: agent.RoleUser, Blocks: []agent.ContentBlock{
+			agent.NewToolResultBlock("call_2", "module x\n", false),
+		}},
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sess.ID+"/messages", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	var body struct {
+		Events []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[string]bool{}
+	for _, ev := range body.Events {
+		typ, _ := ev["type"].(string)
+		id, _ := ev["tool_id"].(string)
+		if typ != "tool_call" && typ != "tool_result" {
+			continue
+		}
+		key := typ + ":" + id
+		seen[key] = true
+		ca, has := ev["created_at"].(float64)
+		switch id {
+		case "call_1":
+			want := stampedCall.CreatedAt.UnixMilli()
+			if typ == "tool_result" {
+				want = stampedResult.CreatedAt.UnixMilli()
+			}
+			if !has || int64(ca) != want {
+				t.Errorf("%s created_at = %v, want %d", key, ev["created_at"], want)
+			}
+		case "call_2":
+			if has {
+				t.Errorf("%s must omit created_at for a zero-CreatedAt message, got %v", key, ca)
+			}
+		}
+	}
+	for _, key := range []string{"tool_call:call_1", "tool_result:call_1", "tool_call:call_2", "tool_result:call_2"} {
+		if !seen[key] {
+			t.Errorf("missing %s event in history replay", key)
+		}
+	}
+}
+
+// History replay must never render <system-reminder> spans (background
+// completion notes, recalled memories) as user bubbles — the TUI skips them
+// and the web transcript must match.
+func TestHandleGetSessionMessages_StripsSystemReminders(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "")
+	sess.Messages = []agent.Message{
+		{Role: agent.RoleUser, Content: "run the build in the background"},
+		agent.NewAssistantMessage("Started."),
+		// A background-completion note injected via steer: pure reminder, no
+		// user speech. Must produce NO history_user_message.
+		{Role: agent.RoleUser, Content: "<system-reminder>\n[BACKGROUND COMPLETED]\nBackground process bg_1 (`make build`) exited: 0.\nOutput since last check:\nhuge build log…\n</system-reminder>"},
+		agent.NewAssistantMessage("Build finished."),
+		// Mixed turn: reminder prepended to real user text. Only the user
+		// text survives.
+		{Role: agent.RoleUser, Content: "<system-reminder>recalled memory</system-reminder>\nnow run the tests"},
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sess.ID+"/messages", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	var body struct {
+		Events []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+
+	var userTexts []string
+	for _, ev := range body.Events {
+		if ev["type"] == "history_user_message" {
+			userTexts = append(userTexts, ev["content"].(string))
+		}
+	}
+	want := []string{"run the build in the background", "now run the tests"}
+	if len(userTexts) != len(want) {
+		t.Fatalf("user messages = %q, want %q", userTexts, want)
+	}
+	for i := range want {
+		if userTexts[i] != want[i] {
+			t.Errorf("user message[%d] = %q, want %q", i, userTexts[i], want[i])
+		}
+	}
+}
+
+// TestHandleGetSessionMessages_MultiToolUse verifies the full event sequence
+// for a session with multiple tool_use blocks and tool_results.
+func TestHandleGetSessionMessages_MultiToolUse(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	// res1 carries a structured UI payload; res2 doesn't. The replay must
+	// surface the payload as ui_payload after the session JSON round-trip.
+	res1 := agent.NewToolResultBlock("call_1", "file.txt\n", false)
+	res1.UI = map[string]any{"type": "file_list", "total": 1}
+	// res2 carries a model-facing <system-reminder> appended by the
+	// tool-result hook (memory save-nudge); replay must strip it.
+	res2 := agent.NewToolResultBlock("call_2",
+		"file.txt:1:foo\n\n<system-reminder>\nsave a memory\n</system-reminder>", false)
+
+	sess := agent.NewSession("stub-model", "")
+	sess.Messages = []agent.Message{
+		{Role: agent.RoleUser, Content: "list and grep"},
+		agent.NewToolUseMessage([]agent.ContentBlock{
+			agent.NewToolUseBlock("call_1", "terminal", map[string]any{"command": "ls"}),
+			agent.NewToolUseBlock("call_2", "grep", map[string]any{"pattern": "foo"}),
+		}),
+		agent.NewToolResultMessage([]agent.ContentBlock{
+			res1,
+			res2,
+		}),
+		agent.NewAssistantMessage("Found it"),
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sess.ID+"/messages", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	var body struct {
+		HasMore bool             `json:"has_more"`
+		Events  []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotTypes []string
+	for _, ev := range body.Events {
+		gotTypes = append(gotTypes, ev["type"].(string))
+	}
+
+	wantTypes := []string{
+		"history_user_message",
+		"tool_call",
+		"tool_call",
+		"tool_result",
+		"tool_result",
+		"assistant_message",
+	}
+	if len(gotTypes) != len(wantTypes) {
+		t.Fatalf("event types = %v, want %v", gotTypes, wantTypes)
+	}
+	for i, want := range wantTypes {
+		if gotTypes[i] != want {
+			t.Fatalf("event[%d].type = %q, want %q; full=%v", i, gotTypes[i], want, gotTypes)
+		}
+	}
+
+	// A tool-use round with no reasoning/text emits no intermediate
+	// assistant_message — only its tool_calls — so the two tool_results land at
+	// events[3] / events[4]; only the first carries UI.
+	ui, ok := body.Events[3]["ui_payload"].(map[string]any)
+	if !ok || ui["type"] != "file_list" {
+		t.Errorf("events[3].ui_payload = %#v, want file_list payload", body.Events[3]["ui_payload"])
+	}
+	if _, present := body.Events[4]["ui_payload"]; present {
+		t.Errorf("events[4].ui_payload present, want absent: %#v", body.Events[4]["ui_payload"])
+	}
+	// The save-nudge reminder on res2 is model-facing — replay must strip it.
+	if got, _ := body.Events[4]["result"].(string); got != "file.txt:1:foo" {
+		t.Errorf("events[4].result = %q, want reminder stripped", got)
+	}
+}
+
+// TestHandleGetSessionMessages_ThinkingBeforeTools verifies an intermediate
+// (tool) round replays its reasoning as a standalone `thinking` event BEFORE the
+// tool_call (think → act), while the final answer keeps its reasoning inline on
+// the assistant_message. This is what lets the web UI place Thoughts ahead of
+// the tool card after a refresh instead of stranding it behind one.
+func TestHandleGetSessionMessages_ThinkingBeforeTools(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "")
+	sess.Messages = []agent.Message{
+		{Role: agent.RoleUser, Content: "weather?"},
+		agent.NewToolUseMessage([]agent.ContentBlock{
+			agent.NewThinkingBlock("let me search", "SIG1"),
+			agent.NewToolUseBlock("call_1", "web_search", map[string]any{"q": "weather"}),
+		}),
+		agent.NewToolResultMessage([]agent.ContentBlock{
+			agent.NewToolResultBlock("call_1", "5 results", false),
+		}),
+		// Final answer turn carries its own reasoning inline (the fix that
+		// persists final-turn thinking).
+		{Role: agent.RoleAssistant, Content: "It's sunny.", Blocks: []agent.ContentBlock{
+			agent.NewThinkingBlock("synthesize the answer", "SIG2"),
+			agent.NewTextBlock("It's sunny."),
+		}},
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sess.ID+"/messages", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	var body struct {
+		Events []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotTypes []string
+	for _, ev := range body.Events {
+		gotTypes = append(gotTypes, ev["type"].(string))
+	}
+	wantTypes := []string{
+		"history_user_message",
+		"thinking",  // intermediate reasoning, BEFORE the tool
+		"tool_call", // web_search
+		"tool_result",
+		"assistant_message", // final answer, reasoning inline
+	}
+	if len(gotTypes) != len(wantTypes) {
+		t.Fatalf("event types = %v, want %v", gotTypes, wantTypes)
+	}
+	for i, want := range wantTypes {
+		if gotTypes[i] != want {
+			t.Fatalf("event[%d].type = %q, want %q; full=%v", i, gotTypes[i], want, gotTypes)
+		}
+	}
+	if got, _ := body.Events[1]["text"].(string); got != "let me search" {
+		t.Errorf("events[1].text = %q, want intermediate thinking", got)
+	}
+	if got, _ := body.Events[4]["thinking"].(string); got != "synthesize the answer" {
+		t.Errorf("events[4].thinking = %q, want final reasoning inline", got)
+	}
+	if got, _ := body.Events[4]["content"].(string); got != "It's sunny." {
+		t.Errorf("events[4].content = %q, want answer text", got)
+	}
+	// The answer that closed the turn is a branch point and says so; the
+	// intermediate tool round is not, so it carries no index and the Web UI
+	// offers no Branch action there.
+	if idx, ok := body.Events[4]["message_index"].(float64); !ok || int(idx) != 3 {
+		t.Errorf("events[4].message_index = %v, want 3", body.Events[4]["message_index"])
+	}
+	for i, ev := range body.Events {
+		if i == 4 || ev["type"] != "assistant_message" {
+			continue
+		}
+		if _, present := ev["message_index"]; present {
+			t.Errorf("events[%d] (intermediate assistant_message) carries message_index %v, want absent", i, ev["message_index"])
+		}
+	}
+}
+
+// TestHandleGetSessionMessages_ShowReasoningField verifies the response
+// carries the session's effective show_reasoning setting directly, resolved
+// from its own model entry. The Web UI gates whether a replayed `thinking`
+// event is allowed to end a tool-call group on this value instead of the
+// reactive session-list state, which can still be empty (defaulting to true)
+// on a page load that lands straight on this session via URL hash — before
+// api.listSessions() has resolved.
+func TestHandleGetSessionMessages_ShowReasoningField(t *testing.T) {
+	setTestHome(t)
+	off := false
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-anthropic", Provider: "anthropic", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+			{ID: "ep-kimi", Provider: "kimi-coding-plan", Models: []config.EndpointModel{{Model: "kimi-for-coding"}}},
+		},
+		Default:       "ep-anthropic::claude-sonnet-4-6",
+		ShowReasoning: &off,
+	})
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	quiet := agent.NewSession("kimi-for-coding", "")
+	quiet.ModelConfig = "kimi-for-coding"
+	if err := quiet.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	loud := agent.NewSession("claude-sonnet-4-6", "")
+	loud.ModelConfig = "claude-sonnet-4-6"
+	if err := loud.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	getShowReasoning := func(sessionID string) any {
+		req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sessionID+"/messages", nil)
+		w := httptest.NewRecorder()
+		serveLoopback(srv.mux, w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+		}
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body["show_reasoning"]
+	}
+
+	// PR5: reasoning is global. Both sessions read the global ShowReasoning
+	// (off) — per-session overrides no longer exist. This test now just
+	// guards that the global value surfaces on session messages.
+	if got := getShowReasoning(quiet.ID); got != false {
+		t.Errorf("kimi-for-coding session show_reasoning = %v, want false (global)", got)
+	}
+	if got := getShowReasoning(loud.ID); got != false {
+		t.Errorf("claude-sonnet-4-6 session show_reasoning = %v, want false (global)", got)
+	}
+}
+
+// TestRunTurnForwardsTools is the regression guard for the web-UI bug where the
+// server's sender only implemented the base Sender, so the agent loop fell back
+// to a tool-less Turn and every tool (web_search included) vanished.
+func TestRunTurnForwardsTools(t *testing.T) {
+	rec := &recordingSender{}
+	srv := &Server{
+		cfg:       Config{Tools: true},
+		model:     "stub-model",
+		turnLocks: map[string]*sync.Mutex{},
+		sender:    rec,
+	}
+
+	sess := agent.NewSession("stub-model", "")
+	if _, err := srv.runTurn(context.Background(), sess, "hi"); err != nil {
+		t.Fatalf("runTurn: %v", err)
+	}
+
+	if len(rec.lastTools) == 0 {
+		t.Fatal("expected tools forwarded to sender, got none (sender degraded to tool-less Turn)")
+	}
+	found := false
+	for _, d := range rec.lastTools {
+		if d.Name == "web_search" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("web_search not among forwarded tools: %v", rec.lastTools)
+	}
+}
+
+// ctxCancelSender cancels the turn context on its first provider call —
+// a Ctrl-C/client-disconnect arriving while the call is in flight.
+type ctxCancelSender struct{ cancel context.CancelFunc }
+
+func (s *ctxCancelSender) SendMessages(ctx context.Context, _, _ string, _ []agent.Message, _ int) (agent.Reply, error) {
+	s.cancel()
+	return agent.Reply{}, ctx.Err()
+}
+
+// TestRunTurn_InterruptPersistsKeptInput: the REST transport must persist
+// what an interrupted turn leaves in history (the input capped with the
+// interrupt note) even though runTurn returns an error — its callers only
+// Save on success. The WS path saves on every outcome; without the
+// error-path Save here the kept message silently vanished on this transport.
+func TestRunTurn_InterruptPersistsKeptInput(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := &Server{
+		cfg:       Config{Tools: false},
+		model:     "stub-model",
+		turnLocks: map[string]*sync.Mutex{},
+		sender:    &ctxCancelSender{cancel: cancel},
+	}
+
+	sess := agent.NewSession("stub-model", "")
+	_, err := srv.runTurn(ctx, sess, "fix the bug")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+
+	reloaded, lerr := agent.LoadSession(sess.ID)
+	if lerr != nil {
+		t.Fatalf("session was not persisted on the interrupt path: %v", lerr)
+	}
+	if len(reloaded.Messages) != 2 {
+		t.Fatalf("persisted messages = %d, want 2 (input + interrupt note): %+v", len(reloaded.Messages), reloaded.Messages)
+	}
+	if m := reloaded.Messages[0]; m.Role != agent.RoleUser || strings.TrimSpace(agent.StripSystemReminders(m.Content)) != "fix the bug" {
+		t.Errorf("messages[0] = %+v, want the interrupted user input", m)
+	}
+	if m := reloaded.Messages[1]; m.Role != agent.RoleAssistant {
+		t.Errorf("messages[1].Role = %q, want assistant interrupt note", m.Role)
+	}
+}
+
+// TestDoAgentTurn_SeedsThinkingProgress is the regression guard for the web-UI
+// "no spinner after send" gap. doAgentTurn must broadcast an initial "thinking"
+// progress immediately — before any text streams — so the frontend keeps an
+// indicator on screen between swapping the ghost bubble for the real one and
+// the first delta. Provider connect + pre-text reasoning fire no events, so
+// without the seed the session looks hung.
+func TestDoAgentTurn_SeedsThinkingProgress(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.initWS()
+	// Maps doAgentTurn touches that the full constructor sets up but mustServer
+	// (a minimal hand-built Server) does not.
+	srv.turnRunning = make(map[string]bool)
+	srv.steerQueues = make(map[string][]queuedTurn)
+	srv.sessionAgents = make(map[string]*agent.Agent)
+
+	sess := agent.NewSession("stub-model", "")
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Subscribe a fake connection so we capture what the turn broadcasts.
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 256),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+	srv.wsHub.subscribe(conn, sess.ID)
+
+	srv.doAgentTurn(sess, "hi", nil, nil)
+
+	// Broadcast is async through the hub's event loop; drain until the turn's
+	// terminal "complete" event (or a safety deadline).
+	var types []string
+	firstProgressIdx, firstTextIdx := -1, -1
+	progressType := ""
+	deadline := time.After(2 * time.Second)
+drain:
+	for {
+		select {
+		case b := <-conn.send:
+			var ev map[string]any
+			if err := json.Unmarshal(b, &ev); err != nil {
+				continue
+			}
+			typ, _ := ev["type"].(string)
+			switch typ {
+			case "progress":
+				if firstProgressIdx < 0 {
+					firstProgressIdx = len(types)
+					progressType, _ = ev["progress_type"].(string)
+				}
+			case "text_delta":
+				if firstTextIdx < 0 {
+					firstTextIdx = len(types)
+				}
+			}
+			types = append(types, typ)
+			if typ == "complete" {
+				break drain
+			}
+		case <-deadline:
+			break drain
+		}
+	}
+
+	if firstProgressIdx < 0 {
+		t.Fatalf("turn broadcast no progress event; got %v", types)
+	}
+	if progressType != "thinking" {
+		t.Errorf("first progress_type = %q, want \"thinking\"; events=%v", progressType, types)
+	}
+	if firstTextIdx >= 0 && firstProgressIdx > firstTextIdx {
+		t.Errorf("thinking progress must precede first text_delta; progress@%d text@%d; events=%v",
+			firstProgressIdx, firstTextIdx, types)
+	}
+}
+
+// TestDoAgentTurn_LiveAndHistoryCreatedAtMatch guards the Web UI's
+// live-vs-history dedup key. On session open, the initial /messages fetch can
+// race the live history_user_message broadcast; the frontend dedups the two
+// render paths by exact created_at equality, so the broadcast and the history
+// endpoint must report the SAME millisecond value for the same user message.
+// A mismatch (one side seconds, the other milliseconds, or two separate
+// time.Now() calls) renders the user's message twice until a page refresh.
+func TestDoAgentTurn_LiveAndHistoryCreatedAtMatch(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	srv.initWS()
+	srv.turnRunning = make(map[string]bool)
+	srv.steerQueues = make(map[string][]queuedTurn)
+	srv.sessionAgents = make(map[string]*agent.Agent)
+
+	sess := agent.NewSession("stub-model", "")
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 256),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+	srv.wsHub.subscribe(conn, sess.ID)
+
+	srv.doAgentTurn(sess, "hello dedup", nil, nil)
+
+	// Capture the live broadcast's created_at.
+	var liveCreatedAt float64
+	deadline := time.After(2 * time.Second)
+drainDedup:
+	for {
+		select {
+		case b := <-conn.send:
+			var ev map[string]any
+			if err := json.Unmarshal(b, &ev); err != nil {
+				continue
+			}
+			if typ, _ := ev["type"].(string); typ == "history_user_message" {
+				liveCreatedAt, _ = ev["created_at"].(float64)
+			} else if typ == "complete" {
+				break drainDedup
+			}
+		case <-deadline:
+			break drainDedup
+		}
+	}
+	if liveCreatedAt <= 0 {
+		t.Fatal("no live history_user_message with created_at captured")
+	}
+
+	// Fetch history and find the same user message.
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sess.ID+"/messages", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("messages status = %d; body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Events []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	var histCreatedAt float64
+	for _, ev := range body.Events {
+		if typ, _ := ev["type"].(string); typ == "history_user_message" {
+			if c, _ := ev["content"].(string); c == "hello dedup" {
+				histCreatedAt, _ = ev["created_at"].(float64)
+			}
+		}
+	}
+	if histCreatedAt <= 0 {
+		t.Fatal("user message not found in history endpoint response")
+	}
+	if liveCreatedAt != histCreatedAt {
+		t.Fatalf("dedup key mismatch: live created_at = %v, history created_at = %v — frontend would render the message twice",
+			liveCreatedAt, histCreatedAt)
+	}
+}
+
+// TestWSStreamWriter_ReseedsThinkingAfterTool is the regression guard for the
+// web-UI "tools pop out of dead air" gap. The frontend clears the progress
+// indicator when a tool_call renders, and the next LLM round emits nothing
+// until its first delta — so after every tool_result (and recoverable
+// tool_error) the stream writer must broadcast a fresh "thinking" progress
+// and keep it in live state for late-subscriber replay.
+func TestWSStreamWriter_ReseedsThinkingAfterTool(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+	srv.initWS()
+
+	const sid = "sess-reseed"
+	srv.liveStateMu.Lock()
+	srv.liveStates[sid] = &sessionLiveState{}
+	srv.liveStateMu.Unlock()
+
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 256),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+	srv.wsHub.subscribe(conn, sid)
+
+	sw := srv.newWSStreamWriter(sid)
+
+	// drainUntilProgress reads broadcasts until a progress event (or deadline)
+	// and returns it along with every event type seen on the way.
+	drainUntilProgress := func() (map[string]any, []string) {
+		deadline := time.After(2 * time.Second)
+		var types []string
+		for {
+			select {
+			case b := <-conn.send:
+				var ev map[string]any
+				if err := json.Unmarshal(b, &ev); err != nil {
+					continue
+				}
+				typ, _ := ev["type"].(string)
+				types = append(types, typ)
+				if typ == "progress" {
+					return ev, types
+				}
+			case <-deadline:
+				return nil, types
+			}
+		}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		event agent.AgentEvent
+	}{
+		{"tool_done", agent.AgentEvent{Kind: agent.EventToolDone, ToolName: "terminal", Output: "ok"}},
+		{"tool_error", agent.AgentEvent{Kind: agent.EventToolError, ToolName: "terminal", Err: "exit 1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sw.handleEvent(tc.event)
+
+			ev, types := drainUntilProgress()
+			if ev == nil {
+				t.Fatalf("no progress broadcast after %s; got %v", tc.name, types)
+			}
+			if pt, _ := ev["progress_type"].(string); pt != "thinking" {
+				t.Errorf("progress_type = %q, want \"thinking\"", pt)
+			}
+			if ph, _ := ev["phase"].(string); ph != "active" {
+				t.Errorf("phase = %q, want \"active\"", ph)
+			}
+			if at, _ := ev["started_at"].(float64); at <= 0 {
+				t.Errorf("started_at = %v, want > 0", ev["started_at"])
+			}
+
+			// Live state must carry the reseeded progress so a tab subscribing
+			// mid-gap replays an indicator instead of a blank screen.
+			srv.liveStateMu.Lock()
+			ls := srv.liveStates[sid]
+			srv.liveStateMu.Unlock()
+			if ls == nil {
+				t.Fatalf("live state deleted after %s; replay would be blank", tc.name)
+			}
+			if ls.progress == nil || ls.progress.ProgressType != "thinking" {
+				t.Errorf("live state progress = %+v, want reseeded thinking phase", ls.progress)
+			}
+		})
+	}
+}
+
+// A turn-level failure (sender/tool setup or the LLM call itself) must reach
+// the frontend under its own "turn_error" type. Sending it as "tool_error" —
+// which the frontend keys by tool_id — meant a failure before any tool ran was
+// silently dropped, leaving the user staring at a stalled turn.
+func TestWSStreamWriter_TurnError_DistinctType(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+	srv.initWS()
+
+	const sid = "sess-turnerr"
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 8),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+	srv.wsHub.subscribe(conn, sid)
+
+	srv.newWSStreamWriter(sid).error("anthropic: HTTP 429: rate limit exceeded")
+
+	select {
+	case b := <-conn.send:
+		var ev map[string]any
+		if err := json.Unmarshal(b, &ev); err != nil {
+			t.Fatalf("unmarshal broadcast: %v", err)
+		}
+		if typ, _ := ev["type"].(string); typ != "turn_error" {
+			t.Errorf("type = %q, want \"turn_error\" (not tool_error — that gets dropped when no tool card exists)", typ)
+		}
+		if msg, _ := ev["error"].(string); msg != "anthropic: HTTP 429: rate limit exceeded" {
+			t.Errorf("error = %q, want the provider message verbatim", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no broadcast after sw.error — the turn failure never reached the client")
+	}
+}
+
+// TestWSStreamWriter_BroadcastsContextUsageMidTurn guards the live refresh of
+// the composer's Context bar: the only other context_usage broadcasts happen
+// at subscribe time and at turn end, so each tool round must push the Agent's
+// fresh count — and parallel tool calls in one round (same count) must push
+// it once, not per tool.
+func TestWSStreamWriter_BroadcastsContextUsageMidTurn(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+	srv.initWS()
+
+	const sid = "sess-ctx-usage"
+	a := agent.New(&stubSender{}, "stub-model")
+	// A resumed-history estimate is the only usage source reachable from a
+	// test (real counts come from provider replies); any positive count
+	// exercises the same broadcast path.
+	a.History.Append(agent.NewUserMessage(strings.Repeat("x", 8000)))
+	srv.sessionAgentsMu.Lock()
+	srv.sessionAgents[sid] = a
+	srv.sessionAgentsMu.Unlock()
+
+	conn := &wsConn{
+		hub:        srv.wsHub,
+		send:       make(chan []byte, 256),
+		subscribed: map[string]struct{}{},
+	}
+	srv.wsHub.register <- conn
+	srv.wsHub.subscribe(conn, sid)
+
+	sw := srv.newWSStreamWriter(sid)
+
+	// drainUntil reads broadcasts until an event of type typ (or deadline),
+	// returning it plus every session_update seen on the way.
+	drainUntil := func(typ string) (map[string]any, []map[string]any) {
+		deadline := time.After(2 * time.Second)
+		var updates []map[string]any
+		for {
+			select {
+			case b := <-conn.send:
+				var ev map[string]any
+				if err := json.Unmarshal(b, &ev); err != nil {
+					continue
+				}
+				if got, _ := ev["type"].(string); got == "session_update" {
+					updates = append(updates, ev)
+				} else if got == typ {
+					return ev, updates
+				}
+			case <-deadline:
+				return nil, updates
+			}
+		}
+	}
+
+	sw.handleEvent(agent.AgentEvent{Kind: agent.EventToolStarted, ToolName: "terminal", ToolID: "t1"})
+	// Sentinel: hub delivery is FIFO per conn, so once the delta arrives every
+	// broadcast from the tool start has been delivered.
+	sw.handleEvent(agent.AgentEvent{Kind: agent.EventTextDelta, Text: "sentinel"})
+	if ev, updates := drainUntil("text_delta"); ev == nil {
+		t.Fatal("sentinel text_delta never arrived")
+	} else if len(updates) != 1 {
+		t.Fatalf("got %d session_update broadcasts after first tool start, want 1: %v", len(updates), updates)
+	} else {
+		if tok, _ := updates[0]["context_tokens"].(float64); tok <= 0 {
+			t.Errorf("context_tokens = %v, want > 0", updates[0]["context_tokens"])
+		}
+		if _, ok := updates[0]["context_usage"].(float64); !ok {
+			t.Errorf("context_usage missing from mid-turn session_update: %v", updates[0])
+		}
+		if _, ok := updates[0]["status"]; ok {
+			t.Errorf("mid-turn session_update must not carry status (it would clobber \"running\"): %v", updates[0])
+		}
+	}
+
+	// Same count again (a second tool in the same round) — deduped.
+	sw.handleEvent(agent.AgentEvent{Kind: agent.EventToolStarted, ToolName: "terminal", ToolID: "t2"})
+	sw.handleEvent(agent.AgentEvent{Kind: agent.EventTextDelta, Text: "sentinel"})
+	if ev, updates := drainUntil("text_delta"); ev == nil {
+		t.Fatal("sentinel text_delta never arrived")
+	} else if len(updates) != 0 {
+		t.Fatalf("got %d session_update broadcasts for an unchanged count, want 0: %v", len(updates), updates)
+	}
+
+	// The count grows (next provider round-trip landed) — broadcast resumes.
+	a.History.Append(agent.NewUserMessage(strings.Repeat("y", 8000)))
+	sw.handleEvent(agent.AgentEvent{Kind: agent.EventToolStarted, ToolName: "terminal", ToolID: "t3"})
+	sw.handleEvent(agent.AgentEvent{Kind: agent.EventTextDelta, Text: "sentinel"})
+	if ev, updates := drainUntil("text_delta"); ev == nil {
+		t.Fatal("sentinel text_delta never arrived")
+	} else if len(updates) != 1 {
+		t.Fatalf("got %d session_update broadcasts after the count grew, want 1: %v", len(updates), updates)
+	}
+}
+
+// PATCH /api/sessions/{id} is the sidebar rename action — the title must
+// persist through a session reload, and bad input must not slip through.
+func TestHandleUpdateSession_Rename(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("stub-model", "")
+	sess.Messages = []agent.Message{{Role: agent.RoleUser, Content: "hi"}}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	do := func(id, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPatch, "/api/sessions/"+id, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		serveLoopback(srv.mux, w, req)
+		return w
+	}
+
+	if w := do(sess.ID, `{"name":"My research session"}`); w.Code != http.StatusOK {
+		t.Fatalf("rename status = %d; body=%s", w.Code, w.Body.String())
+	}
+	loaded, err := agent.LoadSession(sess.ID)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded.Title != "My research session" {
+		t.Errorf("Title = %q, want the new name", loaded.Title)
+	}
+
+	if w := do(sess.ID, `{"name":"  "}`); w.Code != http.StatusBadRequest {
+		t.Errorf("blank name status = %d, want 400", w.Code)
+	}
+	if w := do("no-such-session", `{"name":"x"}`); w.Code != http.StatusNotFound {
+		t.Errorf("unknown id status = %d, want 404", w.Code)
+	}
+}
+
+// TestInvalidateEndpointSenders_DropsOnlyMatchingPrefix verifies PR3 §9.2:
+// invalidateEndpointSenders clears cache entries whose key is prefixed with
+// "<endpointID>::" but leaves other endpoints' entries intact. This is the
+// cache hit-rate preservation — changing one endpoint's base_url doesn't
+// force every other endpoint to rebuild.
+func TestInvalidateEndpointSenders_DropsOnlyMatchingPrefix(t *testing.T) {
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	// Seed the cache with entries under two different endpoint prefixes.
+	// Use a stub Sender so we don't need real API keys.
+	stub := func(id string) agent.Sender { return &nopSender{id: id} }
+	srv.senderCacheMu.Lock()
+	srv.senderCache = map[string]agent.Sender{
+		"relay-a::claude-sonnet-4-6":  stub("a1"),
+		"relay-a::gpt-5.4":            stub("a2"),
+		"official::claude-sonnet-4-6": stub("o1"),
+		"official::gpt-5.4":           stub("o2"),
+		// A bare-model key (legacy session form) — must NOT be cleared by
+		// invalidateEndpointSenders since it has no endpoint prefix.
+		"claude-haiku-4-5": stub("bare"),
+	}
+	srv.senderCacheMu.Unlock()
+
+	srv.invalidateEndpointSenders("relay-a")
+
+	srv.senderCacheMu.Lock()
+	defer srv.senderCacheMu.Unlock()
+	// relay-a entries gone.
+	if _, ok := srv.senderCache["relay-a::claude-sonnet-4-6"]; ok {
+		t.Error("relay-a::claude-sonnet-4-6 still cached after invalidate")
+	}
+	if _, ok := srv.senderCache["relay-a::gpt-5.4"]; ok {
+		t.Error("relay-a::gpt-5.4 still cached after invalidate")
+	}
+	// official entries preserved.
+	if _, ok := srv.senderCache["official::claude-sonnet-4-6"]; !ok {
+		t.Error("official::claude-sonnet-4-6 dropped — invalidate must be endpoint-scoped")
+	}
+	if _, ok := srv.senderCache["official::gpt-5.4"]; !ok {
+		t.Error("official::gpt-5.4 dropped — invalidate must be endpoint-scoped")
+	}
+	// Bare-model key preserved (no prefix to match).
+	if _, ok := srv.senderCache["claude-haiku-4-5"]; !ok {
+		t.Error("bare-model key dropped — invalidateEndpointSenders must not touch bare keys")
+	}
+}
+
+// TestInvalidateEndpointSenders_EmptyIDIsNoop verifies the guard: calling
+// with an empty endpointID (a caller bug) doesn't clear the whole cache.
+// Without the guard, prefix "" would match every key.
+func TestInvalidateEndpointSenders_EmptyIDIsNoop(t *testing.T) {
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	stub := &nopSender{id: "x"}
+	srv.senderCacheMu.Lock()
+	srv.senderCache = map[string]agent.Sender{
+		"relay-a::claude-sonnet-4-6": stub,
+		"official::gpt-5.4":          stub,
+	}
+	srv.senderCacheMu.Unlock()
+
+	srv.invalidateEndpointSenders("")
+
+	srv.senderCacheMu.Lock()
+	defer srv.senderCacheMu.Unlock()
+	if len(srv.senderCache) != 2 {
+		t.Errorf("empty endpointID cleared the cache: %d entries remain, want 2", len(srv.senderCache))
+	}
+}
+
+// nopSender is a minimal agent.Sender for cache tests — never actually sends.
+type nopSender struct{ id string }
+
+func (n *nopSender) SendMessages(ctx context.Context, model, system string, messages []agent.Message, maxTokens int) (agent.Reply, error) {
+	return agent.Reply{}, nil
+}
+
+// TestCachedSenderForEntry_DistinguishesSameModelDifferentEndpoint verifies
+// PR3 §9.1's core fix: the cache key is the raw ref (composite id or bare
+// model), not entry.Model. Two entries with the same Model string but
+// different endpoint prefixes must produce separate cache entries —
+// otherwise a turn on relay-a::claude would silently route to the official
+// anthropic sender (or vice versa).
+//
+// We seed the cache directly with two senders under the two composite-id
+// keys, then call cachedSenderForEntry with one of them and assert the
+// returned sender is the one we cached under that key (not the other).
+func TestCachedSenderForEntry_DistinguishesSameModelDifferentEndpoint(t *testing.T) {
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	relaySender := &nopSender{id: "relay-sender"}
+	officialSender := &nopSender{id: "official-sender"}
+	srv.senderCacheMu.Lock()
+	srv.senderCache = map[string]agent.Sender{
+		"relay-a::claude-sonnet-4-6":  relaySender,
+		"official::claude-sonnet-4-6": officialSender,
+	}
+	srv.senderCacheMu.Unlock()
+
+	// Both entries have the same Model string — what distinguishes them in
+	// the cache is the ref passed in.
+	entry := config.ModelEntry{Provider: "custom", Model: "claude-sonnet-4-6"}
+
+	got, err := srv.cachedSenderForEntry("relay-a::claude-sonnet-4-6", entry)
+	if err != nil {
+		t.Fatalf("cachedSenderForEntry(relay-a::...): %v", err)
+	}
+	if got != relaySender {
+		t.Errorf("relay-a::claude-sonnet-4-6 returned %+v, want relaySender — cache key collision would route to the wrong endpoint", got)
+	}
+
+	got, err = srv.cachedSenderForEntry("official::claude-sonnet-4-6", entry)
+	if err != nil {
+		t.Fatalf("cachedSenderForEntry(official::...): %v", err)
+	}
+	if got != officialSender {
+		t.Errorf("official::claude-sonnet-4-6 returned %+v, want officialSender — cache key collision would route to the wrong endpoint", got)
+	}
+}
+
+// TestCachedSenderForEntry_BareModelRefStillWorks pins the legacy path: a
+// bare-model ref (no "::") uses the bare string as the cache key, matching
+// pre-PR3 behaviour for legacy sessions whose ModelConfig is a bare model.
+func TestCachedSenderForEntry_BareModelRefStillWorks(t *testing.T) {
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+	bareSender := &nopSender{id: "bare"}
+	srv.senderCacheMu.Lock()
+	srv.senderCache = map[string]agent.Sender{
+		"claude-sonnet-4-6": bareSender,
+	}
+	srv.senderCacheMu.Unlock()
+
+	entry := config.ModelEntry{Provider: "anthropic", Model: "claude-sonnet-4-6"}
+	got, err := srv.cachedSenderForEntry("claude-sonnet-4-6", entry)
+	if err != nil {
+		t.Fatalf("cachedSenderForEntry(bare): %v", err)
+	}
+	if got != bareSender {
+		t.Errorf("bare-model ref returned %+v, want bareSender", got)
+	}
+}
+
+// A replayed assistant bubble must carry the persisted CreatedAt: the Web UI
+// stamps the bubble with whatever created_at it receives and falls back to the
+// reload time when it is absent — which made an answer from this morning read
+// as "now" after every refresh. Both replay shapes (final answer and the text
+// segment of a tool round) carry it; a pre-CreatedAt session file carries none.
+func TestHandleGetSessionMessages_AssistantMessageCarriesCreatedAt(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	at := time.Date(2026, 9, 18, 8, 2, 0, 0, time.UTC)
+	sess := agent.NewSession("deepseek-v4-pro", "")
+	sess.Title = "fixed"
+	sess.Messages = []agent.Message{
+		{Role: agent.RoleUser, Content: "weather?", CreatedAt: at},
+		{Role: agent.RoleAssistant, CreatedAt: at.Add(time.Second), Blocks: []agent.ContentBlock{
+			{Type: "text", Text: "checking"},
+			{Type: "tool_use", ID: "t1", Name: "terminal", Input: map[string]any{}},
+		}},
+		{Role: agent.RoleUser, Blocks: []agent.ContentBlock{{Type: "tool_result", ToolUseID: "t1", Result: "sunny"}}},
+		{Role: agent.RoleAssistant, Content: "sunny today", CreatedAt: at.Add(2 * time.Second)},
+		// Pre-CreatedAt session files have a zero timestamp: no created_at
+		// rather than a bogus 1970 value.
+		{Role: agent.RoleUser, Content: "and tomorrow?"},
+		{Role: agent.RoleAssistant, Content: "also sunny"},
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sess.ID+"/messages", nil)
+	req.SetPathValue("id", sess.ID)
+	rec := httptest.NewRecorder()
+	srv.handleGetSessionMessages(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("messages endpoint = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Events []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var got []map[string]any
+	for _, ev := range body.Events {
+		if ev["type"] == "assistant_message" {
+			got = append(got, ev)
+		}
+	}
+	if len(got) != 3 {
+		t.Fatalf("assistant_message events = %d, want 3: %+v", len(got), body.Events)
+	}
+	// JSON numbers decode as float64.
+	if want := float64(at.Add(time.Second).UnixMilli()); got[0]["created_at"] != want {
+		t.Errorf("tool-round text segment created_at = %v, want %v", got[0]["created_at"], want)
+	}
+	if want := float64(at.Add(2 * time.Second).UnixMilli()); got[1]["created_at"] != want {
+		t.Errorf("final answer created_at = %v, want %v", got[1]["created_at"], want)
+	}
+	if v, ok := got[2]["created_at"]; ok {
+		t.Errorf("pre-CreatedAt reply carried created_at = %v, want none", v)
+	}
+}
+
+// The transcript endpoint is the one response that grows with the session —
+// several MB for a long one — so it is gzipped for a client that accepts it,
+// and the decompressed body must be exactly what an identity request gets.
+func TestHandleGetSessionMessages_Gzip(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := agent.NewSession("deepseek-v4-pro", "")
+	sess.Title = "fixed"
+	sess.Messages = []agent.Message{
+		{Role: agent.RoleUser, Content: strings.Repeat("hello ", 200)},
+		{Role: agent.RoleAssistant, Content: strings.Repeat("world ", 200)},
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+	get := func(acceptEncoding string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+sess.ID+"/messages", nil)
+		req.SetPathValue("id", sess.ID)
+		if acceptEncoding != "" {
+			req.Header.Set("Accept-Encoding", acceptEncoding)
+		}
+		rec := httptest.NewRecorder()
+		srv.handleGetSessionMessages(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("messages endpoint = %d: %s", rec.Code, rec.Body.String())
+		}
+		return rec
+	}
+
+	plain := get("")
+	if enc := plain.Header().Get("Content-Encoding"); enc != "" {
+		t.Fatalf("identity request got Content-Encoding %q", enc)
+	}
+
+	zipped := get("gzip, deflate, br")
+	if enc := zipped.Header().Get("Content-Encoding"); enc != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", enc)
+	}
+	if v := zipped.Header().Get("Vary"); v != "Accept-Encoding" {
+		t.Errorf("Vary = %q, want Accept-Encoding", v)
+	}
+	if ct := zipped.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if zipped.Body.Len() >= plain.Body.Len() {
+		t.Errorf("gzipped body %d bytes, not smaller than plain %d", zipped.Body.Len(), plain.Body.Len())
+	}
+	zr, err := gzip.NewReader(zipped.Body)
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	got, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("decompress: %v", err)
+	}
+	if !bytes.Equal(got, plain.Body.Bytes()) {
+		t.Errorf("decompressed body differs from identity body:\n%s\nvs\n%s", got, plain.Body.Bytes())
+	}
+}

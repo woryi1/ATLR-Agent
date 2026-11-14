@@ -1,0 +1,213 @@
+package hooks
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func preToolEngine(t *testing.T, body, matcher string) *Engine {
+	t.Helper()
+	e := NewEngine(nil)
+	if err := e.RegisterShellMatched(EventPreToolUse, makeScript(t, body), matcher, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+func TestPreToolUse_Exit2Blocks(t *testing.T) {
+	e := preToolEngine(t, "echo 'rm is forbidden' >&2; exit 2", "")
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if !dec.Block {
+		t.Fatal("exit 2 must block")
+	}
+	if dec.Reason != "rm is forbidden" {
+		t.Errorf("reason should come from stderr: %q", dec.Reason)
+	}
+}
+
+func TestPreToolUse_Exit0NoOpinion(t *testing.T) {
+	e := preToolEngine(t, "exit 0", "")
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if dec.Block || dec.Allow {
+		t.Errorf("silent exit 0 should be no-opinion, got %+v", dec)
+	}
+}
+
+func TestPreToolUse_StructuredApprove(t *testing.T) {
+	e := preToolEngine(t, `echo '{"decision":"approve"}'`, "")
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if !dec.Allow || dec.Block {
+		t.Errorf("decision approve should allow, got %+v", dec)
+	}
+}
+
+func TestPreToolUse_StructuredBlockWithReason(t *testing.T) {
+	e := preToolEngine(t, `echo '{"decision":"block","reason":"policy X"}'`, "")
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if !dec.Block || dec.Reason != "policy X" {
+		t.Errorf("decision block should carry reason, got %+v", dec)
+	}
+}
+
+func TestPreToolUse_MatcherGates(t *testing.T) {
+	e := preToolEngine(t, "exit 2", "terminal")
+	// Non-matching tool → hook doesn't run → no opinion.
+	if dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "read_file"}); dec.Block {
+		t.Error("matcher should skip read_file")
+	}
+	// Matching tool → blocks.
+	if dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"}); !dec.Block {
+		t.Error("matcher should apply to terminal")
+	}
+}
+
+func TestPreToolUse_BlockWinsOverAllow(t *testing.T) {
+	e := NewEngine(nil)
+	// First hook approves, second blocks — block must win.
+	if err := e.RegisterShellMatched(EventPreToolUse, makeScript(t, `echo '{"decision":"approve"}'`), "", false, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RegisterShellMatched(EventPreToolUse, makeScript(t, "exit 2"), "", false, 0); err != nil {
+		t.Fatal(err)
+	}
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if !dec.Block {
+		t.Errorf("a later block must override an earlier approve, got %+v", dec)
+	}
+}
+
+func TestPreToolUse_OtherExitIsNonBlocking(t *testing.T) {
+	var notices int
+	e := preToolEngine(t, "echo boom >&2; exit 1", "")
+	e.Notify = func(string) { notices++ }
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if dec.Block || dec.Allow {
+		t.Errorf("exit 1 (not 2) must be non-blocking, got %+v", dec)
+	}
+	if notices == 0 {
+		t.Error("a non-blocking hook error should surface via Notify")
+	}
+}
+
+func TestPreToolUse_NoHooksNoOpinion(t *testing.T) {
+	e := NewEngine(nil)
+	if dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"}); dec.Block || dec.Allow {
+		t.Errorf("unconfigured PreToolUse must be no-opinion, got %+v", dec)
+	}
+}
+
+func TestPreToolUse_InProcBlocks(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterInProc(EventPreToolUse, func(_ context.Context, p Payload) string {
+		return `{"decision":"block","reason":"policy X"}`
+	})
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if !dec.Block || dec.Reason != "policy X" {
+		t.Errorf("in-process block decision should carry reason, got %+v", dec)
+	}
+}
+
+func TestPreToolUse_InProcApprove(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterInProc(EventPreToolUse, func(_ context.Context, p Payload) string {
+		return `{"decision":"approve"}`
+	})
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if !dec.Allow || dec.Block {
+		t.Errorf("in-process approve decision should allow, got %+v", dec)
+	}
+}
+
+func TestPreToolUse_InProcNonDecisionIsNoOpinion(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterInProc(EventPreToolUse, func(_ context.Context, p Payload) string {
+		return "not a decision"
+	})
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if dec.Block || dec.Allow {
+		t.Errorf("a plain string return should be no-opinion, got %+v", dec)
+	}
+}
+
+func TestPreToolUse_InProcBlockWinsOverShellApprove(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterInProc(EventPreToolUse, func(_ context.Context, p Payload) string {
+		return `{"decision":"block","reason":"in-proc says no"}`
+	})
+	if err := e.RegisterShellMatched(EventPreToolUse, makeScript(t, `echo '{"decision":"approve"}'`), "", false, 0); err != nil {
+		t.Fatal(err)
+	}
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if !dec.Block || dec.Reason != "in-proc says no" {
+		t.Errorf("in-process block (evaluated first) must win over a later shell approve, got %+v", dec)
+	}
+}
+
+func TestPreToolUse_InProcBlockShortCircuitsShell(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "shell-ran")
+
+	e := NewEngine(nil)
+	e.RegisterInProc(EventPreToolUse, func(_ context.Context, p Payload) string {
+		return `{"decision":"block","reason":"in-proc says no"}`
+	})
+	if err := e.RegisterShellMatched(EventPreToolUse, makeScript(t, "touch "+marker), "", false, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if !dec.Block {
+		t.Fatalf("expected block, got %+v", dec)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Error("shell hook ran despite an earlier in-process block — PreToolUse should short-circuit")
+	}
+}
+
+func TestPreToolUse_InProcPanicIsNoOpinionNotCrash(t *testing.T) {
+	var notices []string
+	e := NewEngine(nil)
+	e.Notify = func(msg string) { notices = append(notices, msg) }
+	e.RegisterInProc(EventPreToolUse, func(_ context.Context, p Payload) string {
+		panic("boom")
+	})
+
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if dec.Block || dec.Allow {
+		t.Errorf("a panicking hook should be no-opinion (tool allowed to proceed), got %+v", dec)
+	}
+	if len(notices) == 0 {
+		t.Error("a panicking in-process hook should surface via Notify")
+	}
+}
+
+func TestPreToolUse_InProcPanicDoesNotSkipLaterHooks(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterInProc(EventPreToolUse, func(_ context.Context, p Payload) string {
+		panic("boom")
+	})
+	e.RegisterInProc(EventPreToolUse, func(_ context.Context, p Payload) string {
+		return `{"decision":"block","reason":"second hook still runs"}`
+	})
+
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if !dec.Block || dec.Reason != "second hook still runs" {
+		t.Errorf("a panic in one hook must not prevent later hooks from running, got %+v", dec)
+	}
+}
+
+func TestPreToolUse_ShellBlockWinsOverInProcApprove(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterInProc(EventPreToolUse, func(_ context.Context, p Payload) string {
+		return `{"decision":"approve"}`
+	})
+	if err := e.RegisterShellMatched(EventPreToolUse, makeScript(t, "exit 2"), "", false, 0); err != nil {
+		t.Fatal(err)
+	}
+	dec := e.PreToolUse(context.Background(), Payload{Event: EventPreToolUse, ToolName: "terminal"})
+	if !dec.Block {
+		t.Errorf("a later shell block must override an earlier in-process approve, got %+v", dec)
+	}
+}

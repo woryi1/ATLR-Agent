@@ -1,0 +1,318 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/open-octo/octo-agent/internal/tools"
+)
+
+// askInput wires a replAsker around the canned stdin string + a buffer for
+// the rendered prompt. Returns the asker and the output buffer so tests
+// can assert both the user answer and the displayed UI.
+func askInput(input string) (*replAsker, *bytes.Buffer) {
+	out := &bytes.Buffer{}
+	reader := newScannerLineReader(strings.NewReader(input), out)
+	view := newPlainView(reader, out, out, verbosityNormal, false)
+	return newREPLAsker(view), out
+}
+
+// oneQuestion builds a single-question request with the given labels.
+func oneQuestion(header string, multi bool, labels ...string) tools.AskRequest {
+	opts := make([]tools.AskOption, 0, len(labels))
+	for _, l := range labels {
+		opts = append(opts, tools.AskOption{Label: l})
+	}
+	return tools.AskRequest{Questions: []tools.AskQuestion{{
+		Question:    "?",
+		Header:      header,
+		MultiSelect: multi,
+		Options:     opts,
+	}}}
+}
+
+func firstAnswer(r tools.AskResponse) tools.AskAnswer {
+	if len(r.Answers) == 0 {
+		return tools.AskAnswer{}
+	}
+	return r.Answers[0]
+}
+
+func TestReplAsker_PrintsQuestionAndOptions(t *testing.T) {
+	a, out := askInput("1\n")
+	req := oneQuestion("lib_choice", false, "date-fns", "Day.js", "Luxon")
+	req.Questions[0].Question = "Which library should we use?"
+	req.Questions[0].Options[0].Description = "small and tree-shakeable"
+	if _, err := a.Ask(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"[ask_user_question · lib_choice]",
+		"Which library should we use?",
+		"1) date-fns",
+		"small and tree-shakeable", // description renders under its label
+		"2) Day.js",
+		"3) Luxon",
+		"4) Other (free text)", // both tail rows are always added
+		"5) Chat about this",
+		"Select [1-5]",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("prompt missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+// A preview renders inline here (no second column on a line reader), capped
+// so a long mockup can't scroll the prompt away.
+func TestReplAsker_PrintsPreviewInline(t *testing.T) {
+	a, out := askInput("1\n")
+	req := oneQuestion("layout", false, "left", "right")
+	req.Questions[0].Options[0].Preview = "+---+\n| A |\n+---+"
+	if _, err := a.Ask(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "| A |") {
+		t.Errorf("preview not rendered in:\n%s", out)
+	}
+}
+
+func TestReplAsker_SinglePickFirstOption(t *testing.T) {
+	a, _ := askInput("1\n")
+	r, _ := a.Ask(context.Background(), oneQuestion("", false, "alpha", "beta"))
+	if got := firstAnswer(r).Choices; len(got) != 1 || got[0] != "alpha" {
+		t.Errorf("single pick = %+v, want [alpha]", got)
+	}
+	if r.Outcome != tools.AskSubmitted {
+		t.Errorf("outcome = %v, want submitted", r.Outcome)
+	}
+}
+
+func TestReplAsker_MultiSelect(t *testing.T) {
+	a, out := askInput("1,3\n")
+	r, _ := a.Ask(context.Background(), oneQuestion("", true, "alpha", "beta", "gamma"))
+	got := firstAnswer(r).Choices
+	if len(got) != 2 || got[0] != "alpha" || got[1] != "gamma" {
+		t.Errorf("multi-pick = %+v, want [alpha gamma]", got)
+	}
+	if !strings.Contains(out.String(), "comma-separated") {
+		t.Errorf("multi-select prompt should hint at comma-separated input")
+	}
+}
+
+func TestReplAsker_SingleSelectIgnoresExtraPicks(t *testing.T) {
+	// Even when the user types "1,2", single-select keeps only the first.
+	a, _ := askInput("1,2\n")
+	r, _ := a.Ask(context.Background(), oneQuestion("", false, "alpha", "beta"))
+	if got := firstAnswer(r).Choices; len(got) != 1 || got[0] != "alpha" {
+		t.Errorf("single-select must keep only the first pick, got %+v", got)
+	}
+}
+
+func TestReplAsker_OtherFreeText(t *testing.T) {
+	// "Other" is the (len(opts)+1)-th slot; after picking it, the asker
+	// prompts again for the free-text follow-up.
+	a, out := askInput("3\nKerberos with constrained delegation\n")
+	r, _ := a.Ask(context.Background(), oneQuestion("", false, "OAuth", "API key"))
+	ans := firstAnswer(r)
+	if ans.Custom != "Kerberos with constrained delegation" {
+		t.Errorf("custom = %q", ans.Custom)
+	}
+	if len(ans.Choices) != 0 {
+		t.Errorf("custom answer should leave Choices empty, got %+v", ans.Choices)
+	}
+	if !strings.Contains(out.String(), "Other (free text):") {
+		t.Errorf("Other follow-up prompt missing in:\n%s", out)
+	}
+}
+
+// "Chat about this" is the tail row: it ends the set as a clarify request
+// rather than answering the question.
+func TestReplAsker_ChatAboutThis(t *testing.T) {
+	a, _ := askInput("4\n")
+	r, _ := a.Ask(context.Background(), oneQuestion("", false, "OAuth", "API key"))
+	if r.Outcome != tools.AskClarify {
+		t.Errorf("outcome = %v, want clarify", r.Outcome)
+	}
+}
+
+// Each question gets its own card; the answers come back in order.
+func TestReplAsker_AsksEveryQuestion(t *testing.T) {
+	a, out := askInput("1\n2\n")
+	req := oneQuestion("first", false, "a", "b")
+	req.Questions = append(req.Questions, tools.AskQuestion{
+		Question: "second?", Header: "second",
+		Options: []tools.AskOption{{Label: "c"}, {Label: "d"}},
+	})
+	r, _ := a.Ask(context.Background(), req)
+	if len(r.Answers) != 2 {
+		t.Fatalf("answers = %+v, want two", r.Answers)
+	}
+	if got := r.Answers[0].Choices; len(got) != 1 || got[0] != "a" {
+		t.Errorf("answer 0 = %v, want [a]", got)
+	}
+	if got := r.Answers[1].Choices; len(got) != 1 || got[0] != "d" {
+		t.Errorf("answer 1 = %v, want [d]", got)
+	}
+	if !strings.Contains(out.String(), "first 1/2") {
+		t.Errorf("card should show progress:\n%s", out)
+	}
+}
+
+// An empty line skips one question and moves on — it no longer abandons the
+// set, because with several questions that would throw away real answers.
+func TestReplAsker_EmptyInputSkipsQuestion(t *testing.T) {
+	a, _ := askInput("\n1\n")
+	req := oneQuestion("first", false, "a", "b")
+	req.Questions = append(req.Questions, tools.AskQuestion{
+		Question: "second?", Header: "second",
+		Options: []tools.AskOption{{Label: "c"}, {Label: "d"}},
+	})
+	r, _ := a.Ask(context.Background(), req)
+	if r.Outcome != tools.AskSubmitted {
+		t.Fatalf("outcome = %v, want submitted", r.Outcome)
+	}
+	if len(r.Answers[0].Choices) != 0 {
+		t.Errorf("skipped question should be blank, got %+v", r.Answers[0])
+	}
+	if got := r.Answers[1].Choices; len(got) != 1 || got[0] != "c" {
+		t.Errorf("answer 1 = %v, want [c]", got)
+	}
+}
+
+func TestReplAsker_EOFRejects(t *testing.T) {
+	// Empty reader → Scan returns false immediately → the set is abandoned.
+	a, _ := askInput("")
+	r, _ := a.Ask(context.Background(), oneQuestion("", false, "a", "b"))
+	if r.Outcome != tools.AskRejected {
+		t.Errorf("EOF should reject the set, got %v", r.Outcome)
+	}
+}
+
+func TestReplAsker_NonNumericSkips(t *testing.T) {
+	// Garbage input → can't parse → skip (with a friendly inline note).
+	a, out := askInput("yes please\n")
+	r, _ := a.Ask(context.Background(), oneQuestion("", false, "a", "b"))
+	if len(firstAnswer(r).Choices) != 0 || firstAnswer(r).Custom != "" {
+		t.Errorf("unparseable input should leave the answer blank, got %+v", firstAnswer(r))
+	}
+	if !strings.Contains(out.String(), "couldn't parse") {
+		t.Errorf("expected user-facing parse note in:\n%s", out)
+	}
+}
+
+// A model that sends an empty header still gets a labelled card: Q1, Q2, …
+func TestReplAsker_HeaderDefault(t *testing.T) {
+	a, out := askInput("1\n")
+	if _, err := a.Ask(context.Background(), oneQuestion("", false, "a", "b")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "[ask_user_question · Q1]") {
+		t.Errorf("missing header should default to Q1:\n%s", out)
+	}
+}
+
+func TestParseSelection(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		max     int
+		multi   bool
+		want    []int
+		wantErr bool
+	}{
+		{"single", "2", 4, false, []int{2}, false},
+		{"multi keeps all", "1,3", 4, true, []int{1, 3}, false},
+		{"single drops extras", "1,3", 4, false, []int{1}, false},
+		{"whitespace tolerated", " 2 , 4 ", 4, true, []int{2, 4}, false},
+		{"out of range errors", "9", 4, false, nil, true},
+		{"non-numeric errors", "abc", 4, false, nil, true},
+		{"empty returns empty", "", 4, false, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseSelection(tc.in, tc.max, tc.multi)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got nil (%v)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if !sliceEqualsInt(got, tc.want) {
+				t.Errorf("parseSelection = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func sliceEqualsInt(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestReplAsker_AskSecret: the secret path renders the question, reads the
+// answer through the no-echo reader (never the line reader — the value must
+// not echo or land in readline history), and returns it as the answer.
+func TestReplAsker_AskSecret(t *testing.T) {
+	out := &bytes.Buffer{}
+	// The line reader carries a decoy: if the secret path accidentally reads
+	// through it, the test fails — the value must come from the secret reader.
+	view := newPlainView(newScannerLineReader(strings.NewReader("decoy\n"), out), out, out, verbosityNormal, false)
+	var gotPrompt string
+	view.secretReader = func(prompt string) (string, bool) {
+		gotPrompt = prompt
+		return "hunter2", true
+	}
+	a := newREPLAsker(view)
+
+	answer, cancelled, err := a.AskSecret(context.Background(), `Enter secret for recording "login": password`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled {
+		t.Fatal("should not be cancelled")
+	}
+	if answer != "hunter2" {
+		t.Fatalf("answer = %q", answer)
+	}
+	if !strings.Contains(out.String(), `Enter secret for recording "login": password`) {
+		t.Errorf("question not rendered: %q", out.String())
+	}
+	if gotPrompt == "" {
+		t.Error("secret reader never invoked")
+	}
+	if strings.Contains(out.String(), "hunter2") {
+		t.Error("secret value echoed to the terminal output")
+	}
+}
+
+// TestReplAsker_AskSecretCancel: empty input / no reader → cancelled, so the
+// collection point aborts the replay with its clean cancellation error.
+func TestReplAsker_AskSecretCancel(t *testing.T) {
+	out := &bytes.Buffer{}
+	view := newPlainView(nil, out, out, verbosityNormal, false)
+	view.secretReader = func(string) (string, bool) { return "", false }
+	a := newREPLAsker(view)
+	if _, cancelled, _ := a.AskSecret(context.Background(), "?"); !cancelled {
+		t.Fatal("reader abort should map to cancelled")
+	}
+
+	// No secret reader wired at all (headless) — also a clean cancel.
+	a2 := newREPLAsker(newPlainView(nil, out, out, verbosityNormal, false))
+	if _, cancelled, _ := a2.AskSecret(context.Background(), "?"); !cancelled {
+		t.Fatal("nil secretReader should map to cancelled")
+	}
+}

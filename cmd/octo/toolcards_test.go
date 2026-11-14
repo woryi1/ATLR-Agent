@@ -1,0 +1,540 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/tools"
+)
+
+func TestCardVerbFor(t *testing.T) {
+	cases := map[string]string{
+		"edit_file":       "Update",
+		"terminal":        "Run",
+		"terminal_output": "Check",
+		"kill_shell":      "Kill",
+		"terminal_input":  "Input",
+		"grep":            "Grep",
+		"web_search":      "Search",
+		"glob":            "Glob",
+		"read_file":       "Read",
+		"write_file":      "Write",
+		"web_fetch":       "Fetch",
+		"sub_agent":       "", // not a card tool → one-liner
+		"remember":        "",
+	}
+	for tool, want := range cases {
+		if got := cardVerbFor(tool); got != want {
+			t.Errorf("cardVerbFor(%q) = %q, want %q", tool, got, want)
+		}
+	}
+}
+
+func TestCardTargetFor(t *testing.T) {
+	cases := []struct {
+		tool  string
+		input map[string]any
+		want  string
+	}{
+		{"terminal", map[string]any{"command": "go test ./..."}, "go test ./..."},
+		{"grep", map[string]any{"pattern": "TODO"}, "TODO"},
+		{"web_search", map[string]any{"query": "golang generics"}, "golang generics"},
+		{"read_file", map[string]any{"path": "main.go"}, "main.go"},
+		{"web_fetch", map[string]any{"url": "https://x.example"}, "https://x.example"},
+		// terminal_output names the process by its command; with no live process
+		// to resolve it falls back to the bare internal id (never "id (cmd)").
+		{"terminal_output", map[string]any{"id": "bg_404"}, "bg_404"},
+	}
+	for _, c := range cases {
+		if got := cardTargetFor(c.tool, c.input); got != c.want {
+			t.Errorf("cardTargetFor(%q, %v) = %q, want %q", c.tool, c.input, got, c.want)
+		}
+	}
+}
+
+func TestRenderToolCard_Dispatch(t *testing.T) {
+	// edit_file success → diff card.
+	edit := renderToolCard("edit_file", map[string]any{
+		"path": "/tmp/nope.go", "old_string": "alpha", "new_string": "beta",
+	}, "", false, 0, 0)
+	if !strings.Contains(edit, "Update(") || !strings.Contains(edit, "alpha") || !strings.Contains(edit, "beta") {
+		t.Errorf("edit_file should render a diff card; got:\n%s", edit)
+	}
+
+	// terminal → output card with the command + output.
+	run := renderToolCard("terminal", map[string]any{"command": "ls"}, "file_a\nfile_b", false, 0, 0)
+	if !strings.Contains(run, "Run(ls)") || !strings.Contains(run, "file_a") {
+		t.Errorf("terminal should render an output card; got:\n%s", run)
+	}
+
+	// terminal_output → snapshot card with status + tail.
+	out := renderToolCard("terminal_output", map[string]any{"id": "bg_1"}, "[status: running]\nstarting up", false, 0, 0)
+	if !strings.Contains(out, "starting up") {
+		t.Errorf("terminal_output should render an output card; got:\n%s", out)
+	}
+
+	// non-card tool → "".
+	if got := renderToolCard("sub_agent", map[string]any{}, "x", false, 0, 0); got != "" {
+		t.Errorf("non-card tool should return \"\"; got %q", got)
+	}
+}
+
+func TestRenderToolCard_ReadFileIsOneLiner(t *testing.T) {
+	// A content preview is near-zero information (usually package/imports);
+	// a successful read_file renders a one-line status with the line count
+	// instead (#1097).
+	output := "     1\tpackage main\n     2\t\n     3\tfunc main() {}\n\n[end of file: 3 lines total]\n"
+	got := renderToolCard("read_file", map[string]any{"path": "main.go"}, output, false, 0, 0)
+	if !strings.Contains(got, "Read(main.go)") {
+		t.Errorf("missing header; got:\n%s", got)
+	}
+	if !strings.Contains(got, "3 lines") {
+		t.Errorf("missing line count; got:\n%s", got)
+	}
+	if strings.Contains(got, "package main") {
+		t.Errorf("should not preview file content anymore; got:\n%s", got)
+	}
+	// A read this small has nothing folded/hidden behind a link — spilling it
+	// to disk anyway would needlessly widen every file read into a plaintext
+	// copy under ~/.octo/tmp for no reason (#1097 review feedback).
+	if strings.Contains(got, "\x1b]8;;") {
+		t.Errorf("a short read should not spill to disk or link; got:\n%s", got)
+	}
+
+	// read_file errors keep the generic short-preview card (the output is an
+	// error message, not file content worth folding). Chroma highlights each
+	// word separately, so check a single token rather than the full phrase.
+	errGot := renderToolCard("read_file", map[string]any{"path": "main.go"}, "no such file", true, 0, 0)
+	if !strings.Contains(errGot, "file") {
+		t.Errorf("error card should still show the error text; got:\n%s", errGot)
+	}
+}
+
+// TestRenderToolCard_ReadFileLargeGetsLink checks the flip side of the
+// gating above: a read past the fold threshold DOES get a click-to-open
+// link, since its content genuinely isn't visible in the one-liner.
+func TestRenderToolCard_ReadFileLargeGetsLink(t *testing.T) {
+	var lines []string
+	for i := 1; i <= 20; i++ {
+		lines = append(lines, fmt.Sprintf("%6d\tline %d", i, i))
+	}
+	output := strings.Join(lines, "\n") + "\n\n[end of file: 20 lines total]\n"
+	got := renderToolCard("read_file", map[string]any{"path": "big.go"}, output, false, 0, 0)
+	if !strings.Contains(got, "20 lines") {
+		t.Errorf("missing line count; got:\n%s", got)
+	}
+	if !strings.Contains(got, "\x1b]8;;") {
+		t.Errorf("a large read should link to the spilled full content; got:\n%s", got)
+	}
+}
+
+func TestReadFileLineCount(t *testing.T) {
+	cases := []struct {
+		name, output string
+		want         int
+	}{
+		{"normal", "     1\ta\n     2\tb\n\n[end of file: 2 lines total]\n", 2},
+		{"truncated", "     1\ta\n\n[truncated: shown lines 1-1. Next unread line is 2. Continue with offset=2 if needed.]\n", 1},
+		{"empty file", "[empty file]", 0},
+		{"past end", "[end of file: 5 lines total. Offset 9 is past the end — no more content to read.]", 0},
+	}
+	for _, c := range cases {
+		if got := readFileLineCount(c.output); got != c.want {
+			t.Errorf("%s: readFileLineCount = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+func TestRenderToolCard_TerminalShowsTail(t *testing.T) {
+	// Command output is shown from the tail — the head is the least
+	// informative end (errors and summaries land at the bottom).
+	var lines []string
+	for i := 1; i <= 10; i++ {
+		lines = append(lines, strings.Repeat("x", 3)+"_line_"+string(rune('0'+i%10)))
+	}
+	got := renderToolCard("terminal", map[string]any{"command": "make test"}, strings.Join(lines, "\n"), false, 0, 0)
+	if strings.Contains(got, "xxx_line_1") {
+		t.Errorf("head line should be folded away in tail mode; got:\n%s", got)
+	}
+	if !strings.Contains(got, "xxx_line_0") { // the 10th (last) line
+		t.Errorf("last line should be visible in tail mode; got:\n%s", got)
+	}
+	if !strings.Contains(got, "… +6 lines") {
+		t.Errorf("fold marker missing; got:\n%s", got)
+	}
+	// Tail mode puts the marker ABOVE the body.
+	if strings.Index(got, "… +6 lines") > strings.Index(got, "xxx_line_0") {
+		t.Errorf("tail-mode marker should precede the body; got:\n%s", got)
+	}
+}
+
+func TestRenderToolCard_TerminalExitLiftedToHeader(t *testing.T) {
+	// "exit status 1" is the real marker shape terminal.go embeds — Go's
+	// *exec.ExitError.Error() passed through verbatim, not the bare "1"
+	// this test used before #1146. The bare-code fixture let the header
+	// silently render "exit exit status 1" for every real failing command
+	// while this test stayed green, since it never exercised the real shape.
+	out := "compiling\nfailure detail\n[exit: exit status 1]"
+	got := renderToolCard("terminal", map[string]any{"command": "make"}, out, false, 0, 1500*time.Millisecond)
+	if !strings.Contains(got, "exit 1") {
+		t.Errorf("exit code should surface in the header meta; got:\n%s", got)
+	}
+	if strings.Contains(got, "exit exit status 1") {
+		t.Errorf("header must not show the raw ExitError text verbatim; got:\n%s", got)
+	}
+	if !strings.Contains(got, "1.5s") {
+		t.Errorf("elapsed should surface in the header meta; got:\n%s", got)
+	}
+	if strings.Contains(got, "[exit: exit status 1]") {
+		t.Errorf("raw exit marker should be stripped from the body; got:\n%s", got)
+	}
+	if !strings.Contains(got, "failure detail") {
+		t.Errorf("body should keep the real output; got:\n%s", got)
+	}
+}
+
+func TestRenderToolCard_TerminalKilledSignalInHeader(t *testing.T) {
+	out := "long output\n[exit: signal: killed]"
+	got := renderToolCard("terminal", map[string]any{"command": "sleep 999"}, out, false, 0, 0)
+	if !strings.Contains(got, "signal: killed") {
+		t.Errorf("signal text should surface in the header meta; got:\n%s", got)
+	}
+	if strings.Contains(got, "exit signal: killed") {
+		t.Errorf(`signal text should not be double-prefixed with "exit "; got:`+"\n%s", got)
+	}
+}
+
+func TestFormatExitReason(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"exit status 1", "exit 1"},
+		{"exit status 127", "exit 127"},
+		{"signal: killed", "signal: killed"},
+		{"signal: segmentation fault", "signal: segmentation fault"},
+		{"1", "1"}, // unrecognized/legacy shape: pass through, don't guess
+	}
+	for _, c := range cases {
+		if got := formatExitReason(c.in); got != c.want {
+			t.Errorf("formatExitReason(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestSplitTerminalExit(t *testing.T) {
+	cases := []struct{ in, wantBody, wantExit string }{
+		{"out\n[exit: 1]", "out", "1"},
+		{"out\n[exit: signal: killed]", "out", "signal: killed"},
+		{"[exit: 2]", "", "2"},
+		{"out\n[exit: 1]\ntrailing", "out\n[exit: 1]\ntrailing", ""}, // marker not last → untouched
+		{"plain output", "plain output", ""},
+		{"", "", ""},
+	}
+	for _, c := range cases {
+		body, exit := splitTerminalExit(c.in)
+		if body != c.wantBody || exit != c.wantExit {
+			t.Errorf("splitTerminalExit(%q) = (%q, %q), want (%q, %q)", c.in, body, exit, c.wantBody, c.wantExit)
+		}
+	}
+}
+
+func TestFormatElapsed(t *testing.T) {
+	cases := []struct {
+		in   time.Duration
+		want string
+	}{
+		{0, ""},
+		{-time.Second, ""},
+		{30 * time.Millisecond, ""}, // would round to a meaningless "0s"
+		{1234 * time.Millisecond, "1.2s"},
+		{94 * time.Second, "1m34s"},
+	}
+	for _, c := range cases {
+		if got := formatElapsed(c.in); got != c.want {
+			t.Errorf("formatElapsed(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestRendersCard_PlainDisablesCards(t *testing.T) {
+	plainOff := &tuiModel{cfg: replConfig{plain: false}}
+	if !plainOff.rendersCard("edit_file") {
+		t.Error("with --plain off, edit_file should render as a card")
+	}
+	plainOn := &tuiModel{cfg: replConfig{plain: true}}
+	if plainOn.rendersCard("edit_file") {
+		t.Error("with --plain on, no tool should render as a card")
+	}
+	// terminal_output is now a card tool.
+	if !plainOff.rendersCard("terminal_output") {
+		t.Error("with --plain off, terminal_output should render as a card")
+	}
+	// A non-card tool is never a card regardless of --plain.
+	if plainOff.rendersCard("sub_agent") {
+		t.Error("sub_agent is not a card tool")
+	}
+}
+
+// setSpillHome points the spill dir at a temp home on every platform
+// (os.UserHomeDir reads HOME on unix, USERPROFILE on Windows).
+func setSpillHome(t *testing.T) {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+}
+
+// spillURIToPath converts the file:// URI embedded in an OSC 8 escape back to
+// a filesystem path, undoing FileURI's percent-encoding and Windows shaping.
+func spillURIToPath(t *testing.T, uri string) string {
+	t.Helper()
+	u, err := url.Parse(uri)
+	if err != nil {
+		t.Fatalf("bad spill URI %q: %v", uri, err)
+	}
+	p := u.Path
+	if runtime.GOOS == "windows" {
+		p = filepath.FromSlash(strings.TrimPrefix(p, "/"))
+	}
+	return p
+}
+
+func TestRenderToolCard_FoldedOutputGetsHyperlink(t *testing.T) {
+	setSpillHome(t)
+	long := strings.TrimSuffix(strings.Repeat("row\n", 12), "\n")
+	got := renderToolCard("terminal", map[string]any{"command": "ls"}, long, false, 0, 0)
+	if !strings.Contains(got, "\x1b]8;;file://") {
+		t.Errorf("folded card should hyperlink the marker; got:\n%q", got)
+	}
+	// The linked file holds the complete output.
+	i := strings.Index(got, "file://")
+	uri := got[i:]
+	uri = uri[:strings.IndexByte(uri, 0x1b)]
+	data, err := os.ReadFile(spillURIToPath(t, uri))
+	if err != nil || string(data) != long {
+		t.Errorf("linked spill should hold the full output; err %v, got %q", err, data)
+	}
+	// An unfolded card gets no link.
+	short := renderToolCard("terminal", map[string]any{"command": "ls"}, "a\nb", false, 0, 0)
+	if strings.Contains(short, "\x1b]8;;") {
+		t.Errorf("unfolded card should not carry a link; got:\n%q", short)
+	}
+}
+
+func TestRenderToolCard_BlankHeavyOutputNoSpill(t *testing.T) {
+	// Blank lines don't count toward the fold; an output that renders without
+	// folding must not leave a spill file behind (prediction/render parity).
+	setSpillHome(t)
+	out := "a\n\n\n\nb\n\n\n\nc\n\n"
+	got := renderToolCard("terminal", map[string]any{"command": "ls"}, out, false, 0, 0)
+	if strings.Contains(got, "\x1b]8;;") || strings.Contains(got, "…") {
+		t.Errorf("blank-heavy output should neither fold nor link; got:\n%q", got)
+	}
+	home, _ := os.UserHomeDir()
+	entries, _ := os.ReadDir(filepath.Join(home, ".octo", "tmp"))
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "card-") {
+			t.Errorf("no spill file expected, found %s", e.Name())
+		}
+	}
+}
+
+func TestRenderToolOutcome_NonCardOutputVisible(t *testing.T) {
+	setSpillHome(t)
+	m := newTestModel()
+	// Short single-line result rides the status line inline.
+	got := m.renderToolOutcome("mcp_thing", map[string]any{"q": "x"}, "42 rows", false, 0)
+	if !strings.Contains(got, "— 42 rows") {
+		t.Errorf("short result should show inline; got:\n%q", got)
+	}
+	if strings.Contains(got, "\x1b]8;;") {
+		t.Errorf("short result should not spill; got:\n%q", got)
+	}
+	// Multi-line result is persisted and linked.
+	long := strings.TrimSuffix(strings.Repeat("r\n", 6), "\n")
+	got = m.renderToolOutcome("mcp_thing", map[string]any{"q": "x"}, long, false, 0)
+	if !strings.Contains(got, "\x1b]8;;file://") || !strings.Contains(got, "output (6 lines)") {
+		t.Errorf("long result should be linked with a line count; got:\n%q", got)
+	}
+	// Errors keep the existing inline errText, no duplicate link.
+	got = m.renderToolOutcome("mcp_thing", map[string]any{"q": "x"}, "boom", true, 0)
+	if !strings.Contains(got, "— boom") || strings.Contains(got, "\x1b]8;;") {
+		t.Errorf("error line should stay as before; got:\n%q", got)
+	}
+}
+
+// renderToolFull is the /transcript command's uncapped re-print (#1093): it
+// must show every line and never fold, even where renderToolCard would.
+func TestRenderToolFull_NeverFolds(t *testing.T) {
+	setSpillHome(t)
+	long := strings.TrimSuffix(strings.Repeat("row\n", 12), "\n")
+	folded := renderToolCard("terminal", map[string]any{"command": "ls"}, long, false, 0, 0)
+	if !strings.Contains(folded, "…") {
+		t.Fatalf("sanity: capped card should fold; got:\n%q", folded)
+	}
+	full := renderToolFull("terminal", map[string]any{"command": "ls"}, long, false, 0)
+	if strings.Contains(full, "…") || strings.Contains(full, "\x1b]8;;") {
+		t.Errorf("uncapped render should not fold or link; got:\n%q", full)
+	}
+	for i := 1; i <= 12; i++ {
+		if !strings.Contains(full, "row") {
+			t.Fatalf("uncapped render missing line %d; got:\n%q", i, full)
+			break
+		}
+	}
+	if got := strings.Count(full, "row"); got != 12 {
+		t.Errorf("uncapped render should show all 12 lines, got %d occurrences", got)
+	}
+	// Non-card tools return "" — the caller falls back to renderToolOutcome.
+	if got := renderToolFull("sub_agent", map[string]any{}, "x", false, 0); got != "" {
+		t.Errorf("non-card tool should return empty; got %q", got)
+	}
+}
+
+func TestRenderToolOutcome_InlineResultSanitized(t *testing.T) {
+	setSpillHome(t)
+	m := newTestModel()
+	// A \r (no \n, under 80 runes) passes the inline check but must not reach
+	// the terminal raw — it would let the result overwrite the status line.
+	got := m.renderToolOutcome("mcp_thing", map[string]any{}, "ok\rSPOOFED", false, 0)
+	if strings.ContainsRune(got, '\r') {
+		t.Errorf("raw \\r reached the status line: %q", got)
+	}
+	if !strings.Contains(got, "SPOOFED") || !strings.Contains(got, "ok") {
+		t.Errorf("sanitized content should keep both halves visible: %q", got)
+	}
+}
+
+// webSearchBody builds a web_search result body with the given backend, in the
+// real field order WebSearchResponse marshals (provider ahead of results).
+func webSearchBody(provider string) string {
+	return `{"query":"x","provider":"` + provider +
+		`","count":1,"results":[{"title":"T","url":"http://e.com","snippet":"s"}]}`
+}
+
+// cardHeader returns just the header line of a rendered card. Assertions have
+// to target it specifically: the body preview echoes the raw JSON, so a
+// whole-card Contains("brave") would pass off the body even with the meta gone.
+func cardHeader(card string) string {
+	return strings.SplitN(card, "\n", 2)[0]
+}
+
+func TestRenderToolCard_WebSearchNamesBackend(t *testing.T) {
+	// Which backend answered only reaches the user through the header's dim
+	// meta — the body preview folds away. A keyed backend is named, no nudge.
+	got := renderToolCard("web_search", map[string]any{"query": "x"}, webSearchBody("brave"), false, 0, 0)
+	if h := cardHeader(got); !strings.Contains(h, "brave") {
+		t.Errorf("backend name missing from card header %q; full card:\n%s", h, got)
+	}
+	if strings.Contains(got, "scraped") {
+		t.Errorf("keyed backend should carry no scrape flag; got:\n%s", got)
+	}
+}
+
+func TestRenderToolCard_WebSearchScrapedCarriesNudge(t *testing.T) {
+	got := renderToolCard("web_search", map[string]any{"query": "x"}, webSearchBody("duckduckgo"), false, 0, 0)
+	h := cardHeader(got)
+	if !strings.Contains(h, "duckduckgo") || !strings.Contains(h, "scraped") {
+		t.Errorf("scraped backend should be named and flagged in the header %q; full card:\n%s", h, got)
+	}
+}
+
+func TestRenderToolCard_WebSearchBackendSurvivesOutputCap(t *testing.T) {
+	// Event consumers get AgentEvent.Output, which the agent loop truncates at
+	// EventToolOutputCap (8 KiB) — reachable with 20 long-snippet results. The
+	// label must survive that, which is why Provider marshals ahead of Results.
+	var results []tools.WebSearchResult
+	for i := 0; i < 20; i++ {
+		results = append(results, tools.WebSearchResult{
+			Title:   "result title " + strconv.Itoa(i),
+			URL:     "https://example.com/" + strconv.Itoa(i),
+			Snippet: strings.Repeat("long snippet text ", 40),
+		})
+	}
+	body, err := json.MarshalIndent(tools.WebSearchResponse{
+		Query: "x", Provider: "duckduckgo", Count: len(results), Results: results,
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) <= agent.EventToolOutputCap {
+		t.Fatalf("fixture is %d bytes, needs to exceed the %d-byte cap to be meaningful",
+			len(body), agent.EventToolOutputCap)
+	}
+	// Replicates agent.truncateOutput, which is unexported. That coupling is
+	// the point of the assertion below rather than a shortcut around it: what
+	// this pins is "a body cut at the cap still yields the provider". If the
+	// agent's truncation policy ever changes shape (rune-aligned cut, different
+	// marker, head+tail), update this line — the property still holds for any
+	// prefix-preserving cut, which is what the field order buys.
+	capped := string(body)[:agent.EventToolOutputCap] + "…[truncated]"
+
+	got := renderToolCard("web_search", map[string]any{"query": "x"}, capped, false, 0, 0)
+	if h := cardHeader(got); !strings.Contains(h, "duckduckgo") {
+		t.Errorf("backend name lost to output truncation; header %q", h)
+	}
+}
+
+func TestWebSearchProviderNote_NeverClaimsMissingKey(t *testing.T) {
+	// Regression guard for a false diagnosis: Execute's cascade falls through on
+	// an HTTP error, an exhausted quota, or a zero-result response, so a user
+	// with a working key can still get scraped results. The note must therefore
+	// never assert anything about the key — it only reports what the provider
+	// name proves. Env is set here to make the point that it is irrelevant.
+	t.Setenv("BRAVE_SEARCH_API_KEY", "bk")
+	for _, provider := range []string{"duckduckgo", "bing"} {
+		note := webSearchProviderNote(provider)
+		if note != "scraped" {
+			t.Errorf("%s: note = %q, want %q", provider, note, "scraped")
+		}
+		if strings.Contains(note, "key") {
+			t.Errorf("%s: note must not mention keys (a key may be set and failing); got %q", provider, note)
+		}
+	}
+	for _, provider := range []string{"brave", "tavily", "serper", "", "unknown"} {
+		if note := webSearchProviderNote(provider); note != "" {
+			t.Errorf("%s: non-scrape backend should carry no flag; got %q", provider, note)
+		}
+	}
+}
+
+func TestWebSearchProvider_Shapes(t *testing.T) {
+	// The scan runs on AgentEvent.Output, which arrives truncated at
+	// EventToolOutputCap often enough that "cut anywhere" is a real input class,
+	// not a hypothetical. Every shape below must yield a value or "", never a
+	// panic, a hang, or a wrong provider.
+	cases := []struct {
+		name, in, want string
+	}{
+		{"intact body", webSearchBody("brave"), "brave"},
+		{"provider first of all", `{"provider":"tavily","query":"x"}`, "tavily"},
+		{"cut mid-array after provider", `{"query":"x","provider":"bing","results":[{"title":"a"`, "bing"},
+		{"cut mid-key before provider", `{"query":"x","prov`, ""},
+		{"cut mid-provider-value", `{"query":"x","provider":"duckdu`, ""},
+		{"cut right after provider key", `{"query":"x","provider":`, ""},
+		{"provider behind a truncated array", `{"query":"x","results":[{"title":"a"`, ""},
+		{"non-JSON error text", "web_search: query is required", ""},
+		{"empty", "", ""},
+		{"json null", "null", ""},
+		{"json array", `[{"provider":"brave"}]`, ""},
+		{"json string", `"brave"`, ""},
+		{"nested provider is not top level", `{"meta":{"provider":"brave"},"provider":"bing"}`, "bing"},
+		{"provider not a string", `{"provider":42,"query":"x"}`, ""},
+		{"duplicate keys take the first", `{"provider":"brave","provider":"bing"}`, "brave"},
+		{"trailing garbage after object", `{"provider":"brave"} SPOOF`, "brave"},
+		{"deep nesting before provider", `{"a":{"b":{"c":[[[1,2]]]}},"provider":"serper"}`, "serper"},
+		{"no provider field", `{"query":"x","count":0}`, ""},
+	}
+	for _, c := range cases {
+		if got := webSearchProvider(c.in); got != c.want {
+			t.Errorf("%s: webSearchProvider(%q) = %q, want %q", c.name, c.in, got, c.want)
+		}
+	}
+}

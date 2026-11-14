@@ -1,0 +1,205 @@
+---
+title: Automate with browser control
+description: Go-native Chrome DevTools Protocol automation — record, replay, self-heal.
+---
+
+import { Badge } from '@astrojs/starlight/components';
+
+<Badge text="Beta" variant="caution" /><br /><br />
+
+octo drives a real Chrome tab over the DevTools Protocol (CDP) — no headless-browser framework
+dependency, no separate runtime.
+
+```bash
+octo browser setup
+```
+
+## Connecting to Chrome
+
+Three ways the `browser` tool gets a page, tried in this order:
+
+1. **A known debug port** (`browser.connect_port` in `config.yml`) — connects directly, no fallback
+   if it fails. This is what `octo browser setup` wires up for you.
+2. **Attach via a specific profile** (`browser.attach_running: true` plus `browser.user_data_dir`) —
+   reads that profile's `DevToolsActivePort` file and connects to the Chrome that owns it.
+3. **Attach to any Chrome already running** with remote debugging enabled
+   (`browser.attach_running: true` alone, and also the default when nothing is configured) —
+   discovers a debugging-enabled Chrome and reuses your logins; never hijacks a browser that
+   doesn't already have debugging turned on.
+
+There is no launch fallback: when no attachable Chrome is found, the tool returns instructions
+for enabling the remote-debugging toggle rather than silently starting a throwaway instance that
+would carry none of your logins.
+
+Whichever path connects, octo always opens a **brand-new tab** rather than reusing one you have
+open (including its own Web UI tab) — driving an existing tab requires an explicit `pages`/
+`select_page` action. The connection is reused across the whole session, so you approve any
+debugger-attach prompt once, not on every navigation.
+
+### `octo browser setup`
+
+```bash
+octo browser setup
+```
+
+Walks you through enabling `chrome://inspect/#remote-debugging` (Chrome 136 stopped honouring
+`--remote-debugging-port` when it points at the *default* user-data directory, and Chrome 144 added
+this in-browser checkbox as the way to debug that profile — which is the one carrying your logins),
+then probes port 9222 in a loop — confirming not just that it connects, but that a
+real page-level CDP call succeeds (a browser-level connection can succeed while page control still
+fails on recent Chrome). On success it saves `browser.connect_port` to your config; on failure it
+prompts you to flip the toggle and retry, or quit and resume later.
+
+## Recording
+
+There's no CLI command for this — recording is driven by the `browser` tool's `record_start` /
+`record_stop` actions, either called by the model or via the Web UI's Record button.
+
+The key thing to understand: **it records what *you* do, not what the model does.** After
+`record_start`, the agent hands the browser to you; you perform the steps yourself, then tell the
+agent you're done and it calls `record_stop <name>`.
+
+What gets captured, per step: the action (`click` / `type` / `select` / `upload` / `navigate`), a
+selector anchored at the nearest element with a stable `id` (not a fragile position-based chain),
+the element's visible text, and the URL — plus a redundant **fingerprint** of the target (alternate
+selectors built with different strategies, its `role` attribute, and the nearest label-like
+neighbor text), which is what lets replay survive wholesale class churn (see Replay below).
+
+The recorder also captures what happens *between* your actions:
+
+- A click that triggers fetch/XHR activity gets an automatic **network wait** step; one that opens
+  a modal / date picker / overlay gets an **element wait** — so replay never races ahead of a page
+  that hasn't settled.
+- A click that starts a browser download is upgraded to a **`download` step** bound to a `file[]`
+  output, so replay captures the file.
+- Provably-redundant fumbles are compressed away deterministically before any model sees them:
+  retyping the same field keeps only the final value, and a click-away-click-back detour collapses
+  to the single final click.
+
+A model pass then distills the raw capture — dropping dead-end detours, turning your specific
+values into `{{param}}` placeholders, and writing a description. The agent hands it what you said
+you wanted to record (the `goal` on `record_start`, in your own words), which is how it tells a
+step your goal needs from a mis-click you cancelled a moment later — so state the objective before
+you start demonstrating. It also sees what each click actually did — whether the URL moved, a tab or
+download opened, and which requests it fired, counted by HTTP method — and trailing clicks that did
+none of that (no write, no navigation) are flagged as likely no-ops for it to drop unless your goal
+needs them. It can only reorder or rename real captured steps, never invent a new target: any refined step whose selector isn't in the
+original capture is rejected in favor of the raw version (fingerprints are re-attached
+deterministically after the pass). When the pass doesn't apply — the model's output can't be
+parsed, uses selectors it wasn't given, or no model is configured — `record_stop` says so and why,
+so you know the steps are the raw capture and can remove any stray clicks yourself.
+
+`record_stop` replies with a numbered run-plan — each step with what it does and what its check
+is — and the agent is told to hold there: it presents the plan and waits for you to confirm it or
+name steps to remove or change before the recording is replayed or relied on. Steps flagged as
+likely no-ops that survived the cleanup are listed separately under the plan with the question
+"要保留吗？" — nothing is removed for you; that review is where a stray click gets dropped.
+
+Each recording is a directory, `~/.octo/browser-recordings/<name>/`, holding `recording.yaml` — the
+editable steps: readable, hand-editable, diffable in git — and `events.json`, the raw captured events
+the steps were compiled from (diagnostic ground truth when a replay misbehaves; never edited by hand).
+`OCTO_BROWSER_RECORDINGS_DIR` relocates the whole tree. (A flat `<name>.yaml` from an older version is
+still read, and rewritten into the directory layout the next time it is saved; the pre-rename
+`~/.octo/browser-skills/` directory is migrated automatically.)
+
+## Replay
+
+```
+browser(action: "replay", name: "<recording>", params: { ... })
+```
+
+(`run_skill` remains accepted as a deprecated alias.)
+
+Replay is deterministic — no model call in the common case. Each step waits for its target,
+executes, and (if the recording declares one) checks a `verify`. A few robustness details worth
+knowing:
+
+- A step recorded with a fingerprint re-identifies its target by **scoring** candidates (from the
+  original selector, the alternates, and text/role scans) against the recorded text, role, tag and
+  neighbor text. A page whose CSS classes all changed still resolves; a positional selector that
+  now matches the *wrong* element is refused outright — an explicit failure into self-heal, never a
+  silent wrong click. Older recordings without fingerprints keep the previous behavior: exact
+  selector first, then an element carrying the same recorded label text.
+- Auto-inserted `wait` steps settle the page (network idle, or a specific element appearing)
+  before the next action fires.
+- A `download` step clicks its trigger, waits for the browser download to complete, and binds the
+  saved file's path to its declared output.
+- If a step opens a new tab, later steps automatically follow it.
+- After typing, an unexpectedly empty field gets one clear-and-retype before the step is marked
+  failed.
+
+The result is a structured object — `{recording, steps, outputs, self_healed?}` — so a recording's
+declared `outputs` (an extracted value, a downloaded file path) can feed directly into a
+[workflow](/docs/guides/workflows/) via `recording("<name>", params)`.
+
+:::caution[Replays are all-or-nothing]
+octo is explicitly instructed not to reach for a recording unless the request matches what it does
+**end to end** — a replay executes every step verbatim and can't be partially applied or adapted
+beyond its declared params. If a request differs in some way the recording doesn't parameterize,
+the model is told to drive the browser directly instead. This is a prompt-level instruction, not a
+code-enforced limit — added after recordings were once over-trusted for partially-matching
+requests. Recordings are also replay-only: there's no keyword-trigger path (an earlier version of
+that was tried and reverted as unreliable).
+:::
+
+## Secret params
+
+A param declared with `secret: true` is a password-class value that **never enters the
+conversation** — not the transcript, not memory, not the provider's context. Recording already
+guarantees the value never lands in the YAML (password fields are captured empty and declared
+without a default); replay completes the guarantee by collecting the value at runtime, out-of-band:
+
+```yaml
+params:
+  - name: password
+    description: secret value (not stored; provide at replay)
+    secret: true
+```
+
+When a secret param has no supplied value, replay resolves it in this order:
+
+1. **An explicit `params` entry** from the caller always wins.
+2. **The session cache** — a value already provided this session is reused silently (in-memory
+   only, evaporates when the session is deleted; never written to disk).
+3. **Environment** — `OCTO_BROWSER_SECRET_<NAME>` (param name uppercased, non-alphanumerics as
+   `_`: `password` → `OCTO_BROWSER_SECRET_PASSWORD`, `api_token` → `OCTO_BROWSER_SECRET_API_TOKEN`).
+   Set it in the process environment or in `~/.octo/serve.env` (mode `0600`, loaded at startup).
+   Same-named params across recordings share one env value. This is the path for cron and other
+   unattended replays.
+4. **A masked prompt** — the TUI reads with echo off; the Web UI shows a password field.
+
+IM chats (WeChat, Telegram, …) deliberately **can't** collect secrets: a value typed there persists
+in platform history, which no client-side care can undo. A replay that hits a missing secret on IM
+fails with an error pointing at `serve.env` or the Web UI / TUI instead. Error messages name the
+recording and the param — never the value.
+
+## Self-heal
+
+If a step's selector no longer matches anything — and only if a model is configured for this
+purpose — octo takes a **text digest** of the page's currently interactable elements (selector +
+visible text, no screenshot, model-agnostic), puts the elements carrying the step's recorded text
+at the top of it whatever their tag (a menu built from click-handled `span`s is not a control by
+any query), and asks the model for a single corrected CSS selector given the intended action, the
+dead selector, and (when the step carries one) the recorded fingerprint — role, tag and neighbor
+text — turning the request from an open guess into constrained matching. The answer must be a
+selector from that list; anything else is refused. Before it is trusted, the proposal is **verified
+against the live page**: it must resolve to an element whose text contains the step's recorded
+label. A proposal that fails this is rejected — the step stays exactly as recorded and the reason
+feeds the next heal round (up to three) — so a selector nothing on the page matched can never be
+acted on, let alone saved. A verified element is **fingerprinted afresh** (alternate selectors, tag,
+role, the neighbor text beside it now) in place of the stale anchors; then the step is retried and,
+if it works, written back into the recording's YAML — so a heal is durable, not a one-off patch
+you'd have to redo on every future replay, and the healed step keeps the redundancy that lets it
+survive the next drift. (The write-back re-marshals the YAML, so any hand-written comments in the
+file are dropped on the next healed replay; field values are kept. Version your recordings in git
+if you annotate them.)
+
+## Permissions and vision
+
+Browser actions go through the same permission engine as any other tool — a click or a form
+submission on a logged-in account is treated as a real, high-impact action, not a read-only step.
+Screenshots only come back as an image block if the active model is vision-capable; a text-only
+model gets a text note instead of a rejected image.
+
+Next: recordings compose directly into [workflow](/docs/guides/workflows/) scripts via
+`recording("<name>")`.

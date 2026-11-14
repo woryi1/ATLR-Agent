@@ -1,0 +1,54 @@
+#!/bin/sh
+# Runs as the installing user (currentUserHome domain — no root, no sudo). Seeds
+# ~/.octo/bin/uv + a fresh config, writes an uninstall helper, and opens the app.
+#
+# The octo CLI is put on PATH by the app itself on first launch, not here: its
+# ensureBundledOcto (cmd/octo-desktop/octo_cli.go) copies the bundled CLI to
+# ~/.local/bin/octo and adds that dir to PATH via the shell rc files — the same
+# path used on Linux. Keeping the CLI at a stable, writable location (rather than
+# inside the app) lets `octo upgrade` replace it without modifying the signed
+# .app bundle. The desktop app replaces the old "start `octo serve -d` on login +
+# open the browser dashboard" onboarding — that surrogate GUI is now a real app.
+set -eu
+
+app_bundle="$HOME/Applications/Octo.app"
+res="$app_bundle/Contents/Resources"
+# Kept byte-identical to octoInstallerMarker in cmd/octo-desktop/octo_cli.go: the
+# app writes the PATH line, this uninstaller strips it.
+marker="# added by the octo installer"
+
+# Seed ~/.octo/bin/uv from the bundle so the CLI has Python tooling immediately
+# (the app also self-provisions this on first launch). octo-managed binary, so
+# refresh on every install/upgrade. No-op if this build didn't bundle uv.
+octo_bin_dir="$HOME/.octo/bin"
+if [ -f "$res/uv" ]; then
+  mkdir -p "$octo_bin_dir"
+  cp "$res/uv" "$octo_bin_dir/uv"
+  chmod +x "$octo_bin_dir/uv"
+fi
+
+# No config.yml seeding: an absent/empty workspace_dir already resolves to
+# ~/Octo (the pre-#1986 "auto" magic string is gone). The dir is still needed
+# for the uninstall helper below.
+config_dir="$HOME/.octo"
+if [ ! -d "$config_dir" ]; then
+  mkdir -p "$config_dir"
+  chmod 700 "$config_dir"
+fi
+
+# Uninstall helper (a .pkg has no native uninstaller). Leaves ~/.octo data.
+cat > "$config_dir/uninstall.sh" <<UNINSTALL
+#!/bin/sh
+set -eu
+rm -rf "$app_bundle"
+for rc in "\$HOME/.zshrc" "\$HOME/.zprofile" "\$HOME/.bash_profile" "\$HOME/.profile"; do
+  [ -f "\$rc" ] && sed -i '' '/$marker/d' "\$rc"
+done
+echo "Octo uninstalled (your ~/.octo data was left intact)."
+UNINSTALL
+chmod +x "$config_dir/uninstall.sh"
+
+# Launch the app.
+open "$app_bundle" >/dev/null 2>&1 || true
+
+exit 0

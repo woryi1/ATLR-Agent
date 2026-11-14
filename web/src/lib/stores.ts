@@ -1,0 +1,1436 @@
+import { writable, derived, get } from 'svelte/store'
+import type { Snippet } from 'svelte'
+import type { Session, SessionGroup, Skill, Workflow, ScheduledTask, McpServer, Channel, Memory, Artifact, ArtifactView } from './types'
+import type { AskQuestion } from './askStepper'
+import * as api from './api'
+import { storageKey } from './storageKey'
+
+// First-run gate. 'unknown' until /api/onboard/status resolves (render a splash,
+// never flash the main UI); 'key_setup' blocks on the setup panel; 'soul_setup'
+// boots normally then auto-launches an /onboard chat; '' means fully configured.
+export const onboardPhase = writable<'unknown' | 'key_setup' | 'soul_setup' | ''>('unknown')
+
+// Navigation
+export const view = writable('chat')
+
+// composerFocusRequest is bumped when something OUTSIDE the composer wants the
+// caret in the input — the question banner's "interrupt and add context"
+// button, for instance. A counter rather than a boolean: two requests in a
+// row must both fire, and a boolean would collapse them.
+export const composerFocusRequest = writable(0)
+
+// requestComposerFocus asks the composer to take the caret.
+export function requestComposerFocus(): void {
+  composerFocusRequest.update((n) => n + 1)
+}
+
+// ── Super mode: shared state + the unlock animation ─────────────────────────
+//
+// superMode is the app-wide mirror of the Super switch. The switch itself
+// lives in the balance strip inside the model menu, but the artwork overlay
+// (the character that shows the current reasoning tier) and the unlock
+// animation both need to know its state — and the strip is a menu that closes
+// as soon as the user clicks away, so it cannot be the only holder.
+export const superMode = writable(false)
+
+// superUnlock asks the unlock animation to play. `mode` decides the copy and
+// whether it is the one-off intro (first launch) or the reward for switching
+// Super on. A token counter, so two triggers in a row both play.
+export const superUnlock = writable<{ token: number; mode: 'super' | 'intro' } | null>(null)
+
+export function playSuperUnlock(mode: 'super' | 'intro'): void {
+  superUnlock.update(u => ({ token: (u?.token ?? 0) + 1, mode }))
+}
+
+// effortArtFor maps a reasoning level to its artwork. The artwork was drawn
+// per PAIR of tiers (未开/低, 低/中, 中/高, 高/最大) and the pictures are
+// interchangeable within their pair, so each level gets a LIST of candidates
+// and `roll` (0..1) picks one. The list is deliberately generous for the
+// levels most models actually declare: many ladders are just off/high/max, so
+// "high" draws from three pictures (低/中, 中/高, 高/最大) and "xhigh" from two.
+// The caller re-rolls on every menu expansion AND on every level change, so
+// working the slider shows different art each time.
+const EFFORT_ART: Record<string, string[]> = {
+  off: ['/effort-art/effort-off-low.webp'],
+  low: ['/effort-art/effort-off-low.webp', '/effort-art/effort-low-medium.webp'],
+  medium: ['/effort-art/effort-low-medium.webp', '/effort-art/effort-medium-high.webp'],
+  high: [
+    '/effort-art/effort-low-medium.webp',
+    '/effort-art/effort-medium-high.webp',
+    '/effort-art/effort-high-max.webp',
+  ],
+  xhigh: ['/effort-art/effort-medium-high.webp', '/effort-art/effort-high-max.webp'],
+  max: ['/effort-art/effort-high-max.webp'],
+}
+
+export function effortArtFor(level: string, superOn: boolean, roll = 0.5): string {
+  if (superOn) return '/effort-art/effort-super.webp'
+  const pool = EFFORT_ART[level] ?? EFFORT_ART.max
+  const r = Math.min(0.999999, Math.max(0, roll))
+  return pool[Math.floor(r * pool.length)]
+}
+
+// scrollToBottomToken is bumped when the message list should jump to the
+// latest message — clicking a session title in the sidebar does exactly that.
+// A counter, so two clicks in a row both land.
+export const scrollToBottomToken = writable(0)
+
+// requestScrollToBottom asks the open chat view to jump to the newest message.
+export function requestScrollToBottom(): void {
+  scrollToBottomToken.update((n) => n + 1)
+}
+
+// The currently active agent profile ID. Default is the code-defined default
+// agent; switching to a profile routes sessions to its isolated session pool.
+export const activeAgent = writable<string>('default')
+// Model picked in the composer BEFORE any session exists (composite
+// "<endpoint>::<model>" id, '' = server default). Consumed once by
+// ChatView.ensureActiveSession when it auto-creates the session — without
+// this, picking a model on the blank new-chat view was a silent no-op
+// (#2066).
+export const pendingModel = writable<string>('')
+// The rest of the picks the blank new-chat landing collects before a session
+// exists, consumed by the same ensureActiveSession call that consumes
+// pendingModel. pendingWorkingDir also decides whether the session is born
+// inside a project — see resolveProjectForDir.
+export const pendingAgent = writable<string>('')
+export const pendingWorkingDir = writable<string>('')
+// Set by the sidebar's per-group "+": the group the not-yet-created session
+// belongs to. An explicit group wins over pendingWorkingDir's inference.
+export const pendingGroupId = writable<string>('')
+// Reasoning effort picked on the landing page before any session exists.
+// '' means "no override" (the Composer falls back to globalReasoningEffort
+// for display). Consumed once by the same ensureActiveSession flow that
+// consumes pendingModel — picking it must not touch the global config until
+// a session is actually created, since every keystroke on the landing page
+// is reversible right up to that point.
+export const pendingReasoningEffort = writable<string>('')
+// Permission mode picked on the landing page before any session exists. ''
+// means "no override" (the Composer falls back to globalPermissionMode for
+// display). Consumed once by the same ensureActiveSession flow that consumes
+// pendingModel — without this, picking a mode on the blank new-chat view was
+// a silent no-op, same failure shape as pendingModel's #2066.
+export const pendingPermissionMode = writable<string>('')
+// Show-reasoning toggle flipped on the landing page before any session
+// exists. null means "no override" (falls back to true, same as the
+// Composer's post-session default). Same failure shape as the two stores
+// above: without this, toggleShowReasoning's `!sid` guard made the switch a
+// silent no-op until a session existed.
+export const pendingShowReasoning = writable<boolean | null>(null)
+export const sidebar = writable('full')
+export const cmdkOpen = writable(false)
+// Drives the MCP import-JSON modal. Adding a single server and editing an
+// existing one both go through the agent instead of a structured form (see
+// McpView's aiSetup/askAgentToEdit) — it works uniformly whether the entry
+// lives in the user or project config.
+export const mcpModalOpen = writable(false)
+// Drives the Settings modal (replaces the old full-page 'settings' view).
+export const settingsModalOpen = writable(false)
+// Optional deep link consumed by the next Settings open: which category, and
+// for 数据管理 which sub-view. Callers that just want the modal set only
+// settingsModalOpen and land on the default category. The modal clears this
+// once applied, so a later plain open isn't stuck on the old target.
+export interface SettingsTarget { cat: string; dataSubView?: string }
+export const settingsTarget = writable<SettingsTarget | null>(null)
+export function openSettingsAt(cat: string, dataSubView?: string) {
+  settingsTarget.set({ cat, dataSubView })
+  settingsModalOpen.set(true)
+}
+export interface ToastEntry { id: number; msg: string; type: string }
+export const toasts = writable<ToastEntry[]>([])
+
+// Runtime / WS state
+export const running = writable(false)
+export const wsDown = writable(false)
+
+// True when the page runs inside the desktop-shell webview. The shell tags its
+// window URL with this marker (cmd/octo-desktop/bridge.go shellURL); an
+// external browser on the same hub lacks it and stays plain web. Fixed for the
+// page's lifetime — unlike nativeShell below it needs no API round-trip, so
+// page-load-time code (framelessDrag) can use it directly.
+export const isDesktopShell =
+  typeof location !== 'undefined' && new URLSearchParams(location.search).get('shell') === 'octo-desktop'
+
+// Major macOS version of the desktop shell's host (e.g. 26), handed over in
+// the shell URL next to the marker (cmd/octo-desktop/bridge.go shellURL); 0
+// outside the mac desktop shell. The window-chrome code needs it at first
+// paint — waiting for /api/version leaves the titlebar rows un-inset under
+// the traffic lights for a second or two at startup — so like isDesktopShell
+// it comes from the URL, no round-trip. VersionBadge re-confirms it into
+// macosMajor from /api/version's os_version once that lands.
+export const shellMacosMajor =
+  typeof location !== 'undefined'
+    ? parseInt(new URLSearchParams(location.search).get('macos') ?? '', 10) || 0
+    : 0
+
+// True when the page runs inside the octo-mobile Capacitor webview. Capacitor
+// injects a global `Capacitor` object with isNativePlatform(); a plain browser
+// has none. Fixed for the page's lifetime, like isDesktopShell. Mobile's
+// nativeness is a CLIENT-side fact — the phone connects to a remote plain
+// `octo serve` that reports native:false — so it is detected here from the
+// injected global, never from /api/version (unlike nativeShell). The frontend's
+// native branches will read this alongside nativeShell as the native plugins
+// land; the plugins are built in the mobile/ Capacitor project.
+export const mobileShell =
+  typeof window !== 'undefined' &&
+  !!(window as unknown as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor?.isNativePlatform?.()
+
+// True when served by the Wails desktop shell (a NativeBridge is wired,
+// reported by /api/version's `native` flag). Lets the folder picker use the OS
+// dialog instead of the in-app directory tree. False under `octo serve`.
+export const nativeShell = writable(false)
+
+// Major macOS version of the desktop shell's host (e.g. 26). Seeded
+// synchronously from the shell URL (shellMacosMajor above) so window chrome
+// is right at first paint, then re-confirmed by VersionBadge from
+// /api/version's os_version; 0 when the host isn't macOS or isn't known yet.
+// The titlebar rows read it to sit on the traffic lights' axis, which macOS 26
+// moved for windows stamped with the macOS 26 SDK (see titlebarPaddingPx).
+export const macosMajor = writable(shellMacosMajor)
+
+// True when the browser is on the same machine as the server (loopback),
+// reported by /api/version's `local` flag — desktop shell OR localhost web.
+// When true, files/folders are chosen by real path (native dialog or the
+// in-app fs picker) instead of being uploaded. False for a remote browser.
+export const localAccess = writable(false)
+
+// Artifacts panel
+export const artifacts = writable<Artifact[]>([])
+export const artifactSel = writable(0)
+export const artifactView = writable<ArtifactView>('preview')
+// Centered modal for full artifact viewing — toggled by the sidebar's maximize
+// button. Independent from panelContent so closing the modal doesn't force
+// the sidebar back open.
+export const artifactModalOpen = writable(false)
+
+// Artifacts panel sidebar mode. null = closed, 'session' = session artifacts,
+// 'lightapps' = Light Apps list + rendering, 'diff' = git diff review.
+export type PanelContent = 'session' | 'lightapps' | 'diff'
+export const panelContent = writable<PanelContent | null>(null)
+
+// The two modes the panel's own switcher offers, and the one it comes back to.
+// Light Apps is not among them: it has its own entry point and is never a
+// default. Persisted for the same reason the panel's width is — which of these
+// two a user reaches for is a habit, not a per-visit decision.
+export type PanelMode = 'session' | 'diff'
+const PANEL_MODE_KEY = storageKey('panelMode')
+
+export function readPanelMode(): PanelMode {
+  try {
+    return localStorage.getItem(PANEL_MODE_KEY) === 'diff' ? 'diff' : 'session'
+  } catch {
+    return 'session'
+  }
+}
+
+export function savePanelMode(mode: PanelMode): void {
+  try { localStorage.setItem(PANEL_MODE_KEY, mode) } catch { /* private mode: this visit only */ }
+}
+
+// What the panel can show next to the view the user is actually on, or null
+// when that view has nothing for it. 'session' and 'diff' are the active
+// chat's own output, so they belong to the chat view alone — opened from
+// anywhere else they park the previous session's artifacts beside a page that
+// has nothing to do with them. The blank chat landing counts as 'anywhere
+// else': there is no session yet, so neither mode has anything to read.
+// Light Apps answers for its own view, and only once a tab is open in it: an
+// empty strip is not worth a column.
+export function panelForView(v: string, openApps: string[], sessionId: string | null): PanelContent | null {
+  if (v === 'chat') return sessionId ? readPanelMode() : null
+  if (v === 'lightapps') return openApps.length > 0 ? 'lightapps' : null
+  return null
+}
+
+/**
+ * Whether the start screen — the blank chat that renders from
+ * ~/.octo/landing — is what the user is looking at. It is the only consumer of
+ * the landing config, so it is also the only moment worth re-reading it (and
+ * the Light App list its hero and shortcuts resolve against). The mobile UI
+ * renders none of it.
+ */
+export function onStartScreen(v: string, sessionId: string | null, mobile: boolean): boolean {
+  return !mobile && v === 'chat' && !sessionId
+}
+
+/** Open the panel in whatever the current view offers, or close it if open. */
+export function togglePanel(): void {
+  panelContent.update(v => v ? null : panelForView(get(view), get(lightappOpen), get(activeSessionId)))
+}
+
+// Artifacts panel taking over the whole content area except the sidebar, so a
+// preview can be read at full width without leaving the layout. Deliberately
+// not persisted: it's a way of looking at something right now, not a setting,
+// and coming back to a booted app with the middle column gone would read as
+// broken. Cleared whenever the panel closes.
+export const panelExpanded = writable(false)
+
+// ChatView's own title/status/actions, rendered inline in the page-spanning
+// title bar rather than a separate row below it (the redesign merges main
+// content's header into that bar for chat specifically — every other view
+// keeps its own full-size page header). ChatView registers its snippet on
+// mount and clears it on destroy; it stays reactive to ChatView's own state
+// since a Svelte snippet is just a closure over it, not a one-time render.
+export const chatHeaderSnippet = writable<Snippet | null>(null)
+
+// Light Apps state for the sidebar (loaded on demand).
+// lightappOpen is the tab strip: the apps the user actually opened, in the
+// order they opened them. `lightapps` stays the full installed list (the cards
+// on the Light Apps page) — the strip must not show apps nobody opened.
+// Not persisted, and it doesn't need to be: 'lightapps' is deliberately absent
+// from PanelMode, so the panel never comes back in this mode on a cold load —
+// the only way in is opening an app, which fills the strip on the way.
+export const lightappOpen = writable<string[]>([])
+export const lightappSel = writable<string>('')
+// The user's landing-page overrides (~/.octo/landing/config.json), empty until
+// loaded and empty for almost everyone — see loadLanding.
+export const landing = writable<import('./api').LandingConfig>({})
+
+// Nothing waits on this: the built-in cards paint first and an override
+// replaces them when the answer lands.
+//
+// Re-read rather than cached for the page's lifetime. The config is a file the
+// user edits in an editor — and one the agent itself writes, mid-session, when
+// asked to make the start screen theirs. The browser could pick that up with a
+// refresh; the desktop shell has no refresh, so a cached read meant quitting
+// the app to see your own edit. Callers re-ask whenever the start screen comes
+// into view (App.svelte); only concurrent asks share a request.
+let landingRequest: Promise<void> | null = null
+export function loadLanding(): Promise<void> {
+  if (landingRequest) return landingRequest
+  landingRequest = api
+    .getLanding()
+    .then((cfg) => {
+      landing.set(cfg ?? {})
+    })
+    .catch(() => {
+      // The built-in cards are the fallback, and they are already on screen.
+    })
+    .finally(() => {
+      landingRequest = null
+    })
+  return landingRequest
+}
+
+export const lightapps = writable<import('./api').LightApp[]>([])
+
+// The installed list is read in several places before the Light Apps panel is
+// ever opened: the sidebar needs it at boot to know which apps claim a mount.
+// Concurrent callers share one request.
+//
+// Re-readable for the same reason loadLanding is: the start screen resolves
+// its hero app and its pinned shortcuts against this list, so an app created
+// during the visit would otherwise stay invisible there until a restart —
+// which is exactly the half of the bug the config re-read does not cover.
+//
+// `fresh` is for a caller that has just written: a request already in flight
+// may have left before the write and would hand back the old list, so it is
+// waited out and a new one sent after it.
+let lightappsRequest: Promise<void> | null = null
+export function loadLightApps(opts: { fresh?: boolean } = {}): Promise<void> {
+  if (lightappsRequest) {
+    return opts.fresh ? lightappsRequest.then(() => loadLightApps()) : lightappsRequest
+  }
+  lightappsRequest = api
+    .listLightApps()
+    .then((list) => {
+      lightapps.set(list)
+    })
+    .catch(() => {
+      // Callers degrade to showing nothing, which is also the answer when the
+      // user simply has no Light Apps.
+    })
+    .finally(() => {
+      lightappsRequest = null
+    })
+  return lightappsRequest
+}
+
+// Apps claiming a permanent place in the UI. `mount` is already normalised
+// server-side, so this one value covers it — the right-hand panel is the
+// session's own, and an app is not part of a session.
+export const mountedViews = derived(lightapps, ($apps) => $apps.filter((a) => a.mount === 'view'))
+
+// The URL a Light App frame loads, mounted or not: /_apps/<slug>/ on this
+// page's own origin (internal/server/lightapp_pages.go), with the resolved
+// theme so the app can match the UI. `gen` busts the frame's cache when the
+// panel asks for a reload.
+export function lightappURL(slug: string, gen: number = 0): string {
+  const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light'
+  return `/_apps/${encodeURIComponent(slug)}/?theme=${theme}&v=${gen}`
+}
+export const lightappHTML = writable<Record<string, string>>({})
+// updated_at of the copy in lightappHTML, per slug. The panel's change poll
+// compares it with the list's fresh stamp to tell an open app was rewritten.
+export const lightappStamp = writable<Record<string, string>>({})
+
+// Every loader goes through these so the HTML and its stamp never drift apart.
+export function cacheLightApp(slug: string, detail: api.LightAppDetail) {
+  lightappHTML.update(m => ({ ...m, [slug]: detail.html }))
+  lightappStamp.update(m => ({ ...m, [slug]: detail.manifest.updated_at ?? '' }))
+}
+export function dropLightApp(slug: string) {
+  lightappHTML.update(({ [slug]: _, ...rest }) => rest)
+  lightappStamp.update(({ [slug]: _, ...rest }) => rest)
+}
+
+// Sessions
+export const sessions = writable<Session[]>([])
+export const activeSessionId = writable<string | null>(null)
+
+// Last view/session on screen before the tab or window closed, so a cold
+// start (no hash naming a target) can put the user back where they left off
+// instead of guessing "whichever session was most recently touched" —
+// another tab or a background reply can update that ranking without the
+// user ever having looked at it. Session existence is re-checked against the
+// session list on boot (App.svelte) since the remembered id may since have
+// been deleted; when it's gone this is worth nothing and the landing page
+// opens instead.
+export interface LastRoute { view: string; sid: string | null }
+const LAST_ROUTE_KEY = storageKey('lastRoute')
+
+export function readLastRoute(): LastRoute | null {
+  try {
+    const raw = localStorage.getItem(LAST_ROUTE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (typeof parsed?.view !== 'string') return null
+    return { view: parsed.view, sid: typeof parsed.sid === 'string' ? parsed.sid : null }
+  } catch {
+    return null
+  }
+}
+
+export function writeLastRoute(view: string, sid: string | null): void {
+  try { localStorage.setItem(LAST_ROUTE_KEY, JSON.stringify({ view, sid })) } catch { /* private mode: this visit only */ }
+}
+// Web-UI sidebar groups. Membership lives here (server registry), not on the
+// session; the sidebar clusters the session list by these.
+export const sessionGroups = writable<SessionGroup[]>([])
+// Pinned session IDs (server registry, web-only). Pinned sessions float into a
+// dedicated section at the top of the sidebar, above all groups.
+export const pinnedSessions = writable<string[]>([])
+// Collapsed session IDs (server registry, web-only). Collapsed sessions sink
+// into a folded panel at the bottom of the sidebar's session list.
+export const collapsedSessions = writable<string[]>([])
+// The project being renamed inline in the sidebar.
+export const editGroupId = writable<string | null>(null)
+export const editGroupDraft = writable('')
+// The configured default permission mode (~/.octo/config.yml), seeded once
+// from GET /api/config on app start. Used as the Composer's last-resort
+// fallback when no session is active (e.g. right after deleting one) —
+// 'ask' alone would ignore whatever the user actually configured.
+export const globalPermissionMode = writable<string>('ask')
+// The configured default reasoning effort (~/.octo/config.yml), seeded once
+// from GET /api/config on app start. Used as the Composer's landing-page
+// (no active session) fallback, mirroring globalPermissionMode above.
+export const globalReasoningEffort = writable<string>('off')
+// Sidebar session UI state
+export const selMode = writable(false)
+export const sel = writable<Record<string, boolean>>({})
+export const menuFor = writable<string | null>(null)
+export const editId = writable<string | null>(null)
+export const editDraft = writable('')
+
+// Per-session chat state (keyed by sessionId)
+export const chatMessages = writable<Record<string, any[]>>({})
+export const chatStreaming = writable<Record<string, boolean>>({})
+// Wall-clock time (ms) of the last text_delta per session. The reply caret is
+// gated on this being recent: the assistant message stays `streaming` for the
+// whole turn (cleared only at segment boundaries — tool_call, new reasoning,
+// complete), so between a finished text run and the next tool the caret would
+// otherwise keep blinking under text that stopped growing while the model is
+// silently generating. Showing it only while text is actively arriving makes it
+// a true typewriter cursor.
+export const chatLastTextAt = writable<Record<string, number>>({})
+// Wall-clock start (ms) of the active streaming turn, per session, so the live
+// "Thinking" elapsed readout survives view remounts (page switches) instead of
+// resetting — a component-local start would restart from ~0 (and briefly read
+// negative) every time ChatView is re-created.
+export const chatTurnStart = writable<Record<string, number>>({})
+export const chatProgress = writable<Record<string, any>>({})
+export const chatBgTasks = writable<Record<string, any[]>>({})
+export const chatTodos = writable<Record<string, any[]>>({})
+export const chatContextUsage = writable<Record<string, any>>({})
+// Absolute context-window occupancy in tokens (the uplink size), per session.
+// Distinct from chatContextUsage, which is the 0–100% fill.
+export const chatContextTokens = writable<Record<string, number>>({})
+export const chatWorkingDir = writable<Record<string, string>>({})
+export const chatPermMode = writable<Record<string, string>>({})
+
+// Per-session goal snapshot (or null when none). Seeded from GET
+// /api/sessions/{id}/goal on session load, refreshed by goal_updated WS
+// events; the Composer renders it as a status chip.
+export const chatGoal = writable<Record<string, any>>({})
+export const chatReasoningEffort = writable<Record<string, string>>({})
+// Effective show-reasoning flag for the current session (global default + per-model override).
+export const chatShowReasoning = writable<Record<string, boolean>>({})
+export const chatSuggestion = writable<Record<string, string>>({})
+// Per-session model name, updated on model switch so the Composer chip stays
+// reactive independently of the sessions store array subscription.
+export const chatModel = writable<Record<string, string>>({})
+// Live thinking buffer (thinking_delta) shown as a Thoughts block while streaming.
+export const chatThinking = writable<Record<string, string>>({})
+// Live sub-agents, keyed by session. Fed by the sub_agent_event WS stream.
+export const chatSubAgents = writable<Record<string, SubAgentState[]>>({})
+// Background workflows, keyed by session. Fed by the workflow_event WS stream.
+// Unlike sub-agents these persist across turns (a workflow runs detached), so
+// the panel is NOT reset on send.
+export const chatWorkflows = writable<Record<string, WorkflowRunState[]>>({})
+
+// A slash-command / prompt queued to auto-send once its session's WS
+// subscription is confirmed. Set by panel "create / setup" actions that open an
+// agent session; consumed by ChatView on the `subscribed` ack. This mirrors the
+// old hand-written UI's Sessions.setPendingMessage → ws "subscribed" flush, so
+// the agentic-first panels invoke a skill in a fresh chat instead of opening a
+// blank session or popping a form.
+export const pendingPrompt = writable<{ sessionId: string; content: string; files?: any[] } | null>(null)
+
+// Permission/question modals
+// Keyed by sessionId so a second session's confirmation doesn't clobber a
+// still-unanswered first one — same pattern as questionModals. Only the
+// active session's confirmation renders as a modal; non-active ones surface
+// as toast notifications.
+export const confirmModals = writable<Record<string, any>>({})
+export interface QuestionModalEntry {
+  questionId: string
+  sessionId: string
+  /** 1-4 questions, rendered as tabs with a review/submit tab. */
+  questions: AskQuestion[]
+  /** Masked-input question: the free-text input renders as a password field. */
+  secret?: boolean
+  dismissed: boolean
+}
+// Keyed by sessionId, unlike a single value — a second session's question
+// must not silently clobber a still-unanswered first one when the user
+// switches sessions. QuestionModal.svelte only ever renders the active
+// session's entry; other sessions' pending state surfaces via the sidebar
+// badge (Session.pending_question) instead.
+export const questionModals = writable<Record<string, QuestionModalEntry>>({})
+export const feedbackModal = writable<any | null>(null)
+
+// Admin data (loaded by views)
+export const skills = writable<Skill[]>([])
+export const workflows = writable<Workflow[]>([])
+export const tasks = writable<ScheduledTask[]>([])
+export const mcpServers = writable<McpServer[]>([])
+export const toolSearchMode = writable('auto')
+export const channels = writable<Channel[]>([])
+export const memories = writable<Memory[]>([])
+export const trashItems = writable<any[]>([])
+export const profileSoul = writable<string | null>(null)
+export const profileUser = writable<any | null>(null)
+export const memTab = writable<'soul' | 'user' | 'memories'>('soul')
+export const recallFiles = writable<any[]>([])
+
+// Monotonic id generator — Date.now() collides when called many times in the
+// same millisecond (e.g. rendering a page of history synchronously), which
+// produces duplicate {#each} keys and crashes the list with each_key_duplicate.
+let _idSeq = 0
+export function uid(prefix = 'm'): string {
+  _idSeq += 1
+  return `${prefix}-${_idSeq}`
+}
+
+// Helper functions
+//
+// Toasts stack (a second one no longer overwrites the first) and each carries
+// its own id + timer, so one toast's timeout can never clear a different,
+// newer toast early (#1114). dismissToast lets Toast.svelte offer a manual
+// close button.
+let _toastSeq = 0
+export function showToast(msg: string, type = 'success') {
+  const id = ++_toastSeq
+  toasts.update(list => [...list, { id, msg, type }])
+  setTimeout(() => dismissToast(id), 3200)
+}
+
+export function dismissToast(id: number) {
+  toasts.update(list => list.filter(t => t.id !== id))
+}
+
+export function setActiveSession(id: string) {
+  activeSessionId.set(id)
+  chatMessages.update(m => ({ ...m, [id]: m[id] || [] }))
+}
+
+// Prepend a freshly created session, replacing any entry the same id already
+// has. Without the dedup, a session-creation call racing the 'session_created'
+// broadcast's own sessions.set() refresh (App.svelte) can leave the id twice
+// in the list — which throws Svelte's each_key_duplicate in the sidebar's
+// keyed {#each} and aborts that render flush before ChatView's own
+// activeSessionId effect gets to run, freezing the chat pane on the old
+// session even though the URL/active id already moved on.
+export function prependSession(sess: Session) {
+  sessions.update(ss => [sess, ...ss.filter(s => s.id !== sess.id)])
+}
+
+// setSessionTitle renames a session in the sidebar list. The server stores a
+// session's display name in Title; the wire object carries it as `title`, and
+// `name` is what the PATCH endpoint takes. Both are written so the sidebar
+// (which reads name first, then title) shows the new title either way.
+export function setSessionTitle(id: string, title: string) {
+  const t = title.trim()
+  if (!id || !t) return
+  sessions.update(ss => ss.map(s => (s.id === id ? { ...s, name: t, title: t } : s)))
+}
+
+// Sessions opened by openAgentSession — single-purpose, panel-launched (Browser
+// Replay/Record/Edit, Skills, Tasks, …). The after-turn follow-up suggestion is
+// noise here, so ChatView skips it for these ids.
+export const agenticSessions = new Set<string>()
+
+// Clear every pick the landing page parks. Called by the entry points that
+// open it, and by every route that lands there by other means — deleting the
+// open session, or a session_deleted broadcast — because a docked group is
+// invisible on that page: without this, clicking a group's "+", changing your
+// mind, and later deleting some session would file your next message into that
+// group with nothing on screen having said so.
+export function clearPendingSessionOpts() {
+  pendingAgent.set('')
+  pendingGroupId.set('')
+  pendingWorkingDir.set('')
+  pendingModel.set('')
+  pendingReasoningEffort.set('')
+  pendingPermissionMode.set('')
+  pendingShowReasoning.set(null)
+}
+
+// Plain "new session" entry point shared by the sidebar button and the
+// command palette. Nothing is created here — it opens the blank chat landing
+// and parks the picks until the first message actually arrives, at which point
+// ChatView.ensureActiveSession creates the session for real. Creating up front
+// left an empty session on disk and a dead row in the sidebar every time the
+// button was touched, whether or not anything was ever said in it.
+// agentProfile (optional) is the agent ID to bind the session to;
+// '' or undefined means Default Agent.
+export function createNewSession(agentProfile?: string): void {
+  clearPendingSessionOpts()
+  if (agentProfile) pendingAgent.set(agentProfile)
+  activeSessionId.set(null)
+  view.set('chat')
+}
+
+// Per-group "new session" entry point (the sidebar's group-header "+"). Same
+// deferred creation as createNewSession, with the target group parked too: on
+// send the server files the session under the group at creation time, so a
+// project member is born in the project's working directory with no seeded
+// dir of its own.
+export function createSessionInGroup(groupId: string): void {
+  clearPendingSessionOpts()
+  pendingGroupId.set(groupId)
+  activeSessionId.set(null)
+  view.set('chat')
+}
+
+// The session a project should reopen: its remembered id when that session is
+// still live, else the most recently updated member, else null. The fallback is
+// what covers a project whose last_session_id predates the field (or points at
+// a session deleted since) — without it those projects would open the blank
+// new-session page the bug report describes.
+export function lastSessionForProject(group: SessionGroup, list: Session[] = get(sessions)): string | null {
+  const members = new Set(group.session_ids ?? [])
+  const remembered = group.last_session_id
+  // An empty list means "not fetched yet", not "no sessions": trusting the
+  // remembered id there is what closes the cold-start race that used to land
+  // on the new-session page (the project opened before the session list
+  // arrived). Once the list IS loaded, an id missing from it was deleted.
+  const loaded = list.length > 0
+  if (remembered && members.has(remembered) && (!loaded || list.some(s => s.id === remembered))) return remembered
+  let best: Session | null = null
+  for (const s of list) {
+    if (!members.has(s.id)) continue
+    if (!best || (s.updated_at ?? '') > (best.updated_at ?? '')) best = s
+  }
+  return best?.id ?? null
+}
+
+// Entering a project opens the session the user was last in. A project with no
+// live session at all keeps the old behaviour of opening the composer with the
+// group docked (deferred creation — nothing is written until a message is
+// sent), which is also what the explicit "+" button does.
+export function openProject(groupId: string): void {
+  const group = get(sessionGroups).find(g => g.id === groupId)
+  if (!group) {
+    createSessionInGroup(groupId)
+    return
+  }
+  // Opening a project that was folded away should show the session it opens.
+  if (group.collapsed) {
+    sessionGroups.update(gs => gs.map(g => g.id === groupId ? { ...g, collapsed: false } : g))
+    api.updateSessionGroup(groupId, { collapsed: false }).catch(() => { /* next refetch corrects it */ })
+  }
+  const sid = lastSessionForProject(group)
+  if (sid) {
+    view.set('chat')
+    activeSessionId.set(sid)
+    return
+  }
+  createSessionInGroup(groupId)
+}
+
+// Remember which session the user is looking at inside its project, so
+// openProject (and the next cold start) can return to it. Deduplicated per
+// (group, session) so a reactive caller can run on every store tick; the local
+// store updates first so the sidebar stays consistent even if the write fails.
+const projectMemSent = new Set<string>()
+export function noteProjectSessionOpen(sessionId: string): void {
+  if (!sessionId) return
+  const group = get(sessionGroups).find(g => !!g.working_dir && g.session_ids.includes(sessionId))
+  if (!group || group.last_session_id === sessionId) return
+  const key = `${group.id}|${sessionId}`
+  if (projectMemSent.has(key)) return
+  projectMemSent.add(key)
+  sessionGroups.update(gs => gs.map(g => g.id === group.id ? { ...g, last_session_id: sessionId } : g))
+  api.updateSessionGroup(group.id, { last_session_id: sessionId }).catch(() => {
+    projectMemSent.delete(key) // retry on the next activation
+  })
+}
+
+// Trailing slashes are the shape difference the pickers produce: both the
+// in-app tree and the native dialog return absolute paths, and the server has
+// already expanded any "~" in what it stored. Not a guarantee of uniqueness —
+// on a case-insensitive filesystem a hand-typed path differing only in case
+// stats fine and comes back verbatim, which would match no existing project and
+// build a second one for the same directory.
+export function normalizeDir(p: string): string {
+  return p.replace(/[\\/]+$/, '')
+}
+
+// Last path segment — the name to show when a directory has to fit somewhere a
+// full path would not (a menu row, a chip). Always pair it with the full path
+// as a title: two mounts can share a leaf name and differ only in their parent.
+// Tolerates a trailing separator and Windows separators; a bare name passes
+// through. The last fallback is the filesystem root, which normalises to the
+// empty string and would otherwise render a nameless row — mounting "/" is
+// unusual but nothing rejects it.
+export function dirLeaf(p: string): string {
+  const norm = normalizeDir(p.replace(/\\/g, '/'))
+  return norm.slice(norm.lastIndexOf('/') + 1) || norm || p
+}
+
+// Resolve a working directory picked on the landing page to the project that
+// owns it, creating that project if none exists yet. Returns the group id to
+// file the new session under. Matching is by directory, not by name: two
+// projects can share a name, but the directory is what actually governs where
+// a session's tools run.
+// projectsClaimingDir lists every project that owns dir — as its workspace or
+// as a mounted source folder. Several claimants is a legitimate state (a
+// folder may be mounted by several projects); callers with a UI let the user
+// pick, everything else takes the unique claim or creates.
+export function projectsClaimingDir(dir: string): SessionGroup[] {
+  const target = normalizeDir(dir)
+  // Scheduled tasks' run clusters are excluded: adopting an ad-hoc session
+  // into one would drop it into that task's run history.
+  return get(sessionGroups).filter(g =>
+    !g.task_id && !!g.working_dir && (
+      normalizeDir(g.working_dir!) === target ||
+      (g.source_dirs ?? []).some(sd => normalizeDir(sd) === target)
+    ),
+  )
+}
+
+export async function resolveProjectForDir(dir: string): Promise<string> {
+  const claims = projectsClaimingDir(dir)
+  // First claim on ambiguity. The composer's picker resolves that case
+  // interactively before parking a folder; the residue reaching here is a
+  // race (groups arriving after the pick, another tab mounting the folder
+  // in between) — accepted: the first claimant is stable and visible.
+  if (claims.length > 0) return claims[0].id
+  // Split on either separator: on Windows a path has no '/' at all, and the
+  // project would otherwise be named after the whole path.
+  const target = normalizeDir(dir)
+  const name = target.split(/[\\/]/).filter(Boolean).pop() || target
+  const g = await api.createSessionGroup(name, { source_dirs: [dir] })
+  sessionGroups.update(gs => [...gs, g])
+  return g.id
+}
+
+// Agentic-first entry point shared by the Skills / Tasks / MCP / Channels /
+// Profile panels: open a fresh chat session and queue a slash-command to
+// auto-send once the WS subscription is confirmed (see pendingPrompt). The
+// relevant skill drives the rest of the flow in conversation — no forms.
+export async function openAgentSession(content: string, name?: string): Promise<void> {
+  const sess = await api.createSession({ source: 'manual', ...(name ? { name } : {}) })
+  agenticSessions.add(sess.id)
+  prependSession(sess)
+  pendingPrompt.set({ sessionId: sess.id, content })
+  activeSessionId.set(sess.id)
+  view.set('chat')
+}
+
+// Expert-gallery entry point: bind a fresh session to the given agent profile
+// (curated or user-created) and, when an example prompt is supplied,
+// pre-queue it as the first message via the same pendingPrompt auto-send
+// mechanism openAgentSession uses. Unlike openAgentSession this is a genuine
+// conversation with the expert, not a single-purpose panel session, so it is
+// deliberately NOT added to agenticSessions.
+export async function summonAgent(agentId: string, agentName: string, examplePrompt?: string): Promise<void> {
+  const sess = await api.createSession({ source: 'manual', agent_profile: agentId, name: agentName })
+  prependSession(sess)
+  if (examplePrompt) pendingPrompt.set({ sessionId: sess.id, content: examplePrompt })
+  activeSessionId.set(sess.id)
+  view.set('chat')
+}
+
+export function addChatMsg(sessionId: string, msg: any) {
+  chatMessages.update(m => ({ ...m, [sessionId]: [...(m[sessionId] || []), msg] }))
+}
+
+export function updateLastMsg(sessionId: string, updater: (msg: any) => any) {
+  chatMessages.update(m => {
+    const msgs = [...(m[sessionId] || [])]
+    if (msgs.length) msgs[msgs.length - 1] = updater(msgs[msgs.length - 1])
+    return { ...m, [sessionId]: msgs }
+  })
+}
+
+// pendingThinking seeds the bubble's collapsible Thoughts section when this
+// delta opens a NEW segment — it has no effect while continuing an existing
+// streaming bubble, since by then any reasoning for the segment has already
+// finished (see the text_delta handler in ChatView.svelte, which passes the
+// live chatThinking buffer here and clears it in the same tick so the pinned
+// live-thinking block never outlives the reply it belongs to.
+export function appendToLastAssistant(sessionId: string, content: string, pendingThinking = '') {
+  if (!content) return
+  chatMessages.update(m => {
+    const msgs = [...(m[sessionId] || [])]
+    const last = msgs.length - 1
+    // Continue the in-flight bubble only if it is the trailing message AND still
+    // streaming. Otherwise this delta opens a new segment (turn start, or text
+    // following a tool call / thinking block), so finalize any prior streaming
+    // bubble and push a fresh one. Without the freshness check a delta would
+    // either be dropped (no assistant bubble yet) or merged into a finalized
+    // reply from an earlier segment/turn.
+    if (last >= 0 && msgs[last].type === 'assistant' && msgs[last].streaming) {
+      msgs[last] = { ...msgs[last], content: msgs[last].content + content }
+      return { ...m, [sessionId]: msgs }
+    }
+    for (let i = 0; i < msgs.length; i++) {
+      if (msgs[i].type === 'assistant' && msgs[i].streaming) {
+        msgs[i] = { ...msgs[i], streaming: false }
+      }
+    }
+    msgs.push({
+      id: uid('a'), type: 'assistant', content,
+      thinking: pendingThinking.trim(), createdAt: Date.now(), streaming: true, tools: [], todos: [],
+    })
+    return { ...m, [sessionId]: msgs }
+  })
+}
+
+export function clearMsgs(sessionId: string) {
+  chatMessages.update(m => ({ ...m, [sessionId]: [] }))
+}
+
+// Finalize any streaming assistant message in a list — shared by every call
+// site that starts a new segment (reasoning, tool call) and needs the caret
+// on the prior in-flight reply to stop blinking behind it.
+function finalizeStreamingAssistant(msgs: any[]): any[] {
+  return msgs.map(msg => (msg.type === 'assistant' && msg.streaming) ? { ...msg, streaming: false } : msg)
+}
+
+// Stop the caret on any trailing streaming assistant message. Call this
+// whenever a new segment (reasoning, tool call) starts so the caret doesn't
+// keep blinking behind content that no longer belongs to the in-flight reply.
+export function stopTrailingCaret(sessionId: string) {
+  chatMessages.update(m => {
+    const msgs = m[sessionId]
+    if (!msgs || !msgs.some(msg => msg.type === 'assistant' && msg.streaming)) return m
+    return { ...m, [sessionId]: finalizeStreamingAssistant(msgs) }
+  })
+}
+
+// Commit a finished reasoning segment as a standalone Thoughts message. Used
+// both on history replay (a `thinking` event) and live (when a tool call ends
+// the current thinking step). Placing it in the message list — rather than the
+// transient live buffer — preserves think → act order and makes the segment a
+// tool-group boundary. Whitespace-only thinking is dropped.
+export function commitThinking(sessionId: string, text: string) {
+  const t = (text ?? '').trim()
+  if (!t) return
+  chatMessages.update(m => {
+    // Finalize any trailing streaming assistant text so its caret stops blinking
+    // once the reasoning segment is committed as a separate message.
+    const msgs = finalizeStreamingAssistant(m[sessionId] || [])
+    msgs.push({
+      id: uid('th'), type: 'thinking', thinking: t,
+      createdAt: Date.now(), streaming: false, tools: [], todos: [],
+    })
+    return { ...m, [sessionId]: msgs }
+  })
+}
+
+export function addToolCallToGroup(sessionId: string, toolCall: any) {
+  chatMessages.update(m => {
+    const msgs = [...(m[sessionId] || [])]
+    // Replay dedup: a mid-turn (re)subscribe redelivers the turn's buffered
+    // events — tool_call included — and this tab may already hold the card.
+    // tool_id is unique per call, so an existing tool with the same id means
+    // this event is a replay; skip it or the transcript shows the card twice
+    // until the next refresh. An empty toolId can't be trusted as a key, so
+    // those calls always append (the pre-dedup behaviour).
+    if (toolCall.toolId) {
+      const replayed = msgs.some((x: any) =>
+        x.type === 'tool_group' && x.tools?.some((t: any) => t.toolId === toolCall.toolId))
+      if (replayed) return m
+    }
+    // Group consecutive tools only — append to the running group when it is the
+    // LAST message. Any thinking/assistant message pushed since (a reasoning
+    // step or LLM text between rounds) ends the group, so separated tools render
+    // as their own cards while back-to-back tool calls stay in one.
+    const last = msgs[msgs.length - 1]
+    if (last && last.type === 'tool_group' && last.streaming) {
+      msgs[msgs.length - 1] = { ...last, tools: [...last.tools, toolCall] }
+      return { ...m, [sessionId]: msgs }
+    }
+    // A tool call starts a new action segment: stop the caret on any trailing
+    // streaming assistant text so it doesn't keep blinking behind the tool card.
+    const finalized = finalizeStreamingAssistant(msgs)
+    finalized.push({ id: uid('grp'), type: 'tool_group', content: '', streaming: true, tools: [toolCall], todos: [], createdAt: Date.now() })
+    return { ...m, [sessionId]: finalized }
+  })
+}
+
+// Find the tool to update: prefer an exact toolId match (correct for parallel
+// tool calls whose results arrive out of order), else the first not-yet-done
+// tool, else the last one. Parallel tool_use returns N calls then N results, so
+// "last tool" alone mis-assigns every result to the final call.
+function pickToolIndex(tools: any[], toolId: string | undefined): number {
+  if (toolId) {
+    const byId = tools.findIndex((t: any) => t.toolId && t.toolId === toolId)
+    if (byId >= 0) return byId
+  }
+  const pending = tools.findIndex((t: any) => !t.done && !t.error)
+  if (pending >= 0) return pending
+  return tools.length - 1
+}
+
+export function updateToolResult(sessionId: string, toolId: string | undefined, result: any, uiPayload: any, endedAt?: number) {
+  chatMessages.update(m => {
+    const msgs = [...(m[sessionId] || [])]
+    const lastGroup = msgs.findLastIndex((x: any) => x.type === 'tool_group')
+    if (lastGroup >= 0) {
+      const tools = [...msgs[lastGroup].tools]
+      const idx = pickToolIndex(tools, toolId)
+      if (idx >= 0) {
+        const started = tools[idx].startedAt
+        // endedAt is the server-stamped event time when present (matching a
+        // server-stamped startedAt); Date.now() only when an older server
+        // sent neither, so both ends stay on one clock.
+        const elapsed = started ? Math.max(0, ((endedAt ?? Date.now()) - started) / 1000) : tools[idx].elapsed
+        tools[idx] = { ...tools[idx], result, ui_payload: uiPayload, done: true, elapsed }
+      }
+      msgs[lastGroup] = { ...msgs[lastGroup], tools }
+    }
+    return { ...m, [sessionId]: msgs }
+  })
+}
+
+// Append streamed stdout lines to the tool they belong to, using the same
+// exact-toolId-first lookup as updateToolResult/setToolError. Attributing by
+// "last tool in the group" (the previous behavior) mis-routes output for
+// parallel/interleaved tool calls, same class of bug pickToolIndex already
+// fixes for results and errors (#1114).
+// MAX_LIVE_STDOUT_LINES bounds a running tool card's accumulated live output —
+// mirrors the backend's maxLiveStdoutLines (internal/server/ws_handlers.go).
+// Without it a long, high-frequency command (a noisy build loop, a runaway
+// `yes`) would grow this array for as long as the command keeps streaming.
+const MAX_LIVE_STDOUT_LINES = 200
+
+export function appendToolStdout(sessionId: string, toolId: string | undefined, lines: string[]) {
+  if (!lines || lines.length === 0) return
+  chatMessages.update(m => {
+    const msgs = [...(m[sessionId] || [])]
+    const lastGroup = msgs.findLastIndex((x: any) => x.type === 'tool_group')
+    if (lastGroup >= 0) {
+      const tools = [...msgs[lastGroup].tools]
+      const idx = pickToolIndex(tools, toolId)
+      if (idx >= 0) {
+        const merged = [...(tools[idx].stdout ?? []), ...lines]
+        const capped = merged.length > MAX_LIVE_STDOUT_LINES ? merged.slice(merged.length - MAX_LIVE_STDOUT_LINES) : merged
+        tools[idx] = { ...tools[idx], stdout: capped }
+      }
+      msgs[lastGroup] = { ...msgs[lastGroup], tools }
+    }
+    return { ...m, [sessionId]: msgs }
+  })
+}
+
+export function setToolError(sessionId: string, toolId: string | undefined, error: string, endedAt?: number) {
+  chatMessages.update(m => {
+    const msgs = [...(m[sessionId] || [])]
+    const lastGroup = msgs.findLastIndex((x: any) => x.type === 'tool_group')
+    if (lastGroup >= 0) {
+      const tools = [...msgs[lastGroup].tools]
+      const idx = pickToolIndex(tools, toolId)
+      if (idx >= 0) {
+        const started = tools[idx].startedAt
+        // See updateToolResult: prefer the server-stamped end time.
+        const elapsed = started ? Math.max(0, ((endedAt ?? Date.now()) - started) / 1000) : tools[idx].elapsed
+        tools[idx] = { ...tools[idx], error, done: true, elapsed }
+      }
+      msgs[lastGroup] = { ...msgs[lastGroup], tools }
+    }
+    return { ...m, [sessionId]: msgs }
+  })
+}
+
+// ── Sub-agents ───────────────────────────────────────────────────────────────
+// One live entry per concurrent sub-agent, driven by the sub_agent_event stream
+// (kind: started | tool | tool_done | tool_error | text | done). The panel is a
+// live view of the current turn; resetSubAgents() clears it when a new turn
+// starts. The full trail persists server-side and is reviewable from the
+// transcript's sub_agent tool card.
+
+// One entry in an agent's trail: a tool call (input, then the capped output
+// once it finishes) or one of the agent's assistant text blocks, in order.
+export type AgentTrailStep =
+  | { kind: 'tool'; id: string; name: string; input?: Record<string, any>; output?: string; done: boolean; error: boolean }
+  | { kind: 'text'; text: string }
+
+export interface SubAgentState {
+  id: string
+  description: string
+  agentType: string // subagent_type, e.g. "explore" (empty for workflow-spawned agents)
+  // running: still working. done: clean completion. error: exited with an error
+  // or was killed. cancelled: user killed (context canceled) while running.
+  status: 'running' | 'done' | 'error' | 'cancelled'
+  lastTool: string
+  steps: AgentTrailStep[]
+  result?: string // capped final reply, set on "done"
+  startedAt: number
+}
+
+// The sub_agent_event WS payload fields the store folds (see the server's
+// subAgentEventPayload — one wire shape for live broadcast and replay).
+export interface SubAgentEventPayload {
+  agent_id?: string
+  description?: string
+  agent_type?: string
+  kind?: string
+  tool_id?: string
+  tool_name?: string
+  tool_input?: Record<string, any>
+  tool_output?: string
+  text?: string
+  stop_reason?: string
+  result?: string
+}
+
+// foldTrailStep folds one tool/text event into a steps array (mutates steps —
+// callers pass a fresh copy). Kind arrives already stripped of any "agent_"
+// prefix so sub-agent and workflow-agent events share the fold.
+//
+// Idempotent under replay: every (re)subscribe replays a running sub-agent's
+// retained events, on top of steps already folded live or hydrated from
+// agent-runs, so a tool already seen by id, a completion already applied, or
+// a text already present is not added again.
+export function foldTrailStep(steps: AgentTrailStep[], kind: string, ev: SubAgentEventPayload): void {
+  if (kind === 'tool') {
+    if (ev.tool_id && steps.some(st => st.kind === 'tool' && st.id === ev.tool_id)) return
+    steps.push({ kind: 'tool', id: ev.tool_id ?? '', name: ev.tool_name || 'tool', input: ev.tool_input, done: false, error: false })
+    return
+  }
+  if (kind === 'tool_done' || kind === 'tool_error') {
+    const isErr = kind === 'tool_error'
+    const id = ev.tool_id ?? ''
+    for (let i = steps.length - 1; i >= 0; i--) {
+      const st = steps[i]
+      if (st.kind !== 'tool' || st.done) continue
+      if ((id && st.id === id) || (!id && st.name === ev.tool_name)) {
+        steps[i] = { ...st, output: ev.tool_output, done: true, error: isErr }
+        return
+      }
+    }
+    // A replayed completion of a step that is already done: refresh it in place.
+    const doneAt = id ? steps.findIndex(st => st.kind === 'tool' && st.id === id) : -1
+    if (doneAt >= 0) {
+      steps[doneAt] = { ...(steps[doneAt] as Extract<AgentTrailStep, { kind: 'tool' }>), output: ev.tool_output, done: true, error: isErr }
+      return
+    }
+    // Unmatched completion (e.g. replay after the "tool" event aged out of the
+    // retention buffer) — append it so the output still shows.
+    steps.push({ kind: 'tool', id, name: ev.tool_name || 'tool', output: ev.tool_output, done: true, error: isErr })
+    return
+  }
+  if (kind === 'text' && ev.text && !steps.some(st => st.kind === 'text' && st.text === ev.text)) {
+    steps.push({ kind: 'text', text: ev.text })
+  }
+}
+
+export function resetSubAgents(sessionId: string) {
+  chatSubAgents.update(m => ({ ...m, [sessionId]: [] }))
+}
+
+// Remove finished sub-agents from the live panel. Called on `complete` so a
+// done panel doesn't linger until the next page refresh. We filter by status
+// rather than clearing the entire array because background sub-agents may
+// outlive the turn that spawned them — they
+// should remain visible in the panel until they finish. There is a brief race
+// window where `complete` can fire before the final `sub_agent_event` with
+// `kind: done` arrives, but the panel will clear on the next turn start via
+// resetSubAgents(), so this is acceptable.
+export function clearDoneSubAgents(sessionId: string) {
+  chatSubAgents.update(m => {
+    const remaining = (m[sessionId] || []).filter(a => a.status === 'running')
+    return { ...m, [sessionId]: remaining }
+  })
+}
+
+export function markSubAgentFinished(
+  sessionId: string,
+  agentId: string,
+  status: 'done' | 'error' | 'cancelled',
+) {
+  chatSubAgents.update(m => {
+    const list = [...(m[sessionId] || [])]
+    const idx = list.findIndex(a => a.id === agentId)
+    if (idx >= 0 && list[idx].status === 'running') {
+      list[idx] = { ...list[idx], status }
+    }
+    return { ...m, [sessionId]: list }
+  })
+}
+export function removeSubAgent(sessionId: string, agentId: string) {
+  chatSubAgents.update(m => {
+    const remaining = (m[sessionId] || []).filter(a => a.id !== agentId)
+    return { ...m, [sessionId]: remaining }
+  })
+}
+
+export function applySubAgentEvent(sessionId: string, ev: SubAgentEventPayload) {
+  const agentId = ev.agent_id ?? ''
+  const kind = ev.kind ?? ''
+  const description = ev.description ?? ''
+  const agentType = ev.agent_type ?? ''
+  chatSubAgents.update(m => {
+    const list = [...(m[sessionId] || [])]
+    let idx = list.findIndex(a => a.id === agentId)
+    if (kind === 'started') {
+      const entry: SubAgentState = {
+        id: agentId,
+        description: description || agentId,
+        agentType,
+        status: 'running',
+        lastTool: '',
+        steps: [],
+        startedAt: Date.now(),
+      }
+      if (idx >= 0) list[idx] = entry
+      else list.push(entry)
+      return { ...m, [sessionId]: list }
+    }
+    if (idx < 0) {
+      // Tool/done arrived before a started event (e.g. resumed agent) — seed it.
+      list.push({ id: agentId, description: description || agentId, agentType, status: 'running', lastTool: '', steps: [], startedAt: Date.now() })
+      idx = list.length - 1
+    }
+    const a = { ...list[idx], steps: [...list[idx].steps] }
+    if (description && a.description === a.id) a.description = description
+    if (agentType && !a.agentType) a.agentType = agentType
+    if (kind === 'tool' || kind === 'tool_done' || kind === 'tool_error' || kind === 'text') {
+      foldTrailStep(a.steps, kind, ev)
+      if (kind === 'tool' && ev.tool_name) a.lastTool = ev.tool_name
+    } else if (kind === 'done') {
+      const stopReason = ev.stop_reason
+      if (stopReason === 'killed') {
+        a.status = 'cancelled'
+      } else if (!stopReason || stopReason === 'error') {
+        a.status = 'error'
+      } else {
+        a.status = 'done'
+      }
+      if (ev.result) a.result = ev.result
+    }
+    list[idx] = a
+    return { ...m, [sessionId]: list }
+  })
+}
+
+// ── Persistent agent-run trails (transcript review) ──────────────────────────
+// Unlike the live panels above, these accumulate for the whole session and are
+// never cleared by turn boundaries: the transcript's sub_agent / workflow tool
+// cards claim them by the agent_id / run_id in their ui_payload. Seeded from
+// GET /api/sessions/:id/agent-runs on session open (hydrateAgentRuns) and kept
+// current by folding the same live WS events the panels consume.
+
+export interface WorkflowTrailState {
+  id: string
+  description: string
+  status: 'running' | 'done' | 'error'
+  logs: string[]
+  agents: WorkflowAgentState[]
+}
+
+export interface AgentRunTrails {
+  subAgents: Record<string, SubAgentState>
+  workflows: Record<string, WorkflowTrailState>
+}
+
+export const agentRunTrails = writable<Record<string, AgentRunTrails>>({})
+
+export function recordAgentTrailEvent(sessionId: string, ev: SubAgentEventPayload) {
+  const agentId = ev.agent_id ?? ''
+  const kind = ev.kind ?? ''
+  if (!agentId) return
+  agentRunTrails.update(m => {
+    const t: AgentRunTrails = {
+      subAgents: { ...(m[sessionId]?.subAgents || {}) },
+      workflows: m[sessionId]?.workflows || {},
+    }
+    const prev = t.subAgents[agentId]
+    const a: SubAgentState = prev
+      ? { ...prev, steps: [...prev.steps] }
+      : { id: agentId, description: ev.description || agentId, agentType: ev.agent_type ?? '', status: 'running', lastTool: '', steps: [], startedAt: Date.now() }
+    if (ev.description && a.description === a.id) a.description = ev.description
+    if (ev.agent_type && !a.agentType) a.agentType = ev.agent_type
+    if (kind === 'started') {
+      // A Continue round re-opens the trail; earlier steps are kept — the
+      // review surface shows the whole history, not just the last round.
+      a.status = 'running'
+    } else if (kind === 'tool' || kind === 'tool_done' || kind === 'tool_error' || kind === 'text') {
+      foldTrailStep(a.steps, kind, ev)
+      if (kind === 'tool' && ev.tool_name) a.lastTool = ev.tool_name
+    } else if (kind === 'done') {
+      const stopReason = ev.stop_reason
+      a.status = stopReason === 'killed' ? 'cancelled' : (!stopReason || stopReason === 'error') ? 'error' : 'done'
+      if (ev.result) a.result = ev.result
+    }
+    t.subAgents[agentId] = a
+    return { ...m, [sessionId]: t }
+  })
+}
+
+export function recordWorkflowTrailEvent(sessionId: string, ev: WorkflowEventPayload) {
+  const runId = ev.run_id ?? ''
+  const kind = ev.kind ?? ''
+  if (!runId) return
+  agentRunTrails.update(m => {
+    const t: AgentRunTrails = {
+      subAgents: m[sessionId]?.subAgents || {},
+      workflows: { ...(m[sessionId]?.workflows || {}) },
+    }
+    const prev = t.workflows[runId]
+    const r: WorkflowTrailState = prev
+      ? { ...prev, logs: [...prev.logs], agents: [...prev.agents] }
+      : { id: runId, description: ev.description || runId, status: 'running', logs: [], agents: [] }
+    if (ev.description && (r.description === r.id || !r.description)) r.description = ev.description
+    if (kind === 'started') {
+      // A replay resends started and then the run's whole log; start the log
+      // over so it isn't appended twice.
+      r.logs = []
+    } else if (kind === 'progress') {
+      if (ev.line) {
+        r.logs.push(ev.line)
+        if (r.logs.length > maxWorkflowProgressLines) r.logs = r.logs.slice(r.logs.length - maxWorkflowProgressLines)
+      }
+    } else if (kind === 'done') {
+      r.status = ev.status === 'error' ? 'error' : 'done'
+    } else if (kind.startsWith('agent_')) {
+      const agentId = ev.agent_id ?? ''
+      if (agentId) {
+        let ai = r.agents.findIndex(a => a.id === agentId)
+        if (ai < 0) {
+          r.agents.push({ id: agentId, label: ev.agent_label || agentId, status: 'running', steps: [] })
+          ai = r.agents.length - 1
+        }
+        const a = { ...r.agents[ai], steps: [...r.agents[ai].steps] }
+        if (ev.agent_label) a.label = ev.agent_label
+        if (kind === 'agent_done') {
+          if (ev.error) {
+            a.error = ev.error
+            a.status = 'error'
+          } else {
+            a.reply = ev.reply
+            a.status = 'done'
+          }
+        } else {
+          foldTrailStep(a.steps, kind.slice('agent_'.length), ev)
+        }
+        r.agents[ai] = a
+      }
+    }
+    t.workflows[runId] = r
+    return { ...m, [sessionId]: t }
+  })
+}
+
+// hydrateAgentRuns seeds the trail store from the REST snapshot. Entries the
+// live stream already created win — the snapshot only fills what this tab
+// hasn't seen (finished runs, earlier sessions of a reloaded page).
+export function hydrateAgentRuns(
+  sessionId: string,
+  resp: { sub_agents?: any[]; workflows?: any[] } | null | undefined,
+) {
+  if (!resp) return
+  agentRunTrails.update(m => {
+    const t: AgentRunTrails = {
+      subAgents: { ...(m[sessionId]?.subAgents || {}) },
+      workflows: { ...(m[sessionId]?.workflows || {}) },
+    }
+    for (const sa of resp.sub_agents ?? []) {
+      if (!sa?.agent_id || t.subAgents[sa.agent_id]) continue
+      t.subAgents[sa.agent_id] = {
+        id: sa.agent_id,
+        description: sa.description || sa.agent_id,
+        agentType: sa.agent_type ?? '',
+        status: sa.status ?? 'done',
+        lastTool: '',
+        steps: (sa.steps ?? []) as AgentTrailStep[],
+        result: sa.result,
+        startedAt: 0,
+      }
+    }
+    for (const wf of resp.workflows ?? []) {
+      if (!wf?.run_id || t.workflows[wf.run_id]) continue
+      t.workflows[wf.run_id] = {
+        id: wf.run_id,
+        description: wf.description || wf.run_id,
+        status: wf.status ?? 'done',
+        logs: wf.logs ?? [],
+        agents: (wf.agents ?? []).map((a: any): WorkflowAgentState => ({
+          id: a.agent_id,
+          label: a.label || a.agent_id,
+          status: a.status ?? 'done',
+          steps: (a.steps ?? []) as AgentTrailStep[],
+          reply: a.reply,
+          error: a.error,
+        })),
+      }
+    }
+    return { ...m, [sessionId]: t }
+  })
+}
+
+// ── Background workflows ─────────────────────────────────────────────────────
+// Live running workflow runs, driven by the workflow_event stream
+// (kind: started | progress | agent_* | done). The pinned panel only shows
+// workflows that are still running; once a run finishes it is removed so the
+// bar does not grow indefinitely. Completion is already visible as a chat
+// message from the agent, and the full trail persists server-side for the
+// transcript's workflow tool card.
+const maxWorkflowProgressLines = 200
+
+// One agent()/skill() call inside a workflow run, with its own trail.
+export interface WorkflowAgentState {
+  id: string // per-run handle, e.g. "a1"
+  label: string
+  status: 'running' | 'done' | 'error'
+  steps: AgentTrailStep[]
+  reply?: string
+  error?: string
+}
+
+export interface WorkflowRunState {
+  id: string
+  description: string
+  status: 'running' | 'done' | 'error'
+  progress: string[]
+  agents: WorkflowAgentState[]
+  startedAt: number
+}
+
+// The workflow_event WS payload fields the store folds (see the server's
+// workflowEventPayload — one wire shape for live broadcast and replay).
+export interface WorkflowEventPayload extends SubAgentEventPayload {
+  run_id?: string
+  line?: string
+  status?: string
+  agent_label?: string
+  reply?: string
+  error?: string
+}
+
+export function applyWorkflowEvent(sessionId: string, ev: WorkflowEventPayload) {
+  const runId = ev.run_id ?? ''
+  const kind = ev.kind ?? ''
+  const description = ev.description ?? ''
+  if (!runId) return
+  chatWorkflows.update(m => {
+    let list = [...(m[sessionId] || [])]
+    let idx = list.findIndex(r => r.id === runId)
+    if (idx < 0) {
+      list.push({ id: runId, description: description || runId, status: 'running', progress: [], agents: [], startedAt: Date.now() })
+      idx = list.length - 1
+    }
+    if (kind === 'done') {
+      // Remove finished runs from the live panel; completion lands as a chat
+      // message, so keeping done/error entries here would push the composer
+      // down in long-lived sessions.
+      list = list.filter(r => r.id !== runId)
+      return { ...m, [sessionId]: list }
+    }
+    const r = { ...list[idx], progress: [...list[idx].progress], agents: [...list[idx].agents] }
+    if (description && (r.description === r.id || !r.description)) r.description = description
+    if (kind === 'progress') {
+      const line = ev.line ?? ''
+      if (line) {
+        r.progress.push(line)
+        if (r.progress.length > maxWorkflowProgressLines) {
+          r.progress = r.progress.slice(r.progress.length - maxWorkflowProgressLines)
+        }
+      }
+    } else if (kind.startsWith('agent_')) {
+      const agentId = ev.agent_id ?? ''
+      if (agentId) {
+        let ai = r.agents.findIndex(a => a.id === agentId)
+        if (ai < 0) {
+          r.agents.push({ id: agentId, label: ev.agent_label || agentId, status: 'running', steps: [] })
+          ai = r.agents.length - 1
+        }
+        const a = { ...r.agents[ai], steps: [...r.agents[ai].steps] }
+        if (ev.agent_label) a.label = ev.agent_label
+        if (kind === 'agent_done') {
+          if (ev.error) {
+            a.error = ev.error
+            a.status = 'error'
+          } else {
+            a.reply = ev.reply
+            a.status = 'done'
+          }
+        } else {
+          foldTrailStep(a.steps, kind.slice('agent_'.length), ev)
+        }
+        r.agents[ai] = a
+      }
+    }
+    list[idx] = r
+    return { ...m, [sessionId]: list }
+  })
+}
+
+// Mark only the tools whose IDs are in the provided set as done. Used after
+// loading history so we don't accidentally close tools from a concurrently
+// replaying live turn (those tools have different IDs and are not in the set).
+export function finishToolsById(sessionId: string, toolIds: Set<string>) {
+  if (toolIds.size === 0) return
+  chatMessages.update(m => {
+    const msgs = (m[sessionId] || []).map((msg: any) => {
+      if (msg.type !== 'tool_group') return msg
+      const tools = msg.tools.map((t: any) =>
+        toolIds.has(t.toolId) && !t.done && !t.error ? { ...t, done: true } : t
+      )
+      const allDone = tools.every((t: any) => t.done || t.error)
+      return { ...msg, streaming: allDone ? false : msg.streaming, tools }
+    })
+    return { ...m, [sessionId]: msgs }
+  })
+}
+
+// Mark every still-running tool in the session as done — called on `complete`
+// so a finished turn never leaves tools spinning (parallel results that never
+// matched, or a tool whose result event was dropped).
+export function finishAllTools(sessionId: string) {
+  chatMessages.update(m => {
+    const msgs = (m[sessionId] || []).map((msg: any) =>
+      msg.type === 'tool_group'
+        ? {
+            ...msg,
+            streaming: false,
+            tools: msg.tools.map((t: any) => (t.done || t.error ? t : { ...t, done: true })),
+          }
+        : msg
+    )
+    return { ...m, [sessionId]: msgs }
+  })
+}

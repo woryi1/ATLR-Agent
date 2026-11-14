@@ -1,0 +1,414 @@
+package server
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/open-octo/octo-agent/internal/channel"
+	"github.com/open-octo/octo-agent/internal/channel/adapters/weixin/ilink"
+)
+
+// ─── Channels REST API ────────────────────────────────────────────────────
+
+// channelInfo is the safe-for-frontend view of a platform config (secrets masked).
+type channelInfo struct {
+	Platform  string            `json:"platform"`
+	AdapterID string            `json:"adapter_id,omitempty"`
+	Enabled   bool              `json:"enabled"`
+	Running   bool              `json:"running"`
+	HasConfig bool              `json:"has_config"`
+	Fields    map[string]string `json:"fields"`
+	Issue     string            `json:"issue,omitempty"`
+}
+
+var secretKeys = map[string]bool{
+	"client_secret": true,
+	"app_secret":    true,
+	"secret":        true,
+	"token":         true,
+	"bot_token":     true,
+	"bot_secret":    true,
+}
+
+// handleListChannels returns all platform configs with secrets masked.
+func (s *Server) handleListChannels(w http.ResponseWriter, r *http.Request) {
+	cfg, err := channel.LoadConfig()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	out := make([]channelInfo, 0, len(cfg.Channels))
+	for name, list := range cfg.Channels {
+		for i, ic := range list {
+			ir := channel.InstanceRef{Platform: name, Instance: ic, Index: i}
+			adapterID := ir.AdapterID()
+			info := instanceToInfo(name, adapterID, ic)
+			info.Running = s.isAdapterRunning(adapterID)
+			info.Issue = s.channelIssue(adapterID)
+			out = append(out, info)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"channels": out})
+}
+
+// handleGetChannel returns a single platform's config.
+func (s *Server) handleGetChannel(w http.ResponseWriter, r *http.Request) {
+	platform := r.PathValue("platform")
+	if platform == "" {
+		writeError(w, http.StatusBadRequest, "missing platform name")
+		return
+	}
+
+	cfg, err := channel.LoadConfig()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	instances := cfg.Platform(platform)
+	if len(instances) == 0 {
+		writeError(w, http.StatusNotFound, "platform not configured")
+		return
+	}
+	ic := instances[0]
+	ir := channel.InstanceRef{Platform: platform, Instance: ic}
+	adapterID := ir.AdapterID()
+	info := instanceToInfo(platform, adapterID, ic)
+	info.Running = s.isAdapterRunning(adapterID)
+	info.Issue = s.channelIssue(adapterID)
+	writeJSON(w, http.StatusOK, info)
+}
+
+type channelUpdateRequest struct {
+	// Enabled is a pointer so "field absent" (a credentials-only save, which
+	// implies enable) is distinguishable from an explicit toggle-off.
+	Enabled *bool             `json:"enabled"`
+	Fields  map[string]string `json:"fields"`
+}
+
+// handleReloadChannel applies the saved config for one platform without a body —
+// the agent calls this after writing channels.yml to trigger reloadChannel.
+func (s *Server) handleReloadChannel(w http.ResponseWriter, r *http.Request) {
+	platform := r.PathValue("platform")
+	if platform == "" {
+		writeError(w, http.StatusBadRequest, "missing platform name")
+		return
+	}
+
+	s.reloadChannel(platform)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "reloaded"})
+}
+func (s *Server) handleSaveChannel(w http.ResponseWriter, r *http.Request) {
+	platform := r.PathValue("platform")
+	if platform == "" {
+		writeError(w, http.StatusBadRequest, "missing platform name")
+		return
+	}
+
+	var req channelUpdateRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+
+	cfg, err := channel.LoadConfig()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Convert string fields to map[string]any for SetPlatform.
+	fields := make(map[string]any)
+	for k, v := range req.Fields {
+		fields[k] = v
+	}
+	if req.Enabled != nil {
+		fields["enabled"] = *req.Enabled
+	}
+
+	cfg.SetPlatform(platform, fields)
+
+	// Reject enabling a platform whose adapter can't start from the merged
+	// config — it would fail at startup and enter a crash-restart loop.
+	// Configure the channel first; a successful configuration enables it
+	// automatically.
+	if inst := cfg.Platform(platform); len(inst) > 0 && inst[0].Enabled {
+		if err := channelStartupCheck(platform, inst[0].Config); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("cannot enable %s: %v", platform, err))
+			return
+		}
+	}
+
+	if err := cfg.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save config: %v", err))
+		return
+	}
+
+	// Hot-apply the change so a newly configured (or re-credentialed) channel
+	// starts serving immediately — no manual server restart.
+	s.reloadChannel(platform)
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
+}
+
+// handleDeleteChannel removes a platform config entirely.
+func (s *Server) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
+	platform := r.PathValue("platform")
+	if platform == "" {
+		writeError(w, http.StatusBadRequest, "missing platform name")
+		return
+	}
+
+	cfg, err := channel.LoadConfig()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	cfg.RemovePlatform(platform)
+	if err := cfg.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save config: %v", err))
+		return
+	}
+
+	// Stop the adapter now that its config is gone — no manual restart.
+	s.reloadChannel(platform)
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// handleTestChannel tests a connection to a platform with the given credentials.
+// Loads the saved config from ~/.octo/channels.yml rather than requiring a body,
+// since the frontend already stores the fields and just needs a validation trigger.
+func (s *Server) handleTestChannel(w http.ResponseWriter, r *http.Request) {
+	platform := r.PathValue("platform")
+
+	// Load the saved channel config and get the saved fields for this platform.
+	cfg, err := channel.LoadConfig()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load channel config: %v", err))
+		return
+	}
+
+	instances := cfg.Platform(platform)
+	if len(instances) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "no configuration saved for this platform"})
+		return
+	}
+
+	ctor, err := channel.Find(platform)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ad, err := ctor(instances[0].Config)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+
+	errs := ad.ValidateConfig(instances[0].Config)
+	if len(errs) > 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": strings.Join(errs, "; ")})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Configuration valid. Connection test requires runtime start."})
+}
+
+// handleAvailableChannels returns all registered adapter platforms.
+func (s *Server) handleAvailableChannels(w http.ResponseWriter, r *http.Request) {
+	platforms := channel.RegisteredPlatforms()
+	type availInfo struct {
+		Platform string   `json:"platform"`
+		Label    string   `json:"label"`
+		Fields   []string `json:"fields"`
+	}
+
+	// Field definitions per platform.
+	fieldDefs := map[string][]string{
+		"dingtalk": {"client_id", "client_secret", "allowed_users"},
+		"discord":  {"bot_token", "allowed_users"},
+		"feishu":   {"app_id", "app_secret", "domain", "allowed_users"},
+		"telegram": {"bot_token", "base_url", "parse_mode", "allowed_users"},
+		"wecom":    {"bot_id", "secret", "webhook_key", "allowed_users"},
+		"weixin":   {"base_url", "cred_path"},
+	}
+
+	labels := map[string]string{
+		"dingtalk": "DingTalk (钉钉)",
+		"discord":  "Discord",
+		"feishu":   "Feishu (飞书)",
+		"telegram": "Telegram",
+		"wecom":    "WeCom (企业微信)",
+		"weixin":   "WeChat (微信)",
+	}
+
+	out := make([]availInfo, 0, len(platforms))
+	for _, p := range platforms {
+		label := labels[p]
+		if label == "" {
+			label = p
+		}
+		fields := fieldDefs[p]
+		if fields == nil {
+			fields = []string{}
+		}
+		out = append(out, availInfo{Platform: p, Label: label, Fields: fields})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"channels": out})
+}
+
+// ─── Proactive send (used by the CLI messenger to delegate here) ────────────
+
+// handleChannelRecipients lists the chats the bot can currently push to (live
+// sessions + the persisted /bind table), so a CLI/remote client can resolve a
+// recipient the same way the in-process send_message tool does.
+func (s *Server) handleChannelRecipients(w http.ResponseWriter, r *http.Request) {
+	type recipient struct {
+		Platform string `json:"platform"`
+		ChatID   string `json:"chat_id"`
+		UserID   string `json:"user_id,omitempty"`
+		Active   bool   `json:"active"`
+		Bound    bool   `json:"bound"`
+	}
+	out := []recipient{}
+	if mgr := s.channelManager(); mgr != nil {
+		for _, kc := range mgr.KnownChats() {
+			out = append(out, recipient{kc.Platform, kc.ChatID, kc.UserID, kc.Active, kc.Bound})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"recipients": out})
+}
+
+// handleChannelSendText delivers a text message to a chat via the live adapter
+// (falling back to a one-shot send from config). Same path scheduled-task
+// notifications and the send_message tool use.
+func (s *Server) handleChannelSendText(w http.ResponseWriter, r *http.Request) {
+	platform := r.PathValue("platform")
+	var req struct {
+		ChatID string `json:"chat_id"`
+		Text   string `json:"text"`
+	}
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if strings.TrimSpace(req.ChatID) == "" || strings.TrimSpace(req.Text) == "" {
+		writeError(w, http.StatusBadRequest, "chat_id and text are required")
+		return
+	}
+	if err := s.channelSend(platform, req.ChatID, req.Text); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
+}
+
+// handleChannelSendFile delivers a local file to a chat. The path is read from
+// the server's own filesystem — the CLI client and serve run on the same host,
+// so no upload is needed.
+func (s *Server) handleChannelSendFile(w http.ResponseWriter, r *http.Request) {
+	platform := r.PathValue("platform")
+	var req struct {
+		ChatID string `json:"chat_id"`
+		Path   string `json:"path"`
+		Name   string `json:"name"`
+	}
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if strings.TrimSpace(req.ChatID) == "" || strings.TrimSpace(req.Path) == "" {
+		writeError(w, http.StatusBadRequest, "chat_id and path are required")
+		return
+	}
+	if err := s.channelSendFile(platform, req.ChatID, req.Path, req.Name); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+
+// channelStartupCheck reports whether a platform's adapter could start with
+// the given config: it must construct, pass ValidateConfig, and — for weixin,
+// whose credentials live outside channels.yml — have a readable credential
+// file (the check Start performs).
+func channelStartupCheck(platform string, cfg channel.PlatformConfig) error {
+	ctor, err := channel.Find(platform)
+	if err != nil {
+		return nil // unregistered platform: nothing to validate against
+	}
+	ad, err := ctor(cfg)
+	if err != nil {
+		return err
+	}
+	if errs := ad.ValidateConfig(cfg); len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	if platform == "weixin" {
+		credPath, _ := cfg["cred_path"].(string)
+		creds, err := ilink.LoadCredentials(credPath)
+		if err != nil || creds == nil {
+			return fmt.Errorf("no credentials — log in first (channel-manager setup weixin)")
+		}
+	}
+	return nil
+}
+
+func instanceToInfo(platform, adapterID string, ic channel.InstanceConfig) channelInfo {
+	fields := make(map[string]string)
+	for k, v := range ic.Config {
+		if k == "enabled" {
+			continue
+		}
+		s, ok := v.(string)
+		if !ok {
+			continue
+		}
+		if secretKeys[k] && len(s) > 4 {
+			s = maskSecret(s)
+		}
+		fields[k] = s
+	}
+
+	// Weixin keeps credentials in ~/.octo/weixin-credentials.json rather than
+	// channels.yml, so an empty field map can still mean "configured".
+	hasConfig := len(fields) > 0
+	if platform == "weixin" && !hasConfig {
+		if creds, err := ilink.LoadCredentials(fields["cred_path"]); err == nil && creds != nil {
+			hasConfig = true
+		}
+	}
+
+	return channelInfo{
+		Platform:  platform,
+		AdapterID: adapterID,
+		Enabled:   ic.Enabled,
+		HasConfig: hasConfig,
+		Fields:    fields,
+	}
+}
+
+// isAdapterRunning reports whether the platform adapter is currently active.
+func (s *Server) isAdapterRunning(platform string) bool {
+	_, ok := s.runningAdapters.Load(platform)
+	return ok
+}
+
+// maskSecret masks most of a secret string, keeping the first and last four
+// runes visible. It measures by runes so it never splits a multi-byte UTF-8
+// character (even though real secrets are usually ASCII).
+func maskSecret(s string) string {
+	r := []rune(s)
+	n := len(r)
+	if n <= 8 {
+		return strings.Repeat("*", n)
+	}
+	return string(r[:4]) + strings.Repeat("*", n-8) + string(r[n-4:])
+}

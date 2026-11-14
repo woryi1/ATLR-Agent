@@ -1,0 +1,146 @@
+package main
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/tools"
+)
+
+// noopSink is a ViewSink that ignores everything — lets runTurn run without a
+// terminal or spinner.
+type noopSink struct{}
+
+func (noopSink) TurnStarted()                            {}
+func (noopSink) Emit(agent.AgentEvent)                   {}
+func (noopSink) TurnEnded(agent.Reply, TurnStats, error) {}
+func (noopSink) Notice(string)                           {}
+func (noopSink) Ask(context.Context, UserPrompt) (UserResponse, error) {
+	return UserResponse{Cancelled: true}, nil
+}
+
+// TestRunTurn_PrependsIdleBgNote verifies the idle path: a background-completion
+// notice pushed via Steer while no turn was running is drained at the start of
+// the next turn and prepended to the user's message, so the model sees it.
+// (capturingSender is defined in repl_test.go.)
+func TestRunTurn_PrependsIdleBgNote(t *testing.T) {
+	cs := &capturingSender{stubSender: stubSender{reply: "ok"}}
+	a := agent.New(cs, "m")
+	// Simulate a background process finishing while the REPL was idle.
+	a.Inbox.Enqueue(tools.FormatBgNote(tools.BgExit{ID: "bg_1", Command: "go build ./...", Status: "exited: 0", NewOutput: "done"}))
+
+	cfg := replConfig{a: a} // no tools, no memStore, no hooks
+	if _, err := runTurn(context.Background(), a, cfg, noopSink{}, "what's next?"); err != nil {
+		t.Fatalf("runTurn: %v", err)
+	}
+
+	got := cs.lastUserContent()
+	if !strings.Contains(got, "Background process bg_1") {
+		t.Errorf("turn input missing the bg notice; got:\n%s", got)
+	}
+	if !strings.Contains(got, "what's next?") {
+		t.Errorf("turn input missing the user message; got:\n%s", got)
+	}
+	// The notice must precede the user's text (it's prepended context).
+	if i, j := strings.Index(got, "bg_1"), strings.Index(got, "what's next?"); i > j {
+		t.Errorf("bg notice should precede the user text; got:\n%s", got)
+	}
+	// Drained exactly once — nothing left for a second turn.
+	if a.Inbox.HasPending() {
+		t.Error("inbox should be empty after the turn drained it")
+	}
+}
+
+// TestTUI_BgExitMsgScrollbackNotice confirms an async background-exit message
+// returns a tea.Println command with a concise Claude-Code-style notice.
+func TestTUI_BgExitMsgScrollbackNotice(t *testing.T) {
+	m := newTestModel()
+	_, cmd := m.Update(bgExitMsg{e: tools.BgExit{ID: "bg_1", Command: "go test ./...", Status: "exited: 0"}})
+	if cmd == nil {
+		t.Fatal("bgExitMsg should return a non-nil cmd")
+	}
+	// bubbletea commands are opaque functions; we can't easily inspect the string
+	// they will print. Verify at least that a cmd is returned (smoke test).
+}
+
+// TestTUI_SubAgentNoteMsgScrollbackNotice confirms a completed async sub-agent
+// returns a scrollback command, mirroring the bgExitMsg/workflowNoteMsg paths.
+func TestTUI_SubAgentNoteMsgScrollbackNotice(t *testing.T) {
+	m := newTestModel()
+	_, cmd := m.Update(subAgentNoteMsg{ev: tools.SubAgentNotification{
+		AgentID:     "agent_2",
+		Description: "Background hello world",
+		Result:      "hello,world",
+	}})
+	if cmd == nil {
+		t.Fatal("subAgentNoteMsg should return a non-nil cmd")
+	}
+}
+
+// TestTUI_SubAgentNoteMsgIdleAutoTurn verifies that when the TUI is idle and a
+// sub-agent completion note is in the inbox, the message kicks an idle auto-turn
+// (the returned cmd is a sequence) rather than just flushing prints.
+func TestTUI_SubAgentNoteMsgIdleAutoTurn(t *testing.T) {
+	m := newTestModel()
+	m.a.Inbox.Enqueue(tools.FormatSubAgentNote(tools.SubAgentNotification{
+		AgentID:     "agent_3",
+		Description: "Idle auto-turn test",
+		Result:      "done",
+	}))
+	_, cmd := m.Update(subAgentNoteMsg{ev: tools.SubAgentNotification{
+		AgentID:     "agent_3",
+		Description: "Idle auto-turn test",
+		Result:      "done",
+	}})
+	if cmd == nil {
+		t.Fatal("subAgentNoteMsg should return a non-nil cmd when an idle auto-turn is possible")
+	}
+}
+
+// TestTUI_SubAgentNoteMsgStopReason verifies that a non-empty StopReason is
+// surfaced in the scrollback status line instead of the default "completed".
+func TestTUI_SubAgentNoteMsgStopReason(t *testing.T) {
+	m := newTestModel()
+	_, cmd := m.Update(subAgentNoteMsg{ev: tools.SubAgentNotification{
+		AgentID:     "agent_4",
+		Description: "Max turns test",
+		StopReason:  "max_turns",
+	}})
+	if cmd == nil {
+		t.Fatal("subAgentNoteMsg should return a non-nil cmd even when stopped")
+	}
+}
+
+// TestTUI_NoticeStylesByOutcome verifies the colour-selection helpers pick the
+// right style per outcome (green for success, red for failure). Forces the
+// lipgloss renderer to ANSI so output is deterministic in a test pipeline.
+func TestTUI_NoticeStylesByOutcome(t *testing.T) {
+	orig := lipgloss.DefaultRenderer().ColorProfile()
+	lipgloss.DefaultRenderer().SetColorProfile(termenv.ANSI)
+	defer lipgloss.DefaultRenderer().SetColorProfile(orig)
+
+	// Background task: clean exit → green, failed/killed → red.
+	green := bgExitNoticeStyle(tools.BgExit{Status: "exited: 0", Killed: false}).Render("x")
+	red := bgExitNoticeStyle(tools.BgExit{Status: "exited: 1", Killed: false}).Render("x")
+	redKilled := bgExitNoticeStyle(tools.BgExit{Status: "exited: 0", Killed: true}).Render("x")
+	if !strings.Contains(green, "\x1b[") {
+		t.Errorf("clean exit expected ANSI colour, got: %q", green)
+	}
+	if red == green {
+		t.Errorf("failed exit expected different (red) colour, got same %q", red)
+	}
+	if redKilled == green {
+		t.Errorf("killed exit expected different (red) colour, got same %q", redKilled)
+	}
+
+	// Workflow: done → green, error → red.
+	wfGreen := workflowNoticeStyle("done").Render("x")
+	wfRed := workflowNoticeStyle("error").Render("x")
+	if wfGreen == wfRed {
+		t.Errorf("workflow done vs error should differ, both: %q", wfGreen)
+	}
+}

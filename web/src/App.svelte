@@ -1,0 +1,834 @@
+<script lang="ts">
+  import { onMount } from 'svelte'
+  import { view, sessions, sessionGroups, pinnedSessions, collapsedSessions, activeSessionId, onboardPhase, openAgentSession, chatShowReasoning, globalPermissionMode, globalReasoningEffort, nativeShell, mobileShell, panelContent, panelExpanded, cmdkOpen, settingsModalOpen, createNewSession, clearPendingSessionOpts, isDesktopShell, readLastRoute, writeLastRoute, noteProjectSessionOpen, playSuperUnlock } from './lib/stores'
+  import MobileApp from './mobile/MobileApp.svelte'
+  import { pinnedLocale } from './mobile/language'
+  import { ws, wsState } from './lib/ws'
+
+  // sessionStorage, not localStorage: this marker is a once-per-tab affair.
+  // Key is namespaced like the rest of this build's storage.
+  const ONBOARD_LAUNCHED_KEY = 'atlr-onboard-launched'
+  import { notificationsEnabled } from './lib/notifications'
+  import { locale, t, tr, setLocale } from './lib/i18n'
+  import { checkAuth } from './lib/auth'
+  import { get } from 'svelte/store'
+  import * as api from './lib/api'
+  import { installExternalLinkInterceptor } from './lib/externalLinks'
+  import { installLaStorageBridge } from './lib/laStorage'
+  import { loadLanding, loadLightApps, onStartScreen } from './lib/stores'
+  import { startNativeHeartbeat } from './lib/nativeHeartbeat'
+  import { normalizeHash, hashPicksChatTarget } from './lib/hashRouting'
+  import { pruneSessions } from './lib/genui/panel-state'
+  import { onTurnEnded as onDiffTurnEnded, resetDiff } from './lib/diff'
+  import { globalKeyIntent } from './lib/globalKeys'
+  import { CENTER_MIN } from './lib/sidebarWidth'
+  import AuthGate from './components/overlays/AuthGate.svelte'
+  import FirstRunSetup from './components/overlays/FirstRunSetup.svelte'
+  import Header from './components/layout/Header.svelte'
+  import Sidebar from './components/layout/Sidebar.svelte'
+  import AgentsView from './views/AgentsView.svelte'
+  import ChatView from './views/ChatView.svelte'
+  import SuperUnlockOverlay from './components/overlays/SuperUnlockOverlay.svelte'
+  import SkillsView from './views/SkillsView.svelte'
+  import WorkflowsView from './views/WorkflowsView.svelte'
+  import BrowserView from './views/BrowserView.svelte'
+  import TasksView from './views/TasksView.svelte'
+  import McpView from './views/McpView.svelte'
+  import ChannelsView from './views/ChannelsView.svelte'
+  import LightAppsView from './views/LightAppsView.svelte'
+  import MountedApp from './components/MountedApp.svelte'
+  import CommandPalette from './components/overlays/CommandPalette.svelte'
+  import McpModal from './components/overlays/McpModal.svelte'
+  import SettingsModal from './components/overlays/SettingsModal.svelte'
+  import ConfirmModal from './components/overlays/ConfirmModal.svelte'
+  import ConfirmDialog from './components/overlays/ConfirmDialog.svelte'
+  import ArtifactModal from './components/ArtifactModal.svelte'
+  import ArtifactsPanel from './components/ArtifactsPanel.svelte'
+  import FeedbackModal from './components/overlays/FeedbackModal.svelte'
+  import Toast from './components/overlays/Toast.svelte'
+  import { touchSession, markSessionSeen, markActiveSessionSeenOnLeave, sessionTouchedAt } from './lib/unread'
+
+  // A phone may pin its own language over the server's (mobile/language.ts).
+  // Applied before the first render so the splash and onboarding use it too.
+  const pinned = mobileShell ? pinnedLocale() : null
+  if (pinned) setLocale(pinned)
+
+  // The session on screen is read by definition — this is the only place the
+  // sidebar's unread dot gets cleared. It re-marks on every list change and
+  // every observed turn ending rather than once on selection, so a reply that
+  // lands while the user is watching (or a refetch carrying the server's newer
+  // updated_at) can't leave a dot on the row they're looking at. Reading a
+  // session means having its transcript open: parked on the tasks view with a
+  // session still "active" behind it does not count, and switching back to
+  // chat re-runs this and clears it then.
+  $effect(() => {
+    void $sessions; void $sessionTouchedAt
+    const sid = $activeSessionId
+    if ($view !== 'chat' || !sid) return
+    markSessionSeen(sid)
+  })
+
+  // The effect above only runs on store changes, and a turn's end-of-turn file
+  // writes produce none the client can see — the fire-and-forget turn_ended is
+  // the sole re-mark, and a window closed (or a webview suspended) before it
+  // arrives leaves the seen mark behind the file's mtime: a phantom unread dot
+  // on next open for a session the user finished reading. Stamp the on-screen
+  // session seen as the page goes away.
+  onMount(() => markActiveSessionSeenOnLeave(() => get(view) === 'chat' ? get(activeSessionId) : null))
+
+  // The centre column swaps views with an instant {#if}. A 180ms opacity
+  // fade makes that read as a transition rather than a repaint. Opacity only
+  // — a transform here would turn <main> into a containing block for every
+  // position:fixed child inside the views.
+  let viewFade = $state(false)
+  let lastView = $view
+  $effect(() => {
+    const v = $view
+    if (v === lastView) return
+    lastView = v
+    viewFade = false
+    requestAnimationFrame(() => { viewFade = true })
+    const t = setTimeout(() => { viewFade = false }, 220)
+    return () => clearTimeout(t)
+  })
+
+  // The one-off theme animation: the same unlock video Super mode plays,
+  // opened on its first second as a still image.
+  //
+  // It belongs to FIRST-RUN SETUP, not to boot. The old trigger was the splash
+  // finishing, which fires on every launch — that is why it replayed every time.
+  // Now it plays at the single moment /api/onboard/status hands over from a
+  // setup phase (key_setup / soul_setup) to configured (''), i.e. when the
+  // onboarding panel closes. A launch that starts already configured never
+  // plays it, even if the localStorage marker was lost with the webview
+  // profile: the phase it starts on is the baseline, and only a real
+  // setup → done transition can fire the animation.
+  let introPhaseSeen: string | null = null
+  $effect(() => {
+    const phase = $onboardPhase
+    if (phase === 'unknown') return
+    if (introPhaseSeen === null) { introPhaseSeen = phase; return }
+    if (introPhaseSeen !== '' && phase === '') {
+      introPhaseSeen = ''
+      playIntroOnce()
+    }
+  })
+
+  function playIntroOnce(): void {
+    const KEY = 'atlr.super-intro.seen'
+    try {
+      if (localStorage.getItem(KEY)) return
+      localStorage.setItem(KEY, '1')
+    } catch { /* no storage: the phase guard already prevents repeats */ }
+    playSuperUnlock('intro')
+  }
+
+  // The Light App bridge is global, and used to be installed by whichever host
+  // happened to render. The artifacts panel is hidden by default, so a Light
+  // App opened as a mounted page had no message listener at all — its storage
+  // migration and its downloads both went nowhere. It belongs here: one
+  // listener, for as long as the app runs.
+  onMount(() => {
+    installLaStorageBridge()
+  })
+
+  // The start screen is read from a file (~/.octo/landing/config.json) that
+  // the user edits by hand — and that the agent writes itself when asked to
+  // make that screen theirs. Its hero app and pinned shortcuts resolve against
+  // the installed Light Apps, which the agent can add to in the same breath,
+  // so both are re-read together.
+  //
+  // Whenever that screen comes into view, and again when the window regains
+  // focus while it is showing: the edit usually happens in another window, and
+  // the desktop shell has no refresh to fall back on. This also covers the
+  // first read, since the effect runs at mount.
+  function readStartScreen() {
+    void loadLanding()
+    void loadLightApps()
+  }
+  const startScreenShowing = $derived(onStartScreen($view, $activeSessionId, mobileShell))
+  $effect(() => {
+    if (startScreenShowing) readStartScreen()
+  })
+  // The installed list is re-read on every focus, not only on the start
+  // screen: the sidebar's mounted entries come from it too, and a manifest
+  // edited outside this window (by hand, or by a turn another client ran)
+  // shows up when the user comes back. Turns this UI hears end with a re-read
+  // of their own (session_activity below).
+  onMount(() => {
+    const onFocus = () => {
+      if (onStartScreen(get(view), get(activeSessionId), mobileShell)) readStartScreen()
+      else void loadLightApps()
+    }
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  })
+
+  // Switching chats must never leave the previous session's diff on screen: the
+  // panel is per-session, and a stale patch list reads as this session's work.
+  $effect(() => {
+    void $activeSessionId
+    resetDiff()
+  })
+
+  // Remember the open session inside its project, so entering that project
+  // again (and the next cold start) reopens it instead of the blank
+  // new-session page. Runs on every activation, including ones restored from
+  // the hash or the last-route fallback.
+  $effect(() => {
+    const sid = $activeSessionId
+    void $sessionGroups
+    if (sid && $view === 'chat') noteProjectSessionOpen(sid)
+  })
+
+  let booted = false
+  // Set when the server requires an access key the user couldn't provide; the
+  // app shows a denied splash instead of booting.
+  let authDenied = $state(false)
+
+  // ── URL routing ─────────────────────────────────────────────────────────────
+  // Reflect the current view (and active chat session) in the hash so a refresh
+  // lands back where the user was instead of the default chat view.
+  let routeReady = false
+  // The "restore where the user left off" fallback below fires at most once,
+  // on the first session list of the boot — and not at all when the URL
+  // already names the chat target. After that the active session belongs to
+  // the user: a later list (another tab creating a session, a WS reconnect)
+  // must not yank them off the new-session landing page, nor out of the empty
+  // state a delete leaves behind. Read synchronously at module init, before
+  // any list can arrive.
+  let autoSelectDone = typeof location !== 'undefined' && hashPicksChatTarget(location.hash)
+  const VALID_VIEWS = ['chat', 'agents', 'skills', 'workflows', 'browser', 'tasks', 'mcp', 'channels', 'lightapps']
+
+  function applyHash() {
+    const h = location.hash.replace(/^#\/?/, '')
+    if (!h) return
+    const [v, ...rest] = h.split('/')
+    // The desktop shell's tray "Settings" item navigates to #settings; the
+    // full-page view became a modal (settings modal redesign, PR #1955), so
+    // route the hash to the modal instead of a VALID_VIEWS entry. Normalize
+    // the hash back to the current view so a reload doesn't re-open the modal.
+    if (v === 'settings') {
+      settingsModalOpen.set(true)
+      const hash = normalizeHash(get(view), get(activeSessionId))
+      history.replaceState(null, '', location.pathname + location.search + hash)
+      return
+    }
+    // The desktop tray's "New Session" item navigates to #new (see
+    // nativeBridge.openNewSession). Desktop-gated: under a plain browser this
+    // hash is unreachable from the shell, so don't let a hand-typed #new open
+    // the landing page there. createNewSession() re-normalizes the hash to
+    // #/chat, so a reload won't loop back into #new.
+    if (v === 'new' && isDesktopShell) {
+      // Claim the auto-select slot before opening the landing page. Reaching
+      // #new from the tray with the window closed loads the page at this hash
+      // from scratch, so the session list is still on its way; without this it
+      // would arrive to an unset activeSessionId and helpfully open the most
+      // recent session, throwing away the new-session the user just asked for.
+      // (Nothing overwrites it any more — this used to be covered by
+      // createNewSession awaiting a POST and setting the id itself.)
+      autoSelectDone = true
+      createNewSession()
+      return
+    }
+    // A mounted Light App is a view named `app:<slug>`, which no fixed list can
+    // enumerate — the set changes with ~/.octo/light-apps. The prefix is what
+    // makes that safe: it cannot collide with a built-in view name, and the
+    // frame itself refuses a slug that is not installed.
+    if (!VALID_VIEWS.includes(v) && !v.startsWith('app:')) return
+    if (get(view) !== v) view.set(v)
+    if (v === 'chat' && rest[0]) {
+      const sid = decodeURIComponent(rest[0])
+      if (get(activeSessionId) !== sid) activeSessionId.set(sid)
+    }
+  }
+
+  // Navigating to a different view closes the artifacts panel — expanded, it
+  // would otherwise keep covering the content area the new view just took
+  // over (the main column stays display:none while the panel is expanded).
+  // Guarded on an actual change: view.set re-fires subscribers on same-value
+  // sets, and flows that open the panel without navigating (a Light App
+  // opening over its own view, the header/palette toggles) must not be undone.
+  let prevView = get(view)
+  view.subscribe(v => {
+    if (v === prevView) return
+    prevView = v
+    panelExpanded.set(false)
+    panelContent.set(null)
+  })
+
+  onMount(() => {
+    // Access-key gate, BEFORE any gated call. Loopback visits pass instantly
+    // (the server exempts them); a networked server without a valid key prompts
+    // via the AuthGate overlay. A denied result blocks boot with a message.
+    let cancelled = false
+    // Desktop shell: send http(s) link clicks to the system browser (the
+    // webview can't open target="_blank" itself). Inert in a real browser.
+    const uninstallLinks = installExternalLinkInterceptor()
+    // Desktop shell: report page liveness so the shell can revive a dead or
+    // black webview instead of foregrounding it. Inert in a real browser.
+    const stopHeartbeat = startNativeHeartbeat()
+    // Drop persisted GenUI panel state for sessions that no longer exist. The
+    // session list is the natural GC point: it is when a deletion made
+    // anywhere else first becomes visible to this client.
+    //
+    // Note this subscription fires immediately with the store's initial [],
+    // before the list has been fetched. pruneSessions ignores an empty list
+    // for exactly that reason — see the comment there.
+    const stopPanelGC = sessions.subscribe(list => pruneSessions(list.map(s => s.id)))
+    const cleanup = () => { cancelled = true; uninstallLinks(); stopHeartbeat(); stopPanelGC(); ws.disconnect() }
+    // The onboard-status read is issued alongside the auth probe rather than
+    // after it, taking one serial round trip out of every cold start. checkAuth
+    // goes first: it runs synchronously up to its first await, which is where a
+    // stored or ?access_key= key is seeded into the cookie — so the early read
+    // already carries it. On loopback both pass at once. A networked server
+    // with no key yet rejects the early read until the prompt has completed,
+    // so a failed early read is retried once auth is settled — same outcome,
+    // one fewer hop on the common path.
+    const auth = checkAuth()
+    const earlyStatus = api.getOnboardStatus().catch(() => null)
+    auth.then(async ok => {
+      if (cancelled) return
+      if (!ok) {
+        authDenied = true
+        return
+      }
+      // First-run gate: decide the onboard phase BEFORE booting the main UI so it
+      // never flashes behind the setup panel. Default to '' on error so a status
+      // hiccup doesn't trap a configured user behind a blank splash.
+      let status = await earlyStatus
+      if (!status) {
+        try {
+          status = await api.getOnboardStatus()
+        } catch {
+          status = null
+        }
+      }
+      onboardPhase.set(status?.phase ?? '')
+    })
+    return cleanup
+  })
+
+  // Boot the normal UI once onboarding doesn't block it. 'key_setup' holds here
+  // until FirstRunSetup completes and flips the phase to ''.
+  $effect(() => {
+    const phase = $onboardPhase
+    if (booted || phase === 'unknown' || phase === 'key_setup') return
+    booted = true
+    bootMain()
+    if (phase === 'soul_setup') maybeLaunchOnboard()
+  })
+
+  // Write the current view/session to the hash on navigation (once the initial
+  // hash has been restored, and only while the main UI is showing). Also
+  // remember it in localStorage — the hash itself doesn't survive the tab or
+  // window closing, but a later cold start's fallback (below) reads this to
+  // put the user back where they left off.
+  $effect(() => {
+    const v = $view, sid = $activeSessionId, phase = $onboardPhase
+    if (!routeReady || phase === 'unknown' || phase === 'key_setup') return
+    const hash = normalizeHash(v, sid)
+    if (location.hash !== hash) location.hash = hash
+    writeLastRoute(v, sid)
+  })
+
+  function bootMain() {
+    ws.connect()
+
+    // Restore the persisted UI language from server config so a refresh
+    // keeps the user's locale choice. Also seed globalPermissionMode and
+    // globalReasoningEffort, so the Composer's no-active-session fallback
+    // shows the real configured defaults instead of a hardcoded guess.
+    api.getConfig().then(cfg => {
+      // Read the pin live: it may have been set while this was in flight.
+      if (cfg.language && !(mobileShell && pinnedLocale())) setLocale(cfg.language)
+      // PR5: permission_mode is global (was per-default-entry before). The
+      // Composer reads this to seed its no-active-session fallback.
+      if (cfg.permission_mode) globalPermissionMode.set(cfg.permission_mode)
+      // reasoning_effort is likewise global; the server normalizes an unset
+      // value to the literal "off" in this response (see handleGetConfig).
+      if (cfg.reasoning_effort) globalReasoningEffort.set(cfg.reasoning_effort)
+    }).catch(() => { /* non-critical */ })
+
+    ws.on('session_update', (ev: any) => {
+      // permission_mode is per-session (each session has its own, only
+      // inheriting the global default at creation) — a mode change only
+      // ever broadcasts to the one session it was changed on, so this stays
+      // a plain per-session merge like every other field here.
+      sessions.update(list =>
+        list.map(s => s.id === ev.session_id
+          ? {
+              ...s,
+              status: ev.status ?? s.status,
+              context_usage: ev.context_usage ?? s.context_usage,
+              show_reasoning: typeof ev.show_reasoning === 'boolean' ? ev.show_reasoning : s.show_reasoning,
+              permission_mode: typeof ev.permission_mode === 'string' ? ev.permission_mode : s.permission_mode,
+              reasoning_effort: typeof ev.reasoning_effort === 'string' ? ev.reasoning_effort : s.reasoning_effort,
+            }
+          : s
+        )
+      )
+      if (typeof ev.show_reasoning === 'boolean') {
+        chatShowReasoning.update(m => ({ ...m, [ev.session_id]: ev.show_reasoning }))
+      }
+    })
+
+    ws.on('session_deleted', (ev: any) => {
+      sessions.update(list => list.filter(s => s.id !== ev.session_id))
+      if (get(activeSessionId) === ev.session_id) {
+        activeSessionId.set(null)
+        clearPendingSessionOpts()
+        // A session deleted by another entry (e.g. another tab or the CLI)
+        // should not leave the chat view stuck on a bound-to-another-entry
+        // banner. Reset to the default chat landing.
+        view.set('chat')
+      }
+    })
+
+    // Pull the authoritative session list from the server into the stores.
+    // Shared by the reconciliation paths below; never touches activeSessionId.
+    const refreshSessionsFromServer = () => {
+      api.listSessions().then((data: any) => {
+        const list = data.sessions ?? []
+        sessions.set(list)
+        chatShowReasoning.update(m => {
+          const next = { ...m }
+          for (const s of list) {
+            if (typeof s.show_reasoning === 'boolean') next[s.id] = s.show_reasoning
+          }
+          return next
+        })
+      }).catch(() => { /* non-critical: WS fast paths already ran */ })
+    }
+
+    // Auto-title: a global broadcast carrying the freshly generated name, so
+    // the sidebar reflects the rename live instead of showing the stale title
+    // until a reload.
+    ws.on('session_renamed', (ev: any) => {
+      if (!ev.name) return
+      sessions.update(list =>
+        list.map(s => s.id === ev.session_id
+          ? { ...s, title: ev.name, name: ev.name }
+          : s
+        )
+      )
+      // Double-check against the server: the store mutation above is the fast
+      // path, but if a slow-consumer drop or a UI reactivity gap hides the
+      // rename, the next REST list will reconcile the sidebar.
+      refreshSessionsFromServer()
+    })
+
+    // A session created outside this tab's own actions — a scheduled cron
+    // fire filing a fresh session into its task's group, or a branch/fork
+    // made in another tab. Every other broadcast about that session is
+    // per-session and dropped for tabs that never subscribed to it, so this
+    // is the one signal an open sidebar gets: refetch both the session list
+    // AND the groups snapshot (which is otherwise only ever fetched once, at
+    // sidebar mount) so the session appears already inside its group (#1699).
+    ws.on('session_created', () => {
+      refreshSessionsFromServer()
+      api.listSessionGroups().then(org => sessionGroups.set(org.groups)).catch(() => { /* non-critical */ })
+    })
+
+    // Synthesized by the WS manager on every reconnect (ws.ts): the socket
+    // has no backlog, so session_activity events broadcast while this tab was
+    // disconnected are gone for good, and with them the turn_ended that would
+    // have refreshed a row's unread state. Refetching the list lands the
+    // server's real updated_at, and the unread effect re-marks the session on
+    // screen — healing both missed dots and phantom ones.
+    ws.on('session_list_reload', refreshSessionsFromServer)
+
+    // The group registry changed — in this tab or another (a group edit, a
+    // membership move, a pin, a project's working directory or notes). The
+    // groups snapshot is otherwise fetched once at sidebar mount, so without
+    // this a project directory retargeted in one tab stays stale in every
+    // other: the sidebar header keeps the old path and the composer chip of
+    // member sessions (which derives from the groups store) misleads about
+    // where tools actually run. The event carries no payload by design —
+    // refetch, so there's no registry shape to mirror client-side.
+    ws.on('session_groups_changed', () => {
+      api.listSessionGroups().then(org => {
+        sessionGroups.set(org.groups)
+        pinnedSessions.set(org.pinned)
+        collapsedSessions.set(org.collapsed)
+      }).catch(() => { /* non-critical; next mount refetches */ })
+    })
+
+    // session_activity is a lightweight global signal (unlike
+    // request_user_question/session_update/complete, which only reach tabs
+    // subscribed to that exact session) — it's how a tab looking at session B
+    // learns that session A got a question or finished replying. Drives both
+    // the sidebar's pending-question badge and the desktop notification.
+    ws.on('session_activity', (ev: any) => {
+      const sid = ev.session_id
+      if (!sid) return
+      if (ev.kind === 'question_pending' || ev.kind === 'question_resolved') {
+        sessions.update(list => list.map(s =>
+          s.id === sid ? { ...s, pending_question: ev.kind === 'question_pending' } : s
+        ))
+      }
+      // Approval analogue — drives the mobile feed's needs-approval card for a
+      // session the client isn't subscribed to.
+      if (ev.kind === 'confirm_pending' || ev.kind === 'confirm_resolved') {
+        sessions.update(list => list.map(s =>
+          s.id === sid ? { ...s, pending_confirmation: ev.kind === 'confirm_pending' } : s
+        ))
+      }
+      // A finished turn left something in that session to read. Stamped
+      // unconditionally: the effect at the top of this file immediately
+      // un-marks it again if it's the session on screen. Must run BEFORE the
+      // sessions.update below — that update synchronously triggers
+      // reconcileSeen, and a fresh browser's seen baseline has to cover this
+      // touch or the row flashes a phantom unread dot.
+      if (ev.kind === 'turn_ended') touchSession(sid)
+      // Running-state pair — keeps the sidebar's activity spinner live for
+      // sessions this tab isn't subscribed to (session_update carries status
+      // only to subscribers).
+      if (ev.kind === 'turn_started' || ev.kind === 'turn_ended') {
+        sessions.update(list => list.map(s => {
+          if (s.id !== sid) return s
+          if (ev.kind === 'turn_started') return { ...s, status: 'running' }
+          // Also stamp updated_at: no broadcast carries the server's value, so
+          // without this the sidebar's relative timestamp keeps aging from the
+          // last REST fetch even as the user chats. The local clock stands in
+          // until the next list refetch reconciles with the server's mtime.
+          return { ...s, status: 'idle', updated_at: new Date().toISOString() }
+        }))
+      }
+      // The agent just finished changing files. Re-render the Git Diff panel if
+      // it's open on this session, or move its badge if it isn't — that pair is
+      // the whole refresh story, no polling anywhere. The agent may also have
+      // written a Light App's manifest (mounted it, say), so the installed list
+      // the sidebar reads is re-read too — the window usually kept focus the
+      // whole turn, and the desktop shell has no refresh.
+      if (ev.kind === 'turn_ended') {
+        onDiffTurnEnded(sid)
+        void loadLightApps()
+      }
+      if (ev.kind === 'question_pending' || ev.kind === 'confirm_pending' || ev.kind === 'turn_complete') {
+        notifyForSessionActivity(sid, ev.kind)
+      }
+    })
+
+    // The sidebar's only source of session rows — nothing pushes the list
+    // over the WS, only per-session deltas (session_update / session_activity).
+    api.listSessions().then((data: any) => {
+      const list = data.sessions ?? []
+      if (list.length > 0) {
+        sessions.set(list)
+        chatShowReasoning.update(m => {
+          const next = { ...m }
+          for (const s of list) {
+            if (typeof s.show_reasoning === 'boolean') next[s.id] = s.show_reasoning
+          }
+          return next
+        })
+        if (!autoSelectDone) {
+          autoSelectDone = true
+          if (!get(activeSessionId)) {
+            // Restore the page the user was last on, not "whichever session
+            // is most recently touched" — that ranking can change from
+            // background activity the user never looked at. If the
+            // remembered session was deleted since, or nothing was ever
+            // remembered, stay on the landing page (view/activeSessionId
+            // already default there) rather than guessing a replacement.
+            const last = readLastRoute()
+            if (last?.sid && list.some((s: any) => s.id === last.sid)) {
+              if (VALID_VIEWS.includes(last.view) && get(view) !== last.view) view.set(last.view)
+              activeSessionId.set(last.sid)
+            } else if (last?.view && last.view !== 'chat' && VALID_VIEWS.includes(last.view) && get(view) === 'chat') {
+              view.set(last.view)
+            }
+          }
+        }
+      }
+    }).catch(() => { /* non-critical: an empty sidebar, not a broken page */ })
+
+    // Restore the view/session from the URL now — synchronously, before the
+    // WS/REST auto-select above resolves (both guard on activeSessionId being
+    // unset, and autoSelectDone already accounts for a chat hash, so this
+    // wins). Then start tracking forward/back + manual edits.
+    applyHash()
+    routeReady = true
+    window.addEventListener('hashchange', applyHash)
+  }
+
+  // Cooldown per (session, kind) — a session with a tight /loop interval
+  // completes turns every 60s+ with no new user input each time, which would
+  // otherwise fire a notification every single iteration. Keyed separately
+  // per kind so a burst of turn_complete pings can't suppress a genuinely
+  // distinct question_pending, or vice versa.
+  const NOTIFY_COOLDOWN_MS = 5 * 60 * 1000
+  const lastNotifiedAt: Record<string, number> = {}
+
+  // Browser notifications this page fired, keyed by session — the only handle
+  // we have for retracting one once the user is looking at that session.
+  const sessionNotifications = new Map<string, Notification>()
+
+  // A session's notification has served its purpose once the user is looking
+  // at that session in a focused window — retract it so it doesn't linger in
+  // the notification center. Idempotent and best-effort on both paths; on the
+  // native path the desktop shell maps the session to the notification ID.
+  function dismissSessionNotification(sid: string) {
+    sessionNotifications.get(sid)?.close()
+    sessionNotifications.delete(sid)
+    if (get(nativeShell)) api.nativeDismissNotify(sid).catch(() => {})
+  }
+
+  // Reading a session means having its transcript open in a focused window:
+  // switching to the chat while focused clears the notification, as does
+  // refocusing the window already parked on it. The effect only re-runs on
+  // store changes (document.hasFocus() is not reactive), hence the listener.
+  $effect(() => {
+    const sid = $activeSessionId
+    if ($view !== 'chat' || !sid || !document.hasFocus()) return
+    dismissSessionNotification(sid)
+  })
+  onMount(() => {
+    const onFocus = () => {
+      const sid = get(activeSessionId)
+      if (get(view) === 'chat' && sid) dismissSessionNotification(sid)
+    }
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  })
+
+  // Desktop notification for a session_activity the user isn't already
+  // looking at in a focused tab — if they are, they'd see it happen live and
+  // a notification would just be noise. No-op unless the user has the
+  // Desktop Notifications preference on AND has granted browser permission.
+  function notifyForSessionActivity(sid: string, kind: 'question_pending' | 'confirm_pending' | 'turn_complete') {
+    if (!get(notificationsEnabled)) return
+    const native = get(nativeShell)
+    // The browser Notification API doesn't work in the desktop webview; native
+    // mode routes to the OS via the bridge, so only gate on browser permission
+    // for the browser path.
+    if (!native && (!('Notification' in window) || Notification.permission !== 'granted')) return
+    const viewingThisSession = document.hasFocus() && get(view) === 'chat' && get(activeSessionId) === sid
+    if (viewingThisSession) return
+    // When the user is in the app (document focused) but viewing a DIFFERENT
+    // session, the in-app question note handles question_pending /
+    // confirm_pending — don't also fire an OS notification, that's duplicate
+    // noise. Only turn_complete surfaces as an OS notification while in-app
+    // (there's no in-app note for it). When the user is away from the app
+    // (tab hidden/minimized), all kinds fire as before.
+    if (document.hasFocus() && (kind === 'question_pending' || kind === 'confirm_pending')) return
+    const cooldownKey = `${sid}:${kind}`
+    const now = Date.now()
+    if (now - (lastNotifiedAt[cooldownKey] ?? 0) < NOTIFY_COOLDOWN_MS) return
+    lastNotifiedAt[cooldownKey] = now
+    const sess = get(sessions).find(s => s.id === sid)
+    const title = sess?.name || sess?.title || sid
+    const bodyKey = kind === 'question_pending' ? 'header.notif_question_body'
+      : kind === 'confirm_pending' ? 'header.notif_confirm_body'
+      : 'header.notif_turn_complete_body'
+    const body = tr(bodyKey)
+    if (native) {
+      // The native notification carries this session id so the desktop shell
+      // routes to it on click. Browser path handles the click in-page below.
+      api.nativeNotify(title, body, sid).catch(() => {})
+      return
+    }
+    const n = new Notification(title, { body, tag: `octo-session-${sid}` })
+    // Keep the live notification addressable per session so opening the chat
+    // (or refocusing the window on it) can retract a banner that's done its
+    // job — dismissSessionNotification above. The tag also makes a repeat
+    // notification for the same session replace rather than stack.
+    sessionNotifications.get(sid)?.close()
+    sessionNotifications.set(sid, n)
+    n.onclick = () => {
+      window.focus()
+      activeSessionId.set(sid)
+      view.set('chat')
+      n.close()
+      sessionNotifications.delete(sid)
+    }
+  }
+
+  // soul_setup: key present, no identity yet → auto-launch one /onboard chat.
+  // sessionStorage guards against a same-tab refresh spawning a second
+  // session; markOnboardAttempted persists a server-side marker file so closing
+  // the tab (or interrupting the chat) doesn't re-nudge on the next load either
+  // — the server stops reporting phase 'soul_setup' once it's set (#1660). Await
+  // the marker BEFORE opening the chat so an immediately-closed first run can't
+  // race the write and re-nudge on reopen.
+  async function maybeLaunchOnboard() {
+    if (sessionStorage.getItem(ONBOARD_LAUNCHED_KEY)) return
+    sessionStorage.setItem(ONBOARD_LAUNCHED_KEY, '1')
+    await api.markOnboardAttempted().catch(() => {})
+    const lang = get(locale).startsWith('zh') ? 'zh' : 'en'
+    openAgentSession(`/onboard lang:${lang}`, tr('onboard.session_title')).catch(() => {})
+  }
+
+  // Cmd/Ctrl+K toggles the command palette — the Header pill advertises the
+  // shortcut, and it fires even while an input has focus (palette convention).
+  // Cmd/Ctrl+N starts a new session — a native desktop-shell bind. Under a
+  // plain browser Cmd+N is a reserved browser shortcut (new window) the page
+  // never sees, so the handler is gated to the Wails shell (isDesktopShell)
+  // where the keypress actually reaches the page and is safe to claim. The
+  // key→intent mapping lives in lib/globalKeys for unit testing.
+  function onGlobalKeydown(e: KeyboardEvent) {
+    const intent = globalKeyIntent(e, { shell: isDesktopShell })
+    if (intent === 'palette') {
+      e.preventDefault()
+      cmdkOpen.update(v => !v)
+    } else if (intent === 'new-session') {
+      e.preventDefault()
+      createNewSession()
+    }
+  }
+
+  // The center column's floor is CENTER_MIN, but only up to whatever room the
+  // sidebar actually leaves — a plain constant would force overflow on a
+  // screen narrower than sidebar-width + CENTER_MIN (a phone browser, or a
+  // desktop window between the 'full'-sidebar breakpoint and CENTER_MIN's own
+  // width). Sidebar's <aside> is `.content`'s first child regardless of its
+  // mode (full/rail/hidden), so measuring it live covers all three without
+  // duplicating their width constants here.
+  let contentEl = $state<HTMLElement | null>(null)
+  let mainMinWidth = $state(CENTER_MIN)
+  $effect(() => {
+    function recompute() {
+      const sideEl = contentEl?.firstElementChild as HTMLElement | null
+      const sideW = sideEl?.getBoundingClientRect().width ?? 0
+      const rowW = contentEl?.getBoundingClientRect().width ?? window.innerWidth
+      mainMinWidth = Math.max(0, Math.min(CENTER_MIN, rowW - sideW))
+    }
+    recompute()
+    window.addEventListener('resize', recompute)
+    return () => window.removeEventListener('resize', recompute)
+  })
+</script>
+
+<svelte:window onkeydown={onGlobalKeydown} />
+
+{#if authDenied}
+  <div class="splash splash-msg">{$t('auth.denied')}</div>
+{:else if $onboardPhase === 'unknown'}
+  <div class="splash"><div class="spinner"></div></div>
+{:else if $onboardPhase === 'key_setup'}
+  <FirstRunSetup />
+{:else if mobileShell}
+<MobileApp />
+{:else}
+<div class="app">
+  <div class="content" bind:this={contentEl}>
+    <Sidebar />
+    <!-- Yield the width only while the panel is actually there to take it:
+         an expanded flag left over from a closed panel would hide the main
+         column with nothing rendered beside it, i.e. a blank page. -->
+    <main class="main" class:yielded={$panelExpanded && !!$panelContent} class:view-fade={viewFade} style="min-width:{$panelContent ? 0 : mainMinWidth}px">
+      <Header />
+      {#if $view === 'chat'}
+        <ChatView />
+      {:else if $view === 'agents'}
+        <AgentsView />
+      {:else if $view === 'skills'}
+        <SkillsView />
+      {:else if $view === 'workflows'}
+        <WorkflowsView />
+      {:else if $view === 'browser'}
+        <BrowserView />
+      {:else if $view === 'tasks'}
+        <TasksView />
+      {:else if $view === 'mcp'}
+        <McpView />
+      {:else if $view === 'channels'}
+        <ChannelsView />
+      {:else if $view === 'lightapps'}
+        <LightAppsView />
+      {:else if $view.startsWith('app:')}
+        <!-- A Light App mounted as its own page. The `app:` prefix keeps a
+             slug from ever colliding with a built-in view name. -->
+        <MountedApp slug={$view.slice(4)} />
+      {/if}
+    </main>
+    {#if $panelContent}
+      <ArtifactsPanel />
+    {/if}
+  </div>
+</div>
+{/if}
+
+<AuthGate />
+<CommandPalette />
+<McpModal />
+<SettingsModal />
+<!-- Mobile approves via its own ApprovalDetail (web/src/mobile); suppress the
+     desktop confirmation overlay there so it doesn't double up. -->
+{#if !mobileShell}<ConfirmModal />{/if}
+<!-- The unlock animation sits above everything else in the app. -->
+<SuperUnlockOverlay />
+<ConfirmDialog />
+<ArtifactModal />
+<FeedbackModal />
+<Toast />
+
+<style>
+/* height 100% (via the html/body/#app chain), NOT 100vh: viewport units are
+   not compensated for the root zoom the font-size setting applies, so 100vh
+   under zoom 1.1 paints 110% of the viewport and clips the composer. */
+.app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-layout);
+  overflow: hidden;
+}
+.content {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+/* min-width comes from the inline style (mainMinWidth) rather than a fixed
+   value here, and only applies while the panel is closed: with the panel
+   open, its own resize clamp (ArtifactsPanel.svelte) already keeps this
+   column at CENTER_MIN whenever there's room, and — in the rare case there
+   isn't room for both minimums — shrinks itself to PANEL_MIN rather than
+   this column giving up its floor, which would just push the panel
+   off-screen instead. A hard floor here would fight that trade-off.
+   With the panel closed this is the only flexible column, so a floor
+   applies — but capped at whatever the sidebar actually leaves (see
+   mainMinWidth above), not a blind CENTER_MIN: on a screen narrower than
+   sidebar + CENTER_MIN (a phone browser, mainly), a plain constant would
+   force the same overflow this was meant to prevent, just from the other
+   side. */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+/* Gives its width to an expanded artifacts panel. display:none rather than
+   unmounting the view: the conversation keeps its scroll position, its
+   in-flight turn and its composer draft, so collapsing the panel comes back
+   to exactly what was there. */
+.main.yielded { display: none; }
+/* View-swap fade. Starts part-way up so it never reads as a flash to black;
+   180ms is long enough to soften the swap, short enough to stay out of the
+   way of fast navigation. */
+.main.view-fade { animation: app-view-in 200ms cubic-bezier(0.22, 1, 0.36, 1); }
+@keyframes app-view-in {
+  from { opacity: 0.2; }
+  to   { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .main.view-fade { animation: none; }
+}
+.splash {
+  height: 100%; display: flex; align-items: center; justify-content: center;
+  background: var(--bg-layout);
+}
+.splash-msg {
+  padding: 24px; text-align: center;
+  font-size: 14px; line-height: 1.6; color: var(--text-secondary);
+  max-width: 420px; margin: 0 auto;
+}
+.splash .spinner {
+  width: 28px; height: 28px; border: 3px solid var(--blue-2);
+  border-top-color: var(--blue-6); border-radius: 50%;
+  animation: octo-spin 0.7s linear infinite;
+}
+@keyframes octo-spin { to { transform: rotate(360deg); } }
+</style>

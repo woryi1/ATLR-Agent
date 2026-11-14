@@ -1,0 +1,791 @@
+package tools
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/panics"
+)
+
+// maxBgOutputBytes caps how much output is retained per background process.
+// Beyond this we keep only the most recent bytes (a long-running server's tail
+// is what matters); Read reports when earlier output was dropped.
+const maxBgOutputBytes = 1 << 20 // 1 MiB
+
+// Anti-polling window shared by Read and Tail. Within a 30-second window, 3 or
+// more empty reads on a running process trigger a block, giving the LLM a hard
+// hint to stop polling and wait for the automatic completion notification.
+const pollWindow = 30 * time.Second
+const maxEmptyPolls = 3
+
+// BackgroundMode distinguishes the two kinds of tracked background processes
+// the terminal tool can launch. Async processes run a one-shot task and notify
+// the model on completion; interactive processes are long-running services or
+// REPLs that the model may observe or feed via terminal_output / terminal_input.
+type BackgroundMode string
+
+const (
+	// BgModeAsync is for one-shot tasks (tests, builds, installs). The model
+	// must not poll them; completion is pushed automatically.
+	BgModeAsync BackgroundMode = "async"
+	// BgModeInteractive is for long-running services and REPLs (rails c,
+	// octo serve). The model may use terminal_output and terminal_input.
+	BgModeInteractive BackgroundMode = "interactive"
+)
+
+// bgProcess tracks one detached command launched via BackgroundManager.
+type bgProcess struct {
+	id      string
+	command string
+	mode    BackgroundMode
+	cancel  context.CancelFunc
+	proc    *os.Process // set after Start; used for hard-kill
+	start   time.Time
+
+	mu       sync.Mutex
+	buf      []byte // most recent <= maxBgOutputBytes of combined stdout+stderr
+	produced int64  // total bytes ever written to the logical stream
+	readOff  int64  // absolute offset already returned by Read
+	done     bool
+	end      time.Time // set when the process exits; used for accurate elapsed time in listings
+	exitErr  error
+	killed   bool // set by terminate(): the process was deliberately killed, not self-exited
+
+	// Anti-polling: time-window based. Within a 30-second window, 3 or more
+	// empty reads on a running process trigger a block. This allows occasional
+	// status checks on long-running services without penalising the model.
+	firstEmptyPoll time.Time
+	emptyPollCount int
+
+	// Anti-polling for Tail (terminal_output). Same window/count threshold as
+	// Read, but tracked independently because Tail snapshots the buffer without
+	// advancing the read cursor.
+	firstEmptyTailPoll time.Time
+	emptyTailPollCount int
+
+	onLine func(string) // optional real-time callback for sync-mode streaming
+
+	// stdin is the write end of the pipe attached to the process's stdin.
+	// Set after Start for background processes that need interactive input.
+	stdin io.WriteCloser
+
+	// visible controls whether the process appears in ListRunning /
+	// RunningBackground. Sync-started processes are hidden until they time
+	// out and become true background tasks, so the TUI "background (N)"
+	// panel doesn't flicker during a normal synchronous call.
+	visible bool
+}
+
+func (p *bgProcess) append(b []byte) {
+	p.mu.Lock()
+	p.produced += int64(len(b))
+	p.buf = append(p.buf, b...)
+	if len(p.buf) > maxBgOutputBytes {
+		p.buf = p.buf[len(p.buf)-maxBgOutputBytes:]
+	}
+	onLine := p.onLine
+	p.mu.Unlock()
+	if onLine != nil {
+		onLine(string(b))
+	}
+}
+
+func (p *bgProcess) finish(err error) {
+	p.mu.Lock()
+	p.done = true
+	p.end = time.Now()
+	p.exitErr = err
+	p.mu.Unlock()
+}
+
+// statusLocked returns the status string ("running" / "exited: …"). Caller must
+// hold p.mu.
+func (p *bgProcess) statusLocked() string {
+	if !p.done {
+		return "running"
+	}
+	if p.exitErr != nil {
+		return "exited: " + p.exitErr.Error()
+	}
+	return "exited: 0"
+}
+
+// tail returns the last n lines of retained output (n <= 0 = all retained) plus
+// the current status. Unlike readNew it does NOT advance the read cursor: it's a
+// non-destructive snapshot, so repeated calls return the same view and there is
+// no incentive to poll. A truncation marker is prefixed when output was dropped
+// (buffer cap or the n-line clamp).
+//
+// To stop models that ignore the "do not poll" instructions, tail tracks empty
+// snapshot calls on a running process within the same anti-polling window used
+// by readNew. Once the threshold is exceeded, blocked is true and callers
+// should tell the model to stop polling and wait for the completion push.
+func (p *bgProcess) tail(n int) (output, status string, blocked bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	body := p.buf
+	truncated := p.produced > int64(len(p.buf)) // earlier bytes dropped by the cap
+	if n > 0 {
+		lines := bytes.Split(bytes.TrimRight(body, "\n"), []byte{'\n'})
+		if len(lines) > n {
+			lines = lines[len(lines)-n:]
+			truncated = true
+		}
+		body = bytes.Join(lines, []byte{'\n'})
+	}
+	out := string(body)
+	if truncated && out != "" {
+		out = "[... earlier output truncated ...]\n" + out
+	}
+	status = p.statusLocked()
+
+	// Anti-polling for terminal_output: repeated empty snapshots of a running
+	// process are almost always a polling loop. Count them in the same window as
+	// Read so the model gets a consistent hard stop.
+	if !p.done && out == "" {
+		now := time.Now()
+		if p.emptyTailPollCount == 0 || now.Sub(p.firstEmptyTailPoll) > pollWindow {
+			p.firstEmptyTailPoll = now
+			p.emptyTailPollCount = 1
+		} else {
+			p.emptyTailPollCount++
+			if p.emptyTailPollCount >= maxEmptyPolls {
+				blocked = true
+			}
+		}
+	} else {
+		p.emptyTailPollCount = 0
+		p.firstEmptyTailPoll = time.Time{}
+	}
+	return out, status, blocked
+}
+
+// readNew returns output produced since the last Read and the current status,
+// advancing the read cursor. When retained output was dropped (buffer cap), the
+// returned text is prefixed with a truncation marker.
+func (p *bgProcess) readNew() (string, string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	bufStart := p.produced - int64(len(p.buf)) // absolute offset of buf[0]
+	var out []byte
+	if p.readOff < bufStart {
+		out = append(out, "[... earlier output truncated ...]\n"...)
+		p.readOff = bufStart
+	}
+	out = append(out, p.buf[p.readOff-bufStart:]...)
+	p.readOff = p.produced
+
+	status := p.statusLocked()
+
+	// Anti-polling: time-window based. Within a 30-second window, 3 or more
+	// empty reads on a running process trigger a block. This is lenient enough
+	// for occasional status checks on long-running services while still stopping
+	// tight polling loops on one-shot tasks.
+	blocked := false
+	if !p.done && len(out) == 0 {
+		now := time.Now()
+		if p.emptyPollCount == 0 || now.Sub(p.firstEmptyPoll) > pollWindow {
+			// Start a new window.
+			p.firstEmptyPoll = now
+			p.emptyPollCount = 1
+		} else {
+			p.emptyPollCount++
+			if p.emptyPollCount >= maxEmptyPolls {
+				blocked = true
+			}
+		}
+	} else {
+		p.emptyPollCount = 0
+		p.firstEmptyPoll = time.Time{}
+	}
+	return string(out), status, blocked
+}
+
+// BgExit is delivered to a BackgroundManager's onExit hook when a detached
+// process finishes. NewOutput is whatever hadn't been consumed by Read yet at
+// exit (so a push notification and a later terminal_output poll don't
+// double-report the same bytes — the readNew cursor advances either way).
+// Mode and Duration exist so the notification can tell the model when an
+// async launch didn't need to be backgrounded at all (see
+// shortAsyncDuration in bgnotify.go).
+type BgExit struct {
+	ID        string
+	Command   string
+	Status    string // "exited: 0" / "exited: <err>" — same shape readNew returns
+	NewOutput string
+	Mode      BackgroundMode
+	Duration  time.Duration // wall-clock time from launch to exit
+	Killed    bool          // the process was deliberately killed, not self-exited
+}
+
+// ExitedOK reports whether the process exited cleanly: exit code 0 and not
+// deliberately killed by a user / session teardown.
+func (e BgExit) ExitedOK() bool {
+	return !e.Killed && e.Status == "exited: 0"
+}
+
+// SyncSession is the promote handle for one in-flight synchronous terminal
+// command. Closing the channel (via Signal) unblocks the polling loop so the
+// process is promoted to a visible background task before the timer fires.
+// safe for concurrent calls (sync.Once).
+type SyncSession struct {
+	ch   chan struct{}
+	once sync.Once
+}
+
+// Signal closes the channel, unblocking any select waiting on C(). Safe to
+// call multiple times — only the first call takes effect.
+func (s *SyncSession) Signal() { s.once.Do(func() { close(s.ch) }) }
+
+// C returns the receive-only channel the terminal polling loop selects on.
+func (s *SyncSession) C() <-chan struct{} { return s.ch }
+
+// BackgroundManager owns the set of detached background processes for a
+// session. Methods are safe for concurrent use.
+type BackgroundManager struct {
+	mu     sync.Mutex
+	procs  map[string]*bgProcess
+	seq    int
+	onExit func(BgExit) // optional; fired from the waiter goroutine on completion
+
+	syncMu   sync.Mutex
+	syncSess *SyncSession // non-nil while a sync terminal is polling
+}
+
+// NewBackgroundManager returns an empty manager.
+func NewBackgroundManager() *BackgroundManager {
+	return &BackgroundManager{procs: map[string]*bgProcess{}}
+}
+
+// BeginSync registers a new SyncSession for the current synchronous terminal
+// command. Call EndSync (via defer) when the command finishes or is promoted.
+// At most one sync terminal runs per manager at a time — the agent loop is
+// serial — so there is only one slot.
+func (m *BackgroundManager) BeginSync() *SyncSession {
+	s := &SyncSession{ch: make(chan struct{})}
+	m.syncMu.Lock()
+	m.syncSess = s
+	m.syncMu.Unlock()
+	return s
+}
+
+// EndSync clears the current SyncSession.
+func (m *BackgroundManager) EndSync() {
+	m.syncMu.Lock()
+	m.syncSess = nil
+	m.syncMu.Unlock()
+}
+
+// HasSync reports whether a sync terminal is currently polling.
+func (m *BackgroundManager) HasSync() bool {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+	return m.syncSess != nil
+}
+
+// PromoteSync signals the current sync terminal to promote itself to a visible
+// background process. No-op if no sync terminal is running.
+func (m *BackgroundManager) PromoteSync() {
+	m.syncMu.Lock()
+	s := m.syncSess
+	m.syncMu.Unlock()
+	if s != nil {
+		s.Signal()
+	}
+}
+
+// HasActiveSync reports whether the default manager has a sync terminal polling.
+// Used by the TUI to conditionally show the Ctrl+B hint.
+func HasActiveSync() bool { return defaultBg.HasSync() }
+
+// PromoteCurrentSync signals the default manager's sync terminal to promote.
+// Called by the TUI Ctrl+B handler.
+func PromoteCurrentSync() { defaultBg.PromoteSync() }
+
+// SetOnExit registers a completion hook fired once per process when it exits,
+// carrying its final status and any output not yet read. Pass nil to clear.
+// The hook runs on the process's waiter goroutine (not under the manager lock),
+// so it may call back into the manager (e.g. Read) without deadlocking. The CLI
+// uses it to push a "background finished" notice into the conversation + UI;
+// the default (nil) keeps the original poll-only behaviour.
+func (m *BackgroundManager) SetOnExit(fn func(BgExit)) {
+	m.mu.Lock()
+	m.onExit = fn
+	m.mu.Unlock()
+}
+
+// FireExitHook calls the onExit hook directly with e, as if a tracked process
+// had just exited. No-op when no hook is registered. Used in tests to trigger
+// the notification path without starting a real shell process.
+func (m *BackgroundManager) FireExitHook(e BgExit) {
+	m.mu.Lock()
+	hook := m.onExit
+	m.mu.Unlock()
+	if hook != nil {
+		hook(e)
+	}
+}
+
+// StartOption is a functional option for BackgroundManager.Start.
+type StartOption func(*bgProcess)
+
+// WithOnLine registers a callback that receives each line of output as it is
+// produced. Used by the synchronous path to forward output to the progress
+// callback in real time.
+func WithOnLine(fn func(string)) StartOption {
+	return func(p *bgProcess) { p.onLine = fn }
+}
+
+// WithVisible sets the process visibility in ListRunning. Sync-started
+// processes start hidden (visible=false) and are promoted to visible=true
+// when they time out.
+func WithVisible(v bool) StartOption {
+	return func(p *bgProcess) { p.visible = v }
+}
+
+// Start launches command detached (via `sh -c`), with no timeout, and returns
+// its background id. Output streams into a capped buffer; the process is killed
+// if its context is cancelled (Kill / KillAll). The mode argument determines
+// whether the process is an async one-shot task or an interactive service/REPL.
+//
+// ctx contributes VALUES only — most importantly the working directory stamped
+// by WithWorkingDir, so the command runs where the session's tools run (the
+// per-session dir, a sub-agent's worktree, a cron task's directory) instead of
+// the server process's cwd. The child's lifecycle is deliberately NOT tied to
+// ctx's cancellation: async/interactive processes must survive the turn that
+// started them, so the process runs under its own cancel (Kill / KillAll).
+func (m *BackgroundManager) Start(ctx context.Context, command string, mode BackgroundMode, opts ...StartOption) (string, error) {
+	if mode != BgModeAsync && mode != BgModeInteractive {
+		return "", fmt.Errorf("background: invalid mode %q (want %q or %q)", mode, BgModeAsync, BgModeInteractive)
+	}
+
+	// WithoutCancel keeps every ctx value (working dir today, whatever
+	// shellCommand consumes tomorrow) while severing the caller's
+	// cancellation/deadline, so only the WithCancel below can kill the process.
+	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	cmd, err := shellCommand(bgCtx, command)
+	if err != nil {
+		cancel()
+		return "", err
+	}
+
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	// Stdin pipe: allows the agent to send input to interactive background
+	// processes (REPLs, configuration wizards, etc.) via terminal_input.
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		cancel()
+		_ = pw.Close()
+		_ = pr.Close()
+		return "", fmt.Errorf("terminal: create stdin pipe: %w", err)
+	}
+	cmd.Stdin = stdinR
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		_ = pw.Close()
+		_ = pr.Close()
+		_ = stdinW.Close()
+		_ = stdinR.Close()
+		return "", fmt.Errorf("terminal: start background: %w", err)
+	}
+
+	m.mu.Lock()
+	m.seq++
+	id := fmt.Sprintf("bg_%d", m.seq)
+	p := &bgProcess{id: id, command: command, mode: mode, cancel: cancel, proc: cmd.Process, start: time.Now(), visible: true, stdin: stdinW}
+	for _, opt := range opts {
+		opt(p)
+	}
+	m.procs[id] = p
+	m.mu.Unlock()
+
+	// readerDone is closed by the reader goroutine when it finishes
+	// draining the pipe. The waiter MUST wait on this before firing
+	// onExit — otherwise a fast-exiting process triggers the hook before
+	// the reader has flushed remaining pipe data, losing output.
+	readerDone := make(chan struct{})
+
+	// Reader: forward combined output into the capped buffer.
+	go func() {
+		// Registered first so it runs last: readerDone is still closed as the
+		// panic unwinds, or the waiter below would block on it forever.
+		defer func() { _ = panics.Error(recover(), "background process reader", "id", id) }()
+		defer close(readerDone)
+		// What this goroutine really owns is draining pr. cmd.Stdout is an
+		// *io.PipeWriter, so os/exec copies into it from a goroutine of its own
+		// that cmd.Wait blocks on — a reader that stops without closing its end
+		// leaves that copy blocked on an undrained pipe forever, and with it
+		// Wait, finish, the exit notification, and the child process itself.
+		// Closing pr fails the copy instead, which is how the panic surfaces as
+		// an exit status rather than a task stuck on "running". Redundant on the
+		// normal path, where the scan ends at EOF.
+		defer pr.Close()
+		scanner := bufio.NewScanner(pr)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			// Colour codes survive being piped (see stripANSI) and every
+			// consumer of this buffer renders it as plain text.
+			line = stripANSI(line)
+			// Tabs break the TUI's cursor-position math; replace with spaces.
+			line = bytes.ReplaceAll(line, []byte{'\t'}, []byte("    "))
+			p.append(append(line, '\n')) // append copies
+		}
+		// A line exceeding the 1 MiB token cap (or any read error) stops the
+		// scan; without this, all remaining output would vanish silently.
+		if err := scanner.Err(); err != nil {
+			p.append([]byte("\n[... output truncated: " + err.Error() + " ...]\n"))
+		}
+	}()
+	// Waiter: wait for the process, close pipe so the reader sees EOF,
+	// then wait for the reader to drain before firing onExit.
+	go func() {
+		finished := false
+		// Until finish runs, the process reads as "running" to every status
+		// query and to the exit-notification path — so a panic before it has
+		// to record an exit itself, or the task hangs in the UI forever. The
+		// caller-supplied onExit hook below is the reachable panic source.
+		defer func() {
+			if err := panics.Error(recover(), "background process waiter", "id", id); err != nil && !finished {
+				p.finish(err)
+			}
+		}()
+		err := cmd.Wait()
+		_ = pw.Close()
+		_ = stdinW.Close() // close stdin so any blocked reads on the process side get EOF
+		<-readerDone       // ensures reader flushed all pipe data
+		p.finish(err)
+		finished = true
+
+		m.mu.Lock()
+		hook := m.onExit
+		m.mu.Unlock()
+		if hook != nil {
+			p.mu.Lock()
+			visible := p.visible
+			p.mu.Unlock()
+			// Only notify for processes that are visible as background tasks.
+			// Sync-started processes start invisible (visible=false); they are
+			// promoted to visible=true when they time out. If a sync process
+			// finishes before the timeout, it was never a background task and
+			// its result was already returned synchronously — no notification.
+			if visible {
+				out, status, _ := p.readNew()
+				p.mu.Lock()
+				killed := p.killed
+				p.mu.Unlock()
+				hook(BgExit{
+					ID: p.id, Command: p.command, Status: status, NewOutput: out,
+					Mode: p.mode, Duration: p.end.Sub(p.start), Killed: killed,
+				})
+			}
+		}
+	}()
+
+	return id, nil
+}
+
+// Read returns output produced since the last call for id, plus a status
+// string. found is false when id is unknown. blocked is true when the caller
+// has polled too many times without new output while the process is still
+// running — this forces the LLM to stop polling. mode reports the process's
+// background mode (empty when not found).
+func (m *BackgroundManager) Read(id string) (output, status string, found bool, blocked bool, mode BackgroundMode) {
+	m.mu.Lock()
+	p := m.procs[id]
+	m.mu.Unlock()
+	if p == nil {
+		return "", "", false, false, ""
+	}
+	out, st, blk := p.readNew()
+	return out, st, true, blk, p.mode
+}
+
+// Tail returns a non-destructive snapshot of the last `lines` lines of a
+// process's output (lines <= 0 = all retained), plus its status. found is false
+// when id is unknown. Unlike Read it does not advance the cursor — it's for
+// on-demand progress peeks (the terminal_output tool). repeated calls return
+// the same bytes, but repeated empty snapshots of a running process are counted
+// as polling; once blocked is true, callers should tell the model to stop.
+// mode reports the process's background mode (empty when not found).
+func (m *BackgroundManager) Tail(id string, lines int) (output, status string, found bool, blocked bool, mode BackgroundMode) {
+	m.mu.Lock()
+	p := m.procs[id]
+	m.mu.Unlock()
+	if p == nil {
+		return "", "", false, false, ""
+	}
+	out, st, blk := p.tail(lines)
+	return out, st, true, blk, p.mode
+}
+
+// Mode returns the background mode for id, or ("", false) if unknown.
+func (m *BackgroundManager) Mode(id string) (BackgroundMode, bool) {
+	m.mu.Lock()
+	p := m.procs[id]
+	m.mu.Unlock()
+	if p == nil {
+		return "", false
+	}
+	return p.mode, true
+}
+
+// BgInfo is a snapshot of a tracked background process — used by the TUI's
+// live "background (N running)" panel and by background-completion summaries.
+type BgInfo struct {
+	ID      string
+	Command string
+	Mode    BackgroundMode
+	Start   time.Time
+	End     time.Time // zero value while running; set when the process exits
+	Status  string    // "running" / "exited: …"
+}
+
+// ListRunning returns the visible processes that haven't exited yet, oldest first.
+// Processes started invisibly (e.g. sync mode) are excluded until promoted.
+func (m *BackgroundManager) ListRunning() []BgInfo {
+	return m.list(false)
+}
+
+// List returns every visible tracked process — running AND exited-but-not-yet
+// reaped — oldest first, so the TUI panel and completion summaries can see what
+// has finished. Invisible (sync, pre-timeout) processes are excluded.
+func (m *BackgroundManager) List() []BgInfo {
+	return m.list(true)
+}
+
+func (m *BackgroundManager) list(includeExited bool) []BgInfo {
+	m.mu.Lock()
+	procs := make([]*bgProcess, 0, len(m.procs))
+	for _, p := range m.procs {
+		procs = append(procs, p)
+	}
+	m.mu.Unlock()
+
+	var out []BgInfo
+	for _, p := range procs {
+		p.mu.Lock()
+		done := p.done
+		visible := p.visible
+		info := BgInfo{ID: p.id, Command: p.command, Mode: p.mode, Start: p.start, Status: p.statusLocked()}
+		if done {
+			info.End = p.end
+		}
+		p.mu.Unlock()
+		if visible && (includeExited || !done) {
+			out = append(out, info)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Start.Equal(out[j].Start) {
+			return out[i].Start.Before(out[j].Start)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+// Promote makes a background process visible in ListRunning. Used when a
+// sync-started process times out and becomes a true background task.
+// Also clears the onLine callback (if any) so the sync path's progress
+// channel can be safely closed without the reader goroutine panicking on
+// a send to a closed channel.
+func (m *BackgroundManager) Promote(id string) bool {
+	m.mu.Lock()
+	p := m.procs[id]
+	m.mu.Unlock()
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	p.visible = true
+	p.onLine = nil
+	p.mu.Unlock()
+	return true
+}
+
+// Kill terminates the process for id with SIGKILL. Returns false when id is unknown.
+func (m *BackgroundManager) Kill(id string) bool {
+	return m.KillWithSignal(id, "SIGKILL")
+}
+
+// KillWithSignal terminates the process for id with the named signal.
+// Supported signals: SIGKILL, SIGTERM, SIGINT. Returns false when id is unknown.
+func (m *BackgroundManager) KillWithSignal(id string, sigName string) bool {
+	m.mu.Lock()
+	p := m.procs[id]
+	m.mu.Unlock()
+	if p == nil {
+		return false
+	}
+	terminate(p, sigName)
+	return true
+}
+
+// terminate is the single chokepoint for taking a background process down — the
+// one place that knows how to do it correctly, so Kill / KillAll / Remove can't
+// drift apart (every past orphan/leak bug came from one of them forgetting a
+// step). Two rules live here and nowhere else:
+//   - Always signal the whole process GROUP (POSIX kill(-pid); Windows
+//     taskkill /T), not just the direct child — otherwise the shell wrapper
+//     (sh -c / pwsh) dies and the real process it spawned is orphaned.
+//   - Only cancel the context on SIGKILL (exec.CommandContext fires its own
+//     SIGKILL as a backstop). For SIGTERM/SIGINT we must NOT cancel, or exec
+//     would race in with an automatic SIGKILL and defeat the graceful stop.
+func terminate(p *bgProcess, sigName string) {
+	if p == nil {
+		return
+	}
+	// Record that this exit is a deliberate kill, not a self-completion, so the
+	// completion notice doesn't tell the model the process "finished fast". This
+	// is the single choke point for every kill path (Kill / KillWithSignal /
+	// KillAll / the sync ctx-cancel), and it works cross-platform — including
+	// Windows, where a taskkill'd process reports a plain non-zero exit with no
+	// signal in its status string.
+	p.mu.Lock()
+	p.killed = true
+	p.mu.Unlock()
+	if sigName == "SIGKILL" {
+		p.cancel()
+	}
+	if p.proc != nil {
+		_ = killProcessGroup(p.proc, sigName)
+	}
+}
+
+// WriteStdin sends text to the stdin of a running background process.
+// Returns an error if the process is unknown or has already exited.
+func (m *BackgroundManager) WriteStdin(id string, input string) error {
+	m.mu.Lock()
+	p := m.procs[id]
+	m.mu.Unlock()
+	if p == nil {
+		return fmt.Errorf("no background process %q", id)
+	}
+	p.mu.Lock()
+	done := p.done
+	stdin := p.stdin
+	p.mu.Unlock()
+	if done {
+		return fmt.Errorf("background process %q has already exited", id)
+	}
+	if stdin == nil {
+		return fmt.Errorf("background process %q does not accept input", id)
+	}
+	_, err := stdin.Write([]byte(input))
+	return err
+}
+
+// WriteStdinAndClose sends text to the process's stdin and then closes it,
+// signalling EOF. Use for one-shot initial stdin (e.g. piping a PR body
+// through --body-file - instead of embedding it in the shell command where
+// backticks and quotes would be interpreted by the shell).
+func (m *BackgroundManager) WriteStdinAndClose(id string, input string) error {
+	m.mu.Lock()
+	p := m.procs[id]
+	m.mu.Unlock()
+	if p == nil {
+		return fmt.Errorf("no background process %q", id)
+	}
+	p.mu.Lock()
+	done := p.done
+	stdin := p.stdin
+	p.mu.Unlock()
+	if done {
+		return fmt.Errorf("background process %q has already exited", id)
+	}
+	if stdin == nil {
+		return fmt.Errorf("background process %q does not accept input", id)
+	}
+	if _, err := stdin.Write([]byte(input)); err != nil {
+		stdin.Close()
+		return err
+	}
+	return stdin.Close()
+}
+
+// Command returns the original command string for a background process id,
+// or ("", false) if the id is unknown or has been removed.
+func (m *BackgroundManager) Command(id string) (string, bool) {
+	m.mu.Lock()
+	p := m.procs[id]
+	m.mu.Unlock()
+	if p == nil {
+		return "", false
+	}
+	return p.command, true
+}
+
+// Remove drops a process from the tracking map, releasing its retained output
+// buffer. Used by the synchronous terminal path to reap a hidden command once
+// it has exited and its output has been returned to the caller — otherwise
+// every synchronous command would leak a bgProcess (up to maxBgOutputBytes
+// each) for the life of the session. Visible background tasks are NOT reaped
+// this way: their output stays readable via terminal_output after they exit.
+func (m *BackgroundManager) Remove(id string) {
+	m.mu.Lock()
+	p, ok := m.procs[id]
+	delete(m.procs, id)
+	m.mu.Unlock()
+	// Belt-and-suspenders: if Remove is ever called on a still-running id, take
+	// it (and its process group) down so it can't outlive its map entry. A no-op
+	// on an already-exited process — the common reap path — where the group is
+	// already gone.
+	if ok {
+		terminate(p, "SIGKILL")
+	}
+}
+
+// KillAll terminates every tracked process. Called on session shutdown so no
+// background command is orphaned.
+func (m *BackgroundManager) KillAll() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.procs {
+		terminate(p, "SIGKILL")
+	}
+}
+
+// defaultBg is the process-wide manager used by the built-in tools when no
+// manager is injected. A single-process CLI shares one set of background
+// processes across the session.
+var defaultBg = NewBackgroundManager()
+
+// KillAllBackground terminates every tracked background process — the default
+// manager AND every per-session manager. Wire it into session/REPL/daemon
+// shutdown to avoid orphans regardless of which session launched a process.
+func KillAllBackground() {
+	for _, m := range allBackgroundManagers() {
+		m.KillAll()
+	}
+}
+
+// DefaultBackgroundManager returns the process-wide background manager used by
+// the CLI/TUI and by tools when no per-session manager is injected.
+func DefaultBackgroundManager() *BackgroundManager { return defaultBg }
+
+// SetBackgroundOnExit registers the completion hook on the default manager (the
+// one the built-in terminal tool uses). The REPL wires this to push a
+// "background finished" notice into the conversation + UI. Pass nil to clear.
+func SetBackgroundOnExit(fn func(BgExit)) { defaultBg.SetOnExit(fn) }
+
+// RunningBackground lists the still-running processes on the default manager,
+// for the TUI's live "background (N running)" panel.
+func RunningBackground() []BgInfo { return defaultBg.ListRunning() }
+
+// BgCommand returns the original command string for a background process id
+// on the default manager, or ("", false) if unknown.
+func BgCommand(id string) (string, bool) { return defaultBg.Command(id) }

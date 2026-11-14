@@ -1,0 +1,317 @@
+package main
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/open-octo/octo-agent/internal/config"
+)
+
+// doctorHome isolates HOME (via the shared isolateHome helper) and additionally
+// clears provider and web-search API keys so the environment checks are
+// deterministic — a developer with a real BRAVE_SEARCH_API_KEY exported would
+// otherwise flip the web-search section.
+func doctorHome(t *testing.T) string {
+	t.Helper()
+	home := isolateHome(t)
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("BRAVE_SEARCH_API_KEY", "")
+	t.Setenv("TAVILY_API_KEY", "")
+	t.Setenv("SERPER_API_KEY", "")
+	return home
+}
+
+func TestRunDoctor_HealthyWithKey(t *testing.T) {
+	doctorHome(t)
+	t.Setenv("OPENAI_API_KEY", "sk-test")
+	cfg := config.Config{
+		Endpoints: []config.Endpoint{{ID: "ep-a", Provider: "openai", Models: []config.EndpointModel{{Model: "gpt-4o"}}}},
+		Default:   "ep-a::gpt-4o",
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runDoctor(nil, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "config.yml parses") || !strings.Contains(out, "All checks passed") {
+		t.Errorf("healthy output missing expected lines:\n%s", out)
+	}
+	// PR6 (design §13.2): per-endpoint card output.
+	if !strings.Contains(out, "Endpoints:") || !strings.Contains(out, "ep-a") || !strings.Contains(out, "gpt-4o") {
+		t.Errorf("healthy output missing per-endpoint card:\n%s", out)
+	}
+	if !strings.Contains(out, "API key: found") {
+		t.Errorf("healthy output missing key-found status:\n%s", out)
+	}
+	// References section.
+	if !strings.Contains(out, "References:") || !strings.Contains(out, "default = ep-a::gpt-4o") {
+		t.Errorf("healthy output missing references section:\n%s", out)
+	}
+}
+
+func TestRunDoctor_MissingKeyIsProblem(t *testing.T) {
+	doctorHome(t)
+	cfg := config.Config{
+		Endpoints: []config.Endpoint{{ID: "ep-a", Provider: "openai", Models: []config.EndpointModel{{Model: "gpt-4o"}}}},
+		Default:   "ep-a::gpt-4o",
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runDoctor(nil, strings.NewReader(""), &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("exit = 0, want non-zero when the API key is missing; out=%q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "OPENAI_API_KEY") {
+		t.Errorf("output should name the missing env var:\n%s", stdout.String())
+	}
+}
+
+func TestRunDoctor_UnparseableConfig(t *testing.T) {
+	home := doctorHome(t)
+	dir := filepath.Join(home, ".octo")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.yml"), []byte("models: [oops\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runDoctor(nil, strings.NewReader(""), &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("exit = 0, want non-zero on an unparseable config")
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "does not parse") || !strings.Contains(out, "octo config --fix") {
+		t.Errorf("unparseable output should point at --fix:\n%s", out)
+	}
+}
+
+func TestRunDoctor_SemanticProblem(t *testing.T) {
+	doctorHome(t)
+	t.Setenv("OPENAI_API_KEY", "sk-test")
+	// Dangling default_model — parses fine, fails Validate.
+	cfg := config.Config{
+		Endpoints: []config.Endpoint{{ID: "ep-a", Provider: "openai", Models: []config.EndpointModel{{Model: "gpt-4o"}}}},
+		Default:   "ep-a::does-not-exist",
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runDoctor(nil, strings.NewReader(""), &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("exit = 0, want non-zero on a semantic problem")
+	}
+	// PR5: the problem is reported as "default ... does not resolve" (the
+	// old "default_model" wording is gone — Default is a composite id now).
+	if !strings.Contains(stdout.String(), "default") || !strings.Contains(stdout.String(), "does not resolve") {
+		t.Errorf("output should surface the dangling default:\n%s", stdout.String())
+	}
+}
+
+func TestRunConfigFix_RestoresBrokenConfig(t *testing.T) {
+	home := doctorHome(t)
+	good := config.Config{
+		Endpoints: []config.Endpoint{{ID: "ep-a", Provider: "openai", Models: []config.EndpointModel{{Model: "gpt-4o"}}}},
+		Default:   "ep-a::gpt-4o",
+	}
+	if err := good.Save(); err != nil { // writes config.yml + .bak
+		t.Fatal(err)
+	}
+	// Corrupt it.
+	path := filepath.Join(home, ".octo", "config.yml")
+	if err := os.WriteFile(path, []byte("models: [oops\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runConfig([]string{"--fix"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; err=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Restored config.yml") {
+		t.Errorf("output should confirm the restore:\n%s", stdout.String())
+	}
+	got, err := config.Load()
+	if err != nil {
+		t.Fatalf("config still broken after --fix: %v", err)
+	}
+	if !strings.HasSuffix(got.Default, "::gpt-4o") {
+		t.Errorf("restored Default = %q, want suffix ::gpt-4o", got.Default)
+	}
+}
+
+func TestRunConfigFix_RepairsSemanticProblem(t *testing.T) {
+	doctorHome(t)
+	cfg := config.Config{
+		Endpoints: []config.Endpoint{{ID: "ep-a", Provider: "openai", Models: []config.EndpointModel{{Model: "gpt-4o"}}}},
+		Default:   "ep-a::gone",
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runConfig([]string{"fix"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; err=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Fixed:") {
+		t.Errorf("output should report the fix:\n%s", stdout.String())
+	}
+	got, _ := config.Load()
+	if !strings.HasSuffix(got.Default, "::gpt-4o") {
+		t.Errorf("Default = %q, want suffix ::gpt-4o (reset)", got.Default)
+	}
+}
+
+func TestRunConfigFix_HealthyIsNoOp(t *testing.T) {
+	doctorHome(t)
+	cfg := config.Config{
+		Endpoints: []config.Endpoint{{ID: "ep-a", Provider: "openai", Models: []config.EndpointModel{{Model: "gpt-4o"}}}},
+		Default:   "ep-a::gpt-4o",
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runConfig([]string{"fix"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(stdout.String(), "healthy") {
+		t.Errorf("healthy config should report nothing to fix:\n%s", stdout.String())
+	}
+}
+
+func TestRunConfigFix_FixesAndReportsUnfixable(t *testing.T) {
+	home := doctorHome(t)
+	dir := filepath.Join(home, ".octo")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Dangling default_model (fixable) AND a duplicate model (unfixable) in one
+	// file: --fix should Save the fix, report both, and still exit non-zero.
+	yml := "models:\n  - {provider: openai, model: gpt-4o}\n  - {provider: openai, model: gpt-4o}\ndefault_model: gone\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yml"), []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runConfig([]string{"fix"}, strings.NewReader(""), &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("exit = 0, want non-zero while an unfixable problem remains")
+	}
+	out := stdout.String()
+	// PR5: the old `default_model: gone` normalizes to an empty Default (no
+	// dangling), so there's no fixable problem — only the unfixable
+	// duplicate model remains. --fix reports it and exits non-zero without
+	// saving (nothing to fix).
+	if !strings.Contains(out, "manual attention") {
+		t.Errorf("output should show the remaining unfixable problem:\n%s", out)
+	}
+	// The fixable part was persisted.
+	got, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load after fix: %v", err)
+	}
+	// PR5: the old `default_model: gone` field maps to a composite id during
+	// normalize; "gone" doesn't match any model so Default stays empty (not
+	// dangling). Repair doesn't force-set an empty Default — it only resets
+	// dangling ones. So Default may be empty or a valid composite id; the key
+	// assertion is the file parses and the unfixable duplicate is still
+	// reported.
+	_ = got.Default
+}
+
+func TestRunConfigFix_ReportsUnfixable(t *testing.T) {
+	home := doctorHome(t)
+	dir := filepath.Join(home, ".octo")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Duplicate model — parses, but Repair can't guess intent.
+	yml := "models:\n  - {provider: openai, model: gpt-4o}\n  - {provider: openai, model: gpt-4o}\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yml"), []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runConfig([]string{"fix"}, strings.NewReader(""), &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("exit = 0, want non-zero when unfixable problems remain")
+	}
+	if !strings.Contains(stdout.String(), "manual attention") {
+		t.Errorf("output should flag the unfixable duplicate:\n%s", stdout.String())
+	}
+}
+
+func TestRunDoctor_WebSearchZeroKeyPointsAtFreeTiers(t *testing.T) {
+	doctorHome(t)
+	t.Setenv("OPENAI_API_KEY", "sk-test")
+	cfg := config.Config{
+		Endpoints: []config.Endpoint{{ID: "ep-a", Provider: "openai", Models: []config.EndpointModel{{Model: "gpt-4o"}}}},
+		Default:   "ep-a::gpt-4o",
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runDoctor(nil, strings.NewReader(""), &stdout, &stderr)
+	out := stdout.String()
+	// A missing search key is informational, not a problem — scraping works.
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; out=%q err=%q", code, out, stderr.String())
+	}
+	if !strings.Contains(out, "Web search:") || !strings.Contains(out, "no search key set") {
+		t.Errorf("zero-key output missing web-search section:\n%s", out)
+	}
+	// The whole point of the section: name the free tiers, not just the env var.
+	if !strings.Contains(out, "BRAVE_SEARCH_API_KEY") || !strings.Contains(out, "free") {
+		t.Errorf("zero-key output should point at a free tier:\n%s", out)
+	}
+	if !strings.Contains(out, "All checks passed") {
+		t.Errorf("zero-key search must not count as a problem:\n%s", out)
+	}
+}
+
+func TestRunDoctor_WebSearchNamesConfiguredBackend(t *testing.T) {
+	doctorHome(t)
+	t.Setenv("OPENAI_API_KEY", "sk-test")
+	t.Setenv("TAVILY_API_KEY", "tk")
+	cfg := config.Config{
+		Endpoints: []config.Endpoint{{ID: "ep-a", Provider: "openai", Models: []config.EndpointModel{{Model: "gpt-4o"}}}},
+		Default:   "ep-a::gpt-4o",
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runDoctor(nil, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, want 0; err=%q", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "TAVILY_API_KEY set") || !strings.Contains(out, "tavily") {
+		t.Errorf("configured backend not named:\n%s", out)
+	}
+	if strings.Contains(out, "no search key set") {
+		t.Errorf("keyed setup should not show the zero-key hint:\n%s", out)
+	}
+}

@@ -1,0 +1,83 @@
+# octo-agent Project Rules
+
+The canonical project guidance for contributors and AI coding agents. Keep this short — substantive design context belongs in `dev-docs/`.
+
+## Project
+
+`octo-agent` is a Go AI agent CLI (Go 1.25+, single binary). Module path `github.com/open-octo/octo-agent`. Ships as CLI + embedded Web UI + IM bridges (see `octo serve`).
+
+## Commands
+
+```bash
+make build                                                  # ./octo (or set VERSION=0.x.y for releases)
+make test                                                   # go test -race ./...
+make vet                                                    # go vet ./...
+make fmt-check                                              # gofmt -l . must print nothing
+make fmt                                                    # gofmt -w .
+make tidy                                                   # go mod tidy
+
+go test ./internal/agent/                                   # single package
+go test ./internal/provider/anthropic/ -run TestSendStream  # single test
+go test -race -v ./internal/tools/                          # verbose race
+```
+
+## Layering
+
+```
+cmd/octo/          CLI entry, flag parsing, REPL, sessions
+internal/app/      Provider-client construction + session bootstrap
+internal/agent/    Agent loop, history, content blocks, Sender interfaces
+internal/provider/ Provider interface + per-vendor implementations
+internal/tools/    Concrete ToolExecutor implementations
+internal/version/  Version constants overridable via -ldflags
+```
+
+Dependency direction is one-way: `provider → agent`, `tools → agent`, never the other way. `internal/app` is the single place that constructs provider clients and adapts them to `agent.Sender`; every entry point (`cmd/octo`, `internal/server`) reaches the LLM through it rather than importing `provider` directly.
+
+## Adding capability
+
+- **New provider** — implement `provider.Provider` (required) and optionally `provider.StreamingProvider`, `provider.ToolProvider`, `provider.ToolStreamingProvider`. Put it under `internal/provider/<name>/`. Each protocol's wire-format quirks are isolated inside the package; the agent layer must not learn about them.
+- **New tool** — implement `agent.ToolExecutor` and `Definition() agent.ToolDefinition` returning the JSON Schema the LLM sees. Place it under `internal/tools/<name>.go`. Register it in `tools.DefaultRegistry` and add it to `tools.DefaultTools()` if it belongs in the default set.
+- **New skill** — `~/.octo/skills/<name>/SKILL.md` with the same frontmatter format Claude Code uses. The skill loader composes existing tools — adding a skill should not require new tool code.
+
+## Code style
+
+- Go 1.25 syntax. `gofmt -w` is the formatter; `go vet ./...` must pass.
+- Tests live next to code (`foo.go` + `foo_test.go`). Use `httptest.NewServer` for HTTP-mocked tests; do not hit live APIs in `go test ./...`.
+- Comments in English. Prefer self-documenting names over comments. Only comment the **why**, never the **what**.
+- No new third-party dependencies without justification in the PR description.
+- **Windows GUI artefacts come only from `scripts/build-desktop-windows.ps1` or `make desktop`.** Never hand-copy a `go build` line: a missing `-H windowsgui` shipped a console-subsystem exe (black window on launch), a missing `-tags embedrg` left grep/glob broken on machines without ripgrep, and splitting `-H` away from `-X` into a second `-ldflags` silently dropped the subsystem flag.
+
+## Workflow
+
+- **Branch off latest `main`** before editing. Never commit on `main` directly.
+- Push lands via PR only. Squash-and-merge is the project default; force-push only after explicit approval.
+- Commit messages and PR descriptions in English.
+- One concept per PR. Mass mechanical changes (rename, move) can ride together but should be a single self-contained change set.
+- **The default — and only required — deliverable is the single-EXE portable build**: `dist/portable/ATLR-Agent.exe` — one self-contained file, no installation, `Data/` created beside the exe, runs from a USB stick. That exe is the whole delivery: **no zip and no installer are produced**, unless the user explicitly asks for one. `scripts/build-desktop-windows.ps1` is the only entry point and its last step does nothing but copy the exe into `dist/portable/`.
+- **Cleaning build products never means deleting them.** Move them into `.trash/<YYYYMMDD-HHMMSS>/` and write a `manifest.txt` (relative path, bytes, original path) alongside; `web/scripts/clean-webdist.mjs` is the reference implementation. Deleting a build artefact outright is forbidden. Ageing out old runs is also a move — into `.trash/_expired/` — never a delete.
+
+## Testing
+
+- `make test` runs `go test -race ./...` — must be green before pushing.
+- Any change under `web/` needs `npm run build` (its `prebuild` clears the stale `internal/server/webdist` output first), then assert `grep -c splash.css internal/server/webdist/index.html` prints `1` — the embedded tree is what actually ships, and a missing stylesheet link strands the boot splash on a black page.
+- Integration tests against real provider APIs are run by hand with a real key, not in CI.
+
+## Common pitfalls (from prior incidents)
+
+- **`Accept-Encoding: gzip` on Bing's HTML search endpoint** returns a JS skeleton instead of the real results page — `web_search` must omit that header.
+- **OpenAI streaming needs `stream_options.include_usage=true`.** DashScope (Bailian) and real OpenAI emit no usage chunk without it (streamed turn reports zero tokens); DeepSeek sends usage regardless either way.
+- **Cache token semantics differ by protocol, not vendor.** Anthropic-protocol endpoints report `input_tokens` as the uncached remainder with `cache_read_input_tokens` separate; OpenAI-protocol endpoints report `prompt_tokens` as the whole input with `cached_tokens` a subset. `InputTokens`/`CacheReadTokens` must stay non-overlapping buckets — the openai adapter subtracts cached from prompt, the anthropic adapter needs no adjustment.
+- **OpenAI tool-call arguments stream as JSON fragments** across multiple chunks, keyed by `tool_calls[i].index` — concatenate before parsing.
+- **`finish_reason: "tool_calls"` (OpenAI) vs `stop_reason: "tool_use"` (Anthropic)** — normalize to `"tool_use"` at the provider adapter; the agent loop must never branch on the OpenAI spelling.
+
+See `CLAUDE.md` for the full write-up of each incident.
+
+## When in doubt
+
+- Verify external claims (API endpoints, third-party SDK existence, dates) before committing them.
+- If `go test ./...` fails because of an environment issue (missing key, blocked network), say so explicitly rather than commenting out the test.
+
+## What lives in `dev-docs/`
+
+Architecture decisions and verified-fact dumps. One Markdown file per topic. Don't commit speculative or unverified claims — verify before writing.

@@ -1,0 +1,1726 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"log/slog"
+	"net/http"
+	"os"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/app"
+	"github.com/open-octo/octo-agent/internal/config"
+	"github.com/open-octo/octo-agent/internal/prompt"
+	"github.com/open-octo/octo-agent/internal/tools"
+)
+
+// ─── Provider Presets ───────────────────────────────────────────────────────
+
+// endpointVariant is the JSON shape the frontend expects for regional endpoints.
+type endpointVariant struct {
+	Label    string `json:"label"`
+	LabelKey string `json:"label_key,omitempty"`
+	BaseURL  string `json:"base_url"`
+	Region   string `json:"region,omitempty"`
+}
+
+// providerPreset is the JSON shape returned by GET /api/providers.
+type providerPreset struct {
+	ID               string            `json:"id"`
+	Name             string            `json:"name"`
+	BaseURL          string            `json:"base_url"`
+	API              string            `json:"api"`
+	DefaultModel     string            `json:"default_model"`
+	Models           []string          `json:"models,omitempty"`
+	ModelVision      map[string]bool   `json:"model_vision,omitempty"` // model id → accepts image input; lets the form pre-fill the vision toggle
+	EndpointVariants []endpointVariant `json:"endpoint_variants,omitempty"`
+	WebsiteURL       string            `json:"website_url,omitempty"`
+	CustomEndpoint   bool              `json:"custom_endpoint,omitempty"`
+}
+
+// buildProviderPresets builds the response for GET /api/providers from the
+// canonical app.Registry.  This is the single source of truth — a new vendor
+// only needs one line in internal/app/provider.go.
+func buildProviderPresets() []providerPreset {
+	presets := make([]providerPreset, 0, len(app.Registry))
+	for _, v := range app.Registry {
+		variants := make([]endpointVariant, len(v.EndpointVariants))
+		for i, ev := range v.EndpointVariants {
+			variants[i] = endpointVariant{
+				Label:    ev.Label,
+				LabelKey: ev.LabelKey,
+				BaseURL:  ev.BaseURL,
+				Region:   ev.Region,
+			}
+		}
+		presets = append(presets, providerPreset{
+			ID:               v.ID,
+			Name:             v.DisplayName,
+			BaseURL:          v.DefaultBaseURL,
+			API:              v.API,
+			DefaultModel:     v.DefaultModel,
+			Models:           app.VendorModels(v.ID),
+			ModelVision:      app.VendorModelVisionMap(v.ID),
+			EndpointVariants: variants,
+			WebsiteURL:       v.WebsiteURL,
+			CustomEndpoint:   v.CustomEndpoint,
+		})
+	}
+	return presets
+}
+
+// ─── GET /api/providers ─────────────────────────────────────────────────────
+
+func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"providers": buildProviderPresets()})
+}
+
+// ─── GET /api/onboard/status ────────────────────────────────────────────────
+
+func (s *Server) handleOnboardStatus(w http.ResponseWriter, r *http.Request) {
+	// no-store: this gates the first-run /onboard nudge, and the desktop webview
+	// heuristically caches GET 200s. Without it, the second window open replays
+	// the first load's stale phase from cache and re-launches /onboard even after
+	// the marker is set (#1660). The client also passes cache:'no-store'.
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	phase := detectOnboardPhase(s.cfg.Provider)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"needs_onboard": phase != "",
+		"phase":         phase,
+	})
+}
+
+// detectOnboardPhase determines whether first-run setup is needed.
+//
+//	"key_setup"  — no API key configured (hard block).
+//	"soul_setup" — key present, the nudge hasn't fired yet, AND the user has no
+//	               identity at all (both soul.md and user.md missing) (soft nudge).
+//	""           — fully configured, or the nudge already fired once (#1660: an
+//	               interrupted first attempt must not retrigger on every restart —
+//	               the Profile page's soul/user "Update" buttons stay available
+//	               as the manual path), or any identity file already exists.
+func detectOnboardPhase(flagProvider string) string {
+	cfg, _ := config.Load()
+
+	// Look for an endpoint that could actually run. Its key may be stored in
+	// config, may live in the provider's environment variable (senderForEntry
+	// and resolveAPIKey both read the environment first), or may not exist at
+	// all for a keyless Custom endpoint (local Ollama/vLLM).
+	//
+	// The environment is only ever consulted per endpoint, never on its own. A
+	// machine that exports ANTHROPIC_API_KEY or DEEPSEEK_API_KEY for some other
+	// tool — common enough — used to be read as "this install is configured"
+	// and skipped setup entirely, on an install with no endpoint and no model
+	// to run. The user landed on a chat that fails at the first message rather
+	// than on the panel that would have fixed it. A key on its own configures
+	// nothing.
+	configured := false
+	for _, ep := range cfg.Endpoints {
+		if ep.APIKey != "" || app.VendorKeyOptional(ep.Provider) || os.Getenv(app.VendorAPIKeyEnvVar(ep.Provider)) != "" {
+			configured = true
+			break
+		}
+	}
+	if !configured {
+		configured = envOnlyProviderConfigured(flagProvider, cfg)
+	}
+	if !configured {
+		// An explicit skip from the first-run wizard records its own marker:
+		// the user chose to run without a configured model, so don't re-open
+		// the wizard on every launch — Settings keeps the manual path. Kept
+		// separate from OnboardAttempted so configuring a key later still
+		// offers the identity nudge.
+		if config.OnboardSkipped() {
+			return ""
+		}
+		return "key_setup"
+	}
+
+	if config.OnboardAttempted() {
+		return ""
+	}
+
+	// Nudge only on a truly fresh identity: BOTH soul.md (who the agent is) and
+	// user.md (who the user is) absent. If either already exists the user has
+	// some identity set up, so don't nudge. (IdentityPath also finds the legacy
+	// uppercase SOUL.md/USER.md spellings.)
+	if identityMissing(octoDir()) {
+		return "soul_setup"
+	}
+
+	return ""
+}
+
+// envOnlyProviderConfigured reports whether the server can reach a model with
+// no endpoint in config.yml — the env-only deployment packaging/systemd and the
+// self-host guide describe, where OCTO_PROVIDER names the vendor and that
+// vendor's key sits in the environment.
+//
+// It follows resolveProviderAndModel's precedence for naming a vendor — the
+// serve --provider flag, then OCTO_PROVIDER — and refuses, as that does, to
+// pick one nobody named: a key in the environment says which vendors are
+// reachable, never which one the user meant. With no vendor named there is
+// nothing configured to run.
+func envOnlyProviderConfigured(flagProvider string, cfg config.Config) bool {
+	provName := firstNonEmpty(flagProvider, os.Getenv("OCTO_PROVIDER"))
+	if provName == "" {
+		return false
+	}
+	if modelFromEnv(provName) == "" && defaultModelFor(provName) == "" {
+		return false
+	}
+	if app.VendorKeyOptional(provName) {
+		return true
+	}
+	key, err := resolveAPIKey(provName, cfg)
+	return err == nil && key != ""
+}
+
+// identityMissing reports whether dir has neither soul.md nor user.md (nor
+// their legacy uppercase spellings).
+func identityMissing(dir string) bool {
+	for _, name := range []string{"soul.md", "user.md"} {
+		if _, err := os.Stat(prompt.IdentityPath(dir, name)); err == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// ─── POST /api/onboard/complete ─────────────────────────────────────────────
+
+func (s *Server) handleOnboardComplete(w http.ResponseWriter, r *http.Request) {
+	// Ensure the ~/.octo directory exists.
+	_ = os.MkdirAll(octoDir(), 0o700)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// ─── POST /api/onboard/attempt ──────────────────────────────────────────────
+
+// handleOnboardAttempt records that the soul_setup nudge has fired, before the
+// /onboard chat itself starts — so a user who closes the tab or interrupts the
+// chat before finishing doesn't get re-nudged on every subsequent load (#1660).
+// The marker is a standalone file, not a config.yml field, so a concurrent
+// config.yml write during first-run can't clobber it.
+func (s *Server) handleOnboardAttempt(w http.ResponseWriter, r *http.Request) {
+	if err := config.MarkOnboardAttempted(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("mark onboard attempted: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// ─── POST /api/onboard/skip ─────────────────────────────────────────────────
+
+// handleOnboardSkip records the first-run wizard's "skip" choice: the user
+// closed the model-setup step without configuring anything. The wizard stays
+// closed on later launches (detectOnboardPhase honours the marker), while the
+// Settings page keeps the manual path. A marker of its own — not the attempted
+// one — so configuring a key later still offers the identity nudge.
+func (s *Server) handleOnboardSkip(w http.ResponseWriter, r *http.Request) {
+	if err := config.MarkOnboardSkipped(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("mark onboard skipped: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// ─── GET /api/config ────────────────────────────────────────────────────────
+
+// configResponse mirrors what the Svelte frontend expects. PR5: the Models
+// field is gone (the frontend reads endpoints via GET /api/config/endpoints);
+// only the global settings remain. ReasoningEffort is the global reasoning
+// level (PR5 deleted per-entry reasoning).
+type configResponse struct {
+	FontSize      string `json:"font_size,omitempty"`
+	Language      string `json:"language,omitempty"`
+	ShowReasoning *bool  `json:"show_reasoning,omitempty"`
+	Coauthor      *bool  `json:"coauthor,omitempty"`
+	WorkspaceDir  string `json:"workspace_dir,omitempty"`
+	// WorkspaceDirDefault is the resolved directory sessions actually get
+	// when WorkspaceDir is empty (i.e. the portable <exe dir>\Workspace) — the Settings UI shows it
+	// as the effective default instead of a bare, easily-misread "auto".
+	WorkspaceDirDefault string `json:"workspace_dir_default,omitempty"`
+	ReasoningEffort     string `json:"reasoning_effort,omitempty"`
+	// PermissionMode is the global default permission mode. PR5 lifted
+	// per-entry permission_mode to global (per-entry reasoning was deleted;
+	// permission_mode was always global in practice — the old default entry
+	// carried it). The Composer reads this to seed its no-active-session
+	// fallback.
+	PermissionMode string `json:"permission_mode,omitempty"`
+	// ComputerEnabled is the raw tools.computer.enabled value ("" = off). The
+	// experimental Settings tab renders it as a toggle; off is the default.
+	ComputerEnabled string `json:"computer_enabled,omitempty"`
+}
+
+func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	cfg, _ := config.Load()
+
+	// Coauthor, unlike ShowReasoning, has an OCTO_COAUTHOR env-var layer above
+	// the config file, so the raw cfg.Coauthor pointer can disagree with what
+	// commits actually get. Report the resolved value the Settings toggle is
+	// meant to reflect, not the on-disk-only one.
+	effCoauthor := cfg.EffectiveCoauthor()
+	// The stored form of disabled reasoning is "" — but serialized through
+	// the omitempty tag that drops the field entirely, and the frontend
+	// defaults an absent value to "medium" (SettingsView). Send the wire
+	// sentinel "off" so off actually reads as off.
+	re := cfg.ReasoningEffort
+	if re == "" {
+		re = "off"
+	}
+	writeJSON(w, http.StatusOK, configResponse{
+		FontSize:            "medium",
+		Language:            cfg.Language,
+		ShowReasoning:       cfg.ShowReasoning,
+		Coauthor:            &effCoauthor,
+		WorkspaceDir:        cfg.WorkspaceDir,
+		WorkspaceDirDefault: s.curWorkspaceDir(),
+		ReasoningEffort:     re,
+		PermissionMode:      cfg.PermissionMode,
+		ComputerEnabled:     cfg.Tools.Computer.Enabled,
+	})
+}
+
+// ─── GET /api/config/endpoints ───────────────────────────────────────────────
+
+// endpointsResponse is the two-level shape served by GET /api/config/endpoints
+// (design §10.1). PR4b ships only the read path: the frontend renders this as
+// read-only endpoint cards with their model lists; the write path (CRUD on
+// endpoints) lands in PR5 alongside the Save format switch.
+//
+// Security: APIKey is never echoed. HasAPIKey reports presence so the UI can
+// badge "已配置 / 未设置" without exposing the secret.
+type endpointsResponse struct {
+	Endpoints    []endpointConfigJSON `json:"endpoints"`
+	Default      string               `json:"default,omitempty"`
+	Lite         string               `json:"lite,omitempty"`
+	VisionHelper string               `json:"vision_helper,omitempty"`
+}
+
+// endpointConfigJSON is one channel in the two-level response.
+//
+// APIKey is deliberately absent from the JSON shape: the read API never echoes
+// the secret. HasAPIKey and APIKeyEnv are the only key-related fields the
+// frontend gets, so it can badge "已配置 / 未设置" without learning the key
+// itself (design §10.1, §19.1).
+type endpointConfigJSON struct {
+	ID        string `json:"id"`
+	Name      string `json:"name,omitempty"`
+	Provider  string `json:"provider"`
+	BaseURL   string `json:"base_url,omitempty"`
+	Protocol  string `json:"protocol,omitempty"`
+	HasAPIKey bool   `json:"has_api_key"`
+	// APIKeyEnv names the vendor env var when it is set. Requests read it
+	// before the stored key, so it is the key in effect even when HasAPIKey
+	// is also true. Only the name is sent, never the value.
+	APIKeyEnv string              `json:"api_key_env,omitempty"`
+	Models    []endpointModelJSON `json:"models"`
+	Headers   map[string]string   `json:"headers,omitempty"`
+}
+
+// apiKeyEnvInEffect returns the provider's API-key env var name when that var
+// is set, mirroring the env-first order of senderForEntry; "" otherwise.
+func apiKeyEnvInEffect(provider string) string {
+	name := app.VendorAPIKeyEnvVar(provider)
+	if name == "" || os.Getenv(name) == "" {
+		return ""
+	}
+	return name
+}
+
+// endpointModelJSON is one model under an endpoint.
+type endpointModelJSON struct {
+	Model         string `json:"model"`
+	ContextWindow int    `json:"context_window,omitempty"`
+	Vision        bool   `json:"vision"`
+	// RPM is the per-model rate limit as the user filled it (the vendor's
+	// advertised cap; the gate runs at RPM-1). 0 = unlimited.
+	RPM int `json:"rpm,omitempty"`
+	// Per-model connection overrides; empty inherits the endpoint's own.
+	BaseURL  string `json:"base_url,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
+	// ReasoningEfforts is the ladder this model accepts, ascending — the
+	// composer renders exactly these notches and nothing else. Declared on the
+	// model entry when the user pinned a subset; otherwise derived from the
+	// vendor/dialect (app.ReasoningEffortsFor) so the picker never offers a
+	// level the provider silently folds into another. Always present (not
+	// omitempty): an empty array means "no model declared anything", which the
+	// UI reads as "fall back to the full ladder".
+	ReasoningEfforts []string `json:"reasoning_efforts"`
+}
+
+// validModelProtocol reports whether p is a wire format a per-model override
+// may pin (the same set the custom vendor accepts).
+func validModelProtocol(p string) bool {
+	switch p {
+	case "anthropic", "openai", "openai-responses":
+		return true
+	}
+	return false
+}
+
+// effectiveReasoningEfforts resolves what GET /api/config/endpoints reports for
+// one model: the model's own declared ladder when it has one, else the
+// vendor/dialect default. Both are ordered by config.ReasoningLadder, so the
+// slider's index means the same thing client and server side.
+func effectiveReasoningEfforts(ep config.Endpoint, m config.EndpointModel) []string {
+	if out := config.OrderReasoningEfforts(m.ReasoningEfforts); len(out) > 0 {
+		return out
+	}
+	proto := ep.Protocol
+	if m.Protocol != "" {
+		proto = m.Protocol
+	}
+	return app.ReasoningEffortsFor(ep.Provider, m.Model, proto)
+}
+
+// handleGetEndpoints serves the two-level endpoint view. Data comes straight
+// from config.Load's in-memory Endpoints (syncEndpointsFromModels already
+// projects the legacy flat Models list into this shape, so PR4b works against
+// either schema). Default/Lite are echoed as composite ids verbatim — on a
+// legacy flat config they're synthesised by syncEndpointsFromModels, on a
+// hand-written new-schema config they're whatever the user typed.
+func (s *Server) handleGetEndpoints(w http.ResponseWriter, r *http.Request) {
+	cfg, _ := config.Load()
+
+	out := endpointsResponse{
+		Endpoints:    make([]endpointConfigJSON, 0, len(cfg.Endpoints)),
+		Default:      cfg.Default,
+		Lite:         cfg.Lite,
+		VisionHelper: cfg.VisionHelper,
+	}
+	for _, ep := range cfg.Endpoints {
+		em := endpointConfigJSON{
+			ID:        ep.ID,
+			Name:      ep.Name,
+			Provider:  ep.Provider,
+			BaseURL:   ep.BaseURL,
+			Protocol:  ep.Protocol,
+			HasAPIKey: ep.APIKey != "",
+			APIKeyEnv: apiKeyEnvInEffect(ep.Provider),
+			Models:    make([]endpointModelJSON, 0, len(ep.Models)),
+			Headers:   ep.Headers,
+		}
+		for _, m := range ep.Models {
+			em.Models = append(em.Models, endpointModelJSON{
+				Model:            m.Model,
+				ContextWindow:    m.ContextWindow,
+				Vision:           m.Vision,
+				RPM:              m.RPM,
+				BaseURL:          m.BaseURL,
+				Protocol:         m.Protocol,
+				ReasoningEfforts: effectiveReasoningEfforts(ep, m),
+			})
+		}
+		out.Endpoints = append(out.Endpoints, em)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// ─── PUT /api/config/show_reasoning ─────────────────────────────────────────
+
+type putShowReasoningRequest struct {
+	ShowReasoning bool `json:"show_reasoning"`
+}
+
+func (s *Server) handlePutShowReasoning(w http.ResponseWriter, r *http.Request) {
+	var req putShowReasoningRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load config: %v", err))
+		return
+	}
+
+	cfg.ShowReasoning = &req.ShowReasoning
+	if err := cfg.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save config: %v", err))
+		return
+	}
+	// Cached senders may have been built with the old global default.
+	s.invalidateSenderCache()
+	// Also rebuild the server's default sender so unbound existing sessions
+	// pick up the new show_reasoning value on their next turn.
+	if err := s.reloadDefaultSender(); err != nil {
+		// Log but don't fail the request: config is already saved and the next
+		// chat request will retry via ensureSender anyway.
+		log.Printf("[server] reload default sender after show_reasoning change: %v", err)
+	}
+
+	// Push each session's own effective show_reasoning — resolved against ITS
+	// OWN model entry (see entryForSession), which falls back to this new
+	// global default only when that entry has no explicit override of its
+	// own — so this doesn't paint a session pinned to a model with its own
+	// show_reasoning: true/false with the new global value it's shielded from.
+	sessions, _ := agent.ListSessions(50)
+	for _, sess := range sessions {
+		_, pm, re, sr, ctxUsage := s.sessionStatusFields(sess)
+		if sr == nil {
+			continue
+		}
+		s.wsHub.broadcast(sess.ID, map[string]any{
+			"type":             "session_update",
+			"session_id":       sess.ID,
+			"working_dir":      s.sessionCwd(sess),
+			"permission_mode":  pm,
+			"reasoning_effort": re,
+			"show_reasoning":   *sr,
+			"context_usage":    ctxUsage,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "show_reasoning": req.ShowReasoning})
+}
+
+// ─── PUT /api/config/computer ───────────────────────────────────────────────
+
+type putComputerRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+// handlePutComputer flips the experimental computer-use tool
+// (tools.computer.enabled). The substrate exists on macOS and Windows only —
+// refuse the write elsewhere so the Settings toggle can never persist a no-op
+// switch on Linux.
+func (s *Server) handlePutComputer(w http.ResponseWriter, r *http.Request) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		writeError(w, http.StatusBadRequest, "computer-use is only available on macOS and Windows")
+		return
+	}
+	var req putComputerRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load config: %v", err))
+		return
+	}
+	if req.Enabled {
+		cfg.Tools.Computer.Enabled = "on"
+	} else {
+		cfg.Tools.Computer.Enabled = "off"
+	}
+	if err := cfg.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save config: %v", err))
+		return
+	}
+	// No sender cache to invalidate: the tool list is rebuilt per turn via
+	// DefaultToolsForCtx → computerEnabled → config.LoadCached (a fresh read).
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "computer_enabled": cfg.Tools.Computer.Enabled})
+}
+
+// ─── PUT /api/config/coauthor ───────────────────────────────────────────────
+
+type putCoauthorRequest struct {
+	Coauthor bool `json:"coauthor"`
+}
+
+// handlePutCoauthor updates config.Coauthor — whether the agent should
+// append a Co-authored-by line to git commit messages. Unlike
+// show_reasoning, this value is never baked into a cached sender:
+// effectiveCoauthor (server.go) reads it fresh from config on every turn's
+// prompt composition, so no sender-cache invalidation/reload and no
+// per-session WS broadcast are needed here — the next turn on any session
+// just picks it up.
+func (s *Server) handlePutCoauthor(w http.ResponseWriter, r *http.Request) {
+	var req putCoauthorRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load config: %v", err))
+		return
+	}
+
+	cfg.Coauthor = &req.Coauthor
+	if err := cfg.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save config: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "coauthor": req.Coauthor})
+}
+
+// ─── PUT /api/config/language ────────────────────────────────────────────────
+
+type putLanguageRequest struct {
+	Language string `json:"language"`
+}
+
+func (s *Server) handlePutLanguage(w http.ResponseWriter, r *http.Request) {
+	var req putLanguageRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if req.Language != "en" && req.Language != "zh" {
+		writeError(w, http.StatusBadRequest, "language must be 'en' or 'zh'")
+		return
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load config: %v", err))
+		return
+	}
+
+	cfg.Language = req.Language
+	if err := cfg.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save config: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "language": req.Language})
+}
+
+// ─── PUT /api/config/workspace_dir ───────────────────────────────────────────
+
+type putWorkspaceDirRequest struct {
+	WorkspaceDir string `json:"workspace_dir"`
+}
+
+// handlePutWorkspaceDir updates the global default working directory used for
+// new web sessions. It accepts the raw config value: empty clears the
+// override and resolves to the portable <exe dir>\Workspace, and anything else
+// is stored as a literal
+// path. The server's resolved default is also updated so new sessions pick
+// it up immediately without a restart.
+func (s *Server) handlePutWorkspaceDir(w http.ResponseWriter, r *http.Request) {
+	var req putWorkspaceDirRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load config: %v", err))
+		return
+	}
+
+	cfg.WorkspaceDir = req.WorkspaceDir
+	if err := cfg.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save config: %v", err))
+		return
+	}
+
+	// Resolve the new value immediately so the running server applies it to
+	// new sessions without needing a restart. On error, fall back to no
+	// override; the config is already saved.
+	resolved, err := tools.ResolveWorkspaceDir(req.WorkspaceDir)
+	if err != nil {
+		slog.Warn("could not resolve workspace_dir; new sessions keep using the launch directory", "err", err)
+		resolved = ""
+	}
+	s.setWorkspaceDir(resolved)
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "workspace_dir": req.WorkspaceDir})
+}
+
+// ─── PUT /api/config/reasoning_effort ────────────────────────────────────────
+
+type putReasoningEffortRequest struct {
+	ReasoningEffort string `json:"reasoning_effort"`
+}
+
+// handlePutReasoningEffort updates the global default reasoning effort. Valid
+// levels: "off", "low", "medium", "high", "xhigh", "max". The server's default
+// sender is rebuilt so unbound existing sessions pick up the new value on their
+// next turn. Because reasoning_effort is baked into cached senders, the cache is
+// invalidated and per-session WS broadcasts push the new effective level.
+func (s *Server) handlePutReasoningEffort(w http.ResponseWriter, r *http.Request) {
+	var req putReasoningEffortRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+
+	level := strings.ToLower(req.ReasoningEffort)
+	if level == "" {
+		level = "off"
+	}
+	if level != "off" && level != "low" && level != "medium" && level != "high" && level != "xhigh" && level != "max" {
+		writeError(w, http.StatusBadRequest, "reasoning_effort must be off, low, medium, high, xhigh, or max")
+		return
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load config: %v", err))
+		return
+	}
+
+	// "off" is only ever a wire/UI sentinel — persist "" (matching
+	// handleUpdateSessionReasoningEffort): the provider layer treats any
+	// non-empty effort as thinking-ON, so a stored literal "off" would
+	// actually enable reasoning. With reasoning off there is also nothing to
+	// trace, so drop show_reasoning too instead of leaving a toggle that
+	// looks on but does nothing.
+	if level == "off" {
+		cfg.ReasoningEffort = ""
+		off := false
+		cfg.ShowReasoning = &off
+	} else {
+		cfg.ReasoningEffort = level
+	}
+	if err := cfg.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save config: %v", err))
+		return
+	}
+
+	s.invalidateSenderCache()
+	if err := s.reloadDefaultSender(); err != nil {
+		log.Printf("[server] reload default sender after reasoning_effort change: %v", err)
+	}
+
+	sessions, _ := agent.ListSessions(50)
+	for _, sess := range sessions {
+		_, pm, re, sr, ctxUsage := s.sessionStatusFields(sess)
+		if sr == nil {
+			continue
+		}
+		s.wsHub.broadcast(sess.ID, map[string]any{
+			"type":             "session_update",
+			"session_id":       sess.ID,
+			"working_dir":      s.sessionCwd(sess),
+			"permission_mode":  pm,
+			"reasoning_effort": re,
+			"show_reasoning":   *sr,
+			"context_usage":    ctxUsage,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "reasoning_effort": level})
+}
+
+// ─── PUT /api/config/permission_mode ─────────────────────────────────────────
+
+type putPermissionModeRequest struct {
+	PermissionMode string `json:"permission_mode"`
+}
+
+// handlePutPermissionMode updates the global default permission mode. Valid
+// values: "interactive", "auto", "strict". New sessions inherit this value.
+// Per-session overrides (set via PATCH /api/sessions/{id}/permission_mode)
+// are untouched — this only changes the global default.
+func (s *Server) handlePutPermissionMode(w http.ResponseWriter, r *http.Request) {
+	var req putPermissionModeRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+
+	mode := strings.ToLower(req.PermissionMode)
+	if mode != "interactive" && mode != "auto" && mode != "strict" {
+		writeError(w, http.StatusBadRequest, "permission_mode must be interactive, auto, or strict")
+		return
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load config: %v", err))
+		return
+	}
+
+	cfg.PermissionMode = mode
+	if err := cfg.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save config: %v", err))
+		return
+	}
+
+	// Push the new default to all sessions so the UI reflects it immediately.
+	// Sessions with a per-session override keep their own value.
+	sessions, _ := agent.ListSessions(50)
+	for _, sess := range sessions {
+		_, pm, re, sr, ctxUsage := s.sessionStatusFields(sess)
+		if sr == nil {
+			continue
+		}
+		s.wsHub.broadcast(sess.ID, map[string]any{
+			"type":             "session_update",
+			"session_id":       sess.ID,
+			"working_dir":      s.sessionCwd(sess),
+			"permission_mode":  pm,
+			"reasoning_effort": re,
+			"show_reasoning":   *sr,
+			"context_usage":    ctxUsage,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "permission_mode": mode})
+}
+
+// maskKey masks most of an API key, keeping the first and last four runes
+// visible. It measures by runes so it never splits a multi-byte UTF-8 character.
+func maskKey(k string) string {
+	if k == "" {
+		return ""
+	}
+	r := []rune(k)
+	n := len(r)
+	if n <= 8 {
+		return strings.Repeat("*", n)
+	}
+	return string(r[:4]) + strings.Repeat("*", n-8) + string(r[n-4:])
+}
+
+// ─── POST /api/config/test ──────────────────────────────────────────────────
+
+type testConfigRequest struct {
+	Model    string `json:"model"`
+	BaseURL  string `json:"base_url"`
+	APIKey   string `json:"api_key"`
+	Provider string `json:"provider,omitempty"`
+	Index    int    `json:"index"`
+	// Protocol is the Custom vendor's wire format ("openai" | "anthropic" |
+	// "openai-responses"); empty means openai. Named vendors ignore it.
+	Protocol string `json:"protocol,omitempty"`
+}
+
+// storedAPIKey returns the saved key of the endpoint that best matches
+// (provider, baseURL): an exact provider+endpoint match wins, else the first
+// endpoint on the same provider. Empty when none is stored. Lets a connection
+// test reuse the stored key when the provider is unchanged.
+func storedAPIKey(cfg config.Config, provider, baseURL string) string {
+	nb := strings.TrimRight(baseURL, "/")
+	var sameProvider string
+	for _, ep := range cfg.Endpoints {
+		if ep.APIKey == "" || ep.Provider != provider {
+			continue
+		}
+		if strings.TrimRight(ep.BaseURL, "/") == nb {
+			return ep.APIKey
+		}
+		if sameProvider == "" {
+			sameProvider = ep.APIKey
+		}
+	}
+	return sameProvider
+}
+
+func (s *Server) handleTestConfig(w http.ResponseWriter, r *http.Request) {
+	var req testConfigRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if req.Model == "" || req.BaseURL == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "model and base_url are required"})
+		return
+	}
+
+	// Resolve the vendor: explicit request field > known endpoint > the Custom
+	// catch-all (the URL is custom by then).
+	providerName := app.ProviderCustom
+	if req.Provider != "" && app.IsKnownVendor(req.Provider) {
+		providerName = req.Provider
+	} else if v := app.VendorByBaseURL(req.BaseURL); v != "" {
+		providerName = v
+	}
+	// The Custom vendor has no fixed wire format; derive it from the request.
+	protocol := ""
+	if app.VendorNeedsProtocol(providerName) {
+		protocol = req.Protocol
+		if protocol == "" {
+			protocol = "openai"
+		}
+	}
+
+	// Resolve the key. An empty or still-masked field means "unchanged" — the
+	// panel never prefills the key input, so editing a model and hitting Test
+	// sends no key. Then test the key real requests would use: the vendor's
+	// env var first, as senderForEntry does, so a stored key the env shadows
+	// isn't reported as working; the matching entry's stored key last.
+	key := req.APIKey
+	if key == "" || strings.Contains(key, "****") {
+		key = os.Getenv(app.VendorAPIKeyEnvVar(providerName))
+	}
+	if key == "" {
+		if cfg, err := config.Load(); err == nil {
+			key = storedAPIKey(cfg, providerName, req.BaseURL)
+		}
+	}
+	if key == "" && !app.VendorKeyOptional(providerName) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "no API key provided"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	if err := app.TestConnection(ctx, providerName, key, req.BaseURL, req.Model, protocol, nil); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Connection successful"})
+}
+
+// ─── POST/PATCH/DELETE /api/config/endpoints (CRUD) ─────────────────────────
+//
+// PR5 (design §10.2): endpoint-level CRUD. The handler layer is thin — it
+// parses the request, calls config.UpsertEndpoint / UpsertModel /
+// SetDefaultComposite / RenameEndpoint under config.Mutate (flock + atomic
+// Save), and triggers s.invalidateEndpointSenders when connection params or
+// the endpoint id changes. Model-level mutations (add/delete model under an
+// endpoint) also invalidate per the coarse-grained policy (design §6).
+//
+// Old /api/config/models* handlers (POST/PATCH/DELETE) were deleted in the
+// same slice — callers must use these endpoint-level routes. The web UI
+// continues to read endpoints via GET /api/config/endpoints (PR4b) and will
+// gain editing affordances in a follow-up PR.
+
+type createEndpointRequest struct {
+	ID       string            `json:"id"`
+	Name     string            `json:"name,omitempty"`
+	Provider string            `json:"provider"`
+	BaseURL  string            `json:"base_url,omitempty"`
+	APIKey   string            `json:"api_key,omitempty"`
+	Protocol string            `json:"protocol,omitempty"`
+	Models   []endpointModelIn `json:"models,omitempty"`
+	Headers  map[string]string `json:"headers,omitempty"`
+}
+
+type endpointModelIn struct {
+	Model string `json:"model"`
+	// A pointer distinguishes an omitted field (preserve) from explicit zero
+	// (clear the deployment override and resume automatic window resolution).
+	ContextWindow *int `json:"context_window,omitempty"`
+	// Same pointer rule as ContextWindow: an update from an older client that
+	// omits rpm must not erase a value set in config.yml. The string pointers
+	// follow the same rule for the per-model connection overrides.
+	// Same pointer rule as ContextWindow: an update from a client that doesn't
+	// know this field must not erase a ladder set in config.yml. An explicit
+	// empty array clears it (back to the vendor default).
+	RPM              *int      `json:"rpm,omitempty"`
+	BaseURL          *string   `json:"base_url,omitempty"`
+	Protocol         *string   `json:"protocol,omitempty"`
+	ReasoningEfforts *[]string `json:"reasoning_efforts,omitempty"`
+	Vision           bool      `json:"vision"`
+}
+
+type updateEndpointRequest struct {
+	// NewID, when non-empty, triggers a rename (RenameEndpoint + cascade).
+	NewID string `json:"new_id,omitempty"`
+	// Name is a pointer so an omitted field (preserve) is distinguishable from
+	// an explicit "" (clear the display name): the name is optional, so the
+	// user must be able to go back to showing just the id.
+	Name     *string           `json:"name,omitempty"`
+	Provider string            `json:"provider,omitempty"`
+	BaseURL  string            `json:"base_url,omitempty"`
+	APIKey   string            `json:"api_key,omitempty"`
+	Protocol string            `json:"protocol,omitempty"`
+	Headers  map[string]string `json:"headers,omitempty"`
+}
+
+// endpointJSONOut is the response shape for a single endpoint — same as
+// endpointConfigJSON from GET /api/config/endpoints, kept inline here so the
+// CRUD handlers don't depend on the read handler's type staying put.
+type endpointJSONOut struct {
+	ID        string              `json:"id"`
+	Name      string              `json:"name,omitempty"`
+	Provider  string              `json:"provider"`
+	BaseURL   string              `json:"base_url,omitempty"`
+	Protocol  string              `json:"protocol,omitempty"`
+	HasAPIKey bool                `json:"has_api_key"`
+	APIKeyEnv string              `json:"api_key_env,omitempty"`
+	Models    []endpointModelJSON `json:"models"`
+	Headers   map[string]string   `json:"headers,omitempty"`
+}
+
+func endpointToJSON(ep config.Endpoint) endpointJSONOut {
+	out := endpointJSONOut{
+		ID:        ep.ID,
+		Name:      ep.Name,
+		Provider:  ep.Provider,
+		BaseURL:   ep.BaseURL,
+		Protocol:  ep.Protocol,
+		HasAPIKey: ep.APIKey != "",
+		APIKeyEnv: apiKeyEnvInEffect(ep.Provider),
+		Models:    make([]endpointModelJSON, 0, len(ep.Models)),
+		Headers:   ep.Headers,
+	}
+	for _, m := range ep.Models {
+		out.Models = append(out.Models, endpointModelJSON{
+			Model:            m.Model,
+			ContextWindow:    m.ContextWindow,
+			Vision:           m.Vision,
+			RPM:              m.RPM,
+			BaseURL:          m.BaseURL,
+			Protocol:         m.Protocol,
+			ReasoningEfforts: effectiveReasoningEfforts(ep, m),
+		})
+	}
+	return out
+}
+
+// handleCreateEndpoint: POST /api/config/endpoints
+func (s *Server) handleCreateEndpoint(w http.ResponseWriter, r *http.Request) {
+	var req createEndpointRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if req.ID == "" {
+		writeError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	if req.Provider == "" {
+		writeError(w, http.StatusBadRequest, "provider is required")
+		return
+	}
+
+	var created config.Endpoint
+	if err := config.Mutate(func(cfg *config.Config) error {
+		// Reject id collision — Validate would flag it as unfixable anyway.
+		for _, ep := range cfg.Endpoints {
+			if ep.ID == req.ID {
+				return fmt.Errorf("endpoint id %q already exists", req.ID)
+			}
+		}
+		ep := config.Endpoint{
+			ID:       req.ID,
+			Name:     req.Name,
+			Provider: req.Provider,
+			BaseURL:  req.BaseURL,
+			APIKey:   req.APIKey,
+			Protocol: req.Protocol,
+			Headers:  req.Headers,
+		}
+		for _, m := range req.Models {
+			if m.Model == "" {
+				continue
+			}
+			if m.ContextWindow != nil && (*m.ContextWindow < 0 || *m.ContextWindow > 0 && *m.ContextWindow < config.MinFallbackContextWindow) {
+				return fmt.Errorf("model %q context_window must be 0 or at least %d tokens", m.Model, config.MinFallbackContextWindow)
+			}
+			if m.RPM != nil && (*m.RPM < 0 || *m.RPM > config.MaxRateLimitValue) {
+				return fmt.Errorf("model %q rpm must be 0 (unlimited) or between 1 and %d", m.Model, config.MaxRateLimitValue)
+			}
+			if m.Protocol != nil && *m.Protocol != "" && !validModelProtocol(*m.Protocol) {
+				return fmt.Errorf("model %q protocol must be anthropic, openai or openai-responses", m.Model)
+			}
+			contextWindow := 0
+			if m.ContextWindow != nil {
+				contextWindow = *m.ContextWindow
+			}
+			rpm := 0
+			if m.RPM != nil {
+				rpm = *m.RPM
+			}
+			baseURL := ""
+			if m.BaseURL != nil {
+				baseURL = strings.TrimSpace(*m.BaseURL)
+			}
+			protocol := ""
+			if m.Protocol != nil {
+				protocol = strings.TrimSpace(*m.Protocol)
+			}
+			var efforts []string
+			if m.ReasoningEfforts != nil {
+				efforts = config.OrderReasoningEfforts(*m.ReasoningEfforts)
+			}
+			ep.Models = append(ep.Models, config.EndpointModel{Model: m.Model, ContextWindow: contextWindow, Vision: m.Vision, RPM: rpm, BaseURL: baseURL, Protocol: protocol, ReasoningEfforts: efforts})
+		}
+		cfg.UpsertEndpoint(ep)
+		created = ep
+		return nil
+	}); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// A brand-new endpoint has no cached senders yet, so no invalidation
+	// needed. New endpoints with models could in principle be referenced
+	// immediately, but the cache is populated lazily on the first turn.
+	writeJSON(w, http.StatusCreated, endpointToJSON(created))
+}
+
+// handleUpdateEndpoint: PATCH /api/config/endpoints/{id}
+// Without new_id: updates connection params / name in place.
+// With new_id: renames the endpoint (RenameEndpoint + Default/Lite cascade +
+// invalidateEndpointSenders on the old id).
+func (s *Server) handleUpdateEndpoint(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing endpoint id")
+		return
+	}
+	var req updateEndpointRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+
+	var updated config.Endpoint
+	if err := config.Mutate(func(cfg *config.Config) error {
+		idx := -1
+		for i := range cfg.Endpoints {
+			if cfg.Endpoints[i].ID == id {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return fmt.Errorf("%w: %s", config.ErrEndpointNotFound, id)
+		}
+		// Rename path: new_id triggers RenameEndpoint (which rewrites
+		// Default/Lite composite-id prefixes) before applying field updates.
+		if req.NewID != "" && req.NewID != id {
+			if err := cfg.RenameEndpoint(id, req.NewID); err != nil {
+				return err
+			}
+			// RenameEndpoint updated Endpoints[idx].ID in place; re-find it
+			// under the new id so the field patches below land on the right
+			// endpoint.
+			for i := range cfg.Endpoints {
+				if cfg.Endpoints[i].ID == req.NewID {
+					idx = i
+					break
+				}
+			}
+		}
+		ep := cfg.Endpoints[idx]
+		// Apply field patches. Empty strings in the request mean "unchanged"
+		// EXCEPT for Protocol/BaseURL where the user may legitimately want to
+		// clear them — but we can't distinguish "omitted" from "cleared" with
+		// the current JSON shape. PR5 errs on the side of "empty = unchanged"
+		// for those fields; clearing one requires sending the previous value.
+		// Name is the exception: it is a pointer, so "" clears it.
+		if req.Name != nil {
+			ep.Name = strings.TrimSpace(*req.Name)
+		}
+		if req.Provider != "" {
+			ep.Provider = req.Provider
+		}
+		if req.BaseURL != "" {
+			ep.BaseURL = req.BaseURL
+		}
+		if req.APIKey != "" {
+			ep.APIKey = req.APIKey
+		}
+		if req.Protocol != "" {
+			ep.Protocol = req.Protocol
+		}
+		// Headers is a map, so unlike the string fields above, encoding/json
+		// distinguishes "omitted" (nil) from "explicitly sent, possibly empty"
+		// (non-nil). req.Headers != nil means the caller submitted a full
+		// replacement for the headers set; {} clears it.
+		if req.Headers != nil {
+			ep.Headers = req.Headers
+		}
+		cfg.Endpoints[idx] = ep
+		updated = ep
+		return nil
+	}); err != nil {
+		if errors.Is(err, config.ErrEndpointNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, config.ErrEndpointIDInUse) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Invalidate cached senders for the endpoint — connection params may have
+	// changed (coarse-grained: we invalidate even if only Name changed). If a
+	// rename happened, invalidate the OLD id (senders cached under "<old>::...").
+	invalidID := id
+	if req.NewID != "" && req.NewID != id {
+		invalidID = id
+	}
+	s.invalidateEndpointSenders(invalidID)
+	// Connection params (base_url, api_key, headers, ...) of the endpoint
+	// backing the default entry may have changed; unbound sessions ride the
+	// default sender, so rebuild it too — otherwise the update only reaches
+	// bound sessions and the default sender keeps the stale connection until
+	// restart.
+	if err := s.reloadDefaultSender(); err != nil {
+		log.Printf("[server] reload default sender after endpoint update: %v", err)
+	}
+	writeJSON(w, http.StatusOK, endpointToJSON(updated))
+}
+
+// handleDeleteEndpoint: DELETE /api/config/endpoints/{id}
+func (s *Server) handleDeleteEndpoint(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing endpoint id")
+		return
+	}
+	if err := config.Mutate(func(cfg *config.Config) error {
+		idx := -1
+		for i := range cfg.Endpoints {
+			if cfg.Endpoints[i].ID == id {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return fmt.Errorf("%w: %s", config.ErrEndpointNotFound, id)
+		}
+		cfg.Endpoints = append(cfg.Endpoints[:idx], cfg.Endpoints[idx+1:]...)
+		// Clear Default/Lite/VisionHelper if they pointed at the deleted
+		// endpoint's prefix.
+		if strings.HasPrefix(cfg.Default, id+"::") {
+			cfg.Default = ""
+		}
+		if strings.HasPrefix(cfg.Lite, id+"::") {
+			cfg.Lite = ""
+		}
+		if strings.HasPrefix(cfg.VisionHelper, id+"::") {
+			cfg.VisionHelper = ""
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, config.ErrEndpointNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.invalidateEndpointSenders(id)
+	// Deleting the endpoint may have cleared Default (when it pointed at this
+	// endpoint) — rebuild the default sender so unbound sessions stop riding
+	// a sender built against the deleted endpoint.
+	if err := s.reloadDefaultSender(); err != nil {
+		log.Printf("[server] reload default sender after endpoint delete: %v", err)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleAddEndpointModel: POST /api/config/endpoints/{id}/models
+func (s *Server) handleAddEndpointModel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing endpoint id")
+		return
+	}
+	var req endpointModelIn
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if req.Model == "" {
+		writeError(w, http.StatusBadRequest, "model is required")
+		return
+	}
+	if req.ContextWindow != nil && (*req.ContextWindow < 0 || *req.ContextWindow > 0 && *req.ContextWindow < config.MinFallbackContextWindow) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("context_window must be 0 or at least %d tokens", config.MinFallbackContextWindow))
+		return
+	}
+	if req.RPM != nil && (*req.RPM < 0 || *req.RPM > config.MaxRateLimitValue) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("rpm must be 0 (unlimited) or between 1 and %d", config.MaxRateLimitValue))
+		return
+	}
+	if req.Protocol != nil && *req.Protocol != "" && !validModelProtocol(*req.Protocol) {
+		writeError(w, http.StatusBadRequest, "protocol must be anthropic, openai or openai-responses")
+		return
+	}
+
+	var updated config.Endpoint
+	if err := config.Mutate(func(cfg *config.Config) error {
+		contextWindow := 0
+		if req.ContextWindow != nil {
+			contextWindow = *req.ContextWindow
+		} else {
+			// Settings clients created before context_window existed omit the
+			// field, so an update must not erase a value set in config.yml.
+			for _, ep := range cfg.Endpoints {
+				if ep.ID != id {
+					continue
+				}
+				for _, model := range ep.Models {
+					if model.Model == req.Model {
+						contextWindow = model.ContextWindow
+						break
+					}
+				}
+				break
+			}
+		}
+		rpm := 0
+		if req.RPM != nil {
+			rpm = *req.RPM
+		} else {
+			// Same preserve rule as context_window above.
+			for _, ep := range cfg.Endpoints {
+				if ep.ID != id {
+					continue
+				}
+				for _, model := range ep.Models {
+					if model.Model == req.Model {
+						rpm = model.RPM
+						break
+					}
+				}
+				break
+			}
+		}
+		// Per-model connection overrides follow the same preserve rule: a
+		// client that omits them must not erase hand-edited config.yml values.
+		// An explicit "" clears the override (back to the endpoint's own).
+		// reasoning_efforts uses the same rule: the model's own ladder is
+		// hand-edited today, so an update from the Settings form (which has no
+		// field for it) must carry it forward rather than reset it to the
+		// vendor default.
+		baseURL := ""
+		protocol := ""
+		var efforts []string
+		if req.BaseURL != nil || req.Protocol != nil || req.ReasoningEfforts != nil {
+			if req.BaseURL != nil {
+				baseURL = strings.TrimSpace(*req.BaseURL)
+			}
+			if req.Protocol != nil {
+				protocol = strings.TrimSpace(*req.Protocol)
+			}
+			if req.ReasoningEfforts != nil {
+				efforts = config.OrderReasoningEfforts(*req.ReasoningEfforts)
+			}
+		} else {
+			for _, ep := range cfg.Endpoints {
+				if ep.ID != id {
+					continue
+				}
+				for _, model := range ep.Models {
+					if model.Model == req.Model {
+						baseURL = model.BaseURL
+						protocol = model.Protocol
+						efforts = model.ReasoningEfforts
+						break
+					}
+				}
+				break
+			}
+		}
+		if err := cfg.UpsertModel(id, config.EndpointModel{Model: req.Model, ContextWindow: contextWindow, Vision: req.Vision, RPM: rpm, BaseURL: baseURL, Protocol: protocol, ReasoningEfforts: efforts}); err != nil {
+			return err
+		}
+		for _, ep := range cfg.Endpoints {
+			if ep.ID == id {
+				updated = ep
+				break
+			}
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, config.ErrEndpointNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.invalidateEndpointSenders(id)
+	writeJSON(w, http.StatusOK, endpointToJSON(updated))
+}
+
+// handleListRemoteModels backs the settings panel's "Fetch models" button: it
+// asks a saved Custom endpoint which model ids it serves, using the stored
+// connection (env key first, like senderForEntry). It only reads — the panel
+// adds the ids the user picks through POST .../models. A failed upstream call
+// is a normal result ({ok:false}), not an HTTP error, so the panel can show it
+// next to the button the same way handleTestConfig's result is shown.
+func (s *Server) handleListRemoteModels(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	cfg, err := config.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var ep config.Endpoint
+	found := false
+	for _, e := range cfg.Endpoints {
+		if e.ID == id {
+			ep, found = e, true
+			break
+		}
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("endpoint %q not found", id))
+		return
+	}
+	// Named vendors keep their curated lists; Anthropic-protocol endpoints have
+	// no common listing call. Responses endpoints share OpenAI's /v1/models.
+	if ep.Provider != app.ProviderCustom || (ep.Protocol != "openai" && ep.Protocol != "openai-responses") {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "fetching models is only supported for custom OpenAI-compatible endpoints"})
+		return
+	}
+
+	key := os.Getenv(app.VendorAPIKeyEnvVar(ep.Provider))
+	if key == "" {
+		key = ep.APIKey
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	models, err := app.ListModels(ctx, ep.Provider, key, ep.BaseURL, ep.Protocol, ep.Headers)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": models})
+}
+
+// handleTestEndpoint: POST /api/config/endpoints/{id}/test {model}. Tests a
+// saved endpoint with its own stored connection — env key first, then its
+// stored key, its base URL and its headers — the way real requests reach it.
+// handleTestConfig instead tests unsaved form values and can only guess the
+// stored key from provider + base URL, which picks the wrong one when two
+// endpoints share a provider, and it has no headers. Like that handler, a
+// failed upstream call is a normal {ok:false} result.
+func (s *Server) handleTestEndpoint(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if req.Model == "" {
+		writeError(w, http.StatusBadRequest, "model is required")
+		return
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var ep config.Endpoint
+	found := false
+	for _, e := range cfg.Endpoints {
+		if e.ID == id {
+			ep, found = e, true
+			break
+		}
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("endpoint %q not found", id))
+		return
+	}
+
+	key := os.Getenv(app.VendorAPIKeyEnvVar(ep.Provider))
+	if key == "" {
+		key = ep.APIKey
+	}
+	if key == "" && !app.VendorKeyOptional(ep.Provider) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "no API key provided"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	if err := app.TestConnection(ctx, ep.Provider, key, ep.BaseURL, req.Model, ep.Protocol, ep.Headers); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Connection successful"})
+}
+
+// handleDeleteEndpointModel: DELETE /api/config/endpoints/{id}/models/{model}
+func (s *Server) handleDeleteEndpointModel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	model := r.PathValue("model")
+	if id == "" || model == "" {
+		writeError(w, http.StatusBadRequest, "missing endpoint id or model")
+		return
+	}
+	if err := config.Mutate(func(cfg *config.Config) error {
+		for i := range cfg.Endpoints {
+			if cfg.Endpoints[i].ID != id {
+				continue
+			}
+			kept := cfg.Endpoints[i].Models[:0]
+			for _, m := range cfg.Endpoints[i].Models {
+				if m.Model == model {
+					continue
+				}
+				kept = append(kept, m)
+			}
+			cfg.Endpoints[i].Models = kept
+			// Clear Default/Lite/VisionHelper if they pointed at the deleted model.
+			if cfg.Default == id+"::"+model {
+				cfg.Default = ""
+			}
+			if cfg.Lite == id+"::"+model {
+				cfg.Lite = ""
+			}
+			if cfg.VisionHelper == id+"::"+model {
+				cfg.VisionHelper = ""
+			}
+			return nil
+		}
+		return fmt.Errorf("%w: %s", config.ErrEndpointNotFound, id)
+	}); err != nil {
+		if errors.Is(err, config.ErrEndpointNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.invalidateEndpointSenders(id)
+	// Deleting the model may have cleared Default (when it pointed exactly at
+	// "<id>::<model>") — rebuild the default sender so unbound sessions pick
+	// up the new default (or fall out of the stale one) on their next turn.
+	if err := s.reloadDefaultSender(); err != nil {
+		log.Printf("[server] reload default sender after endpoint model delete: %v", err)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// resolveEndpointModel picks the target model for default/lite assignment.
+// If model is empty, it returns the endpoint's first model. Otherwise it
+// validates that the model exists under the endpoint.
+func resolveEndpointModel(ep config.Endpoint, model string) (string, error) {
+	if len(ep.Models) == 0 {
+		return "", fmt.Errorf("endpoint %q has no models", ep.ID)
+	}
+	if model == "" {
+		return ep.Models[0].Model, nil
+	}
+	for _, m := range ep.Models {
+		if m.Model == model {
+			return model, nil
+		}
+	}
+	return "", fmt.Errorf("model %q not found in endpoint %q", model, ep.ID)
+}
+
+// handleSetEndpointDefault: POST /api/config/endpoints/{id}/default[?model=<model>]
+// Sets cfg.Default to "<id>::<model>". If ?model is omitted, the endpoint's
+// first model is used. A model that does not exist under the endpoint is
+// rejected with 400.
+func (s *Server) handleSetEndpointDefault(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing endpoint id")
+		return
+	}
+	model := r.URL.Query().Get("model")
+	var newDefault string
+	if err := config.Mutate(func(cfg *config.Config) error {
+		for _, ep := range cfg.Endpoints {
+			if ep.ID != id {
+				continue
+			}
+			m, err := resolveEndpointModel(ep, model)
+			if err != nil {
+				return err
+			}
+			newDefault = ep.CompositeID(m)
+			cfg.SetDefaultComposite(newDefault)
+			return nil
+		}
+		return fmt.Errorf("%w: %s", config.ErrEndpointNotFound, id)
+	}); err != nil {
+		if errors.Is(err, config.ErrEndpointNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Default switch does NOT invalidate the per-entry sender cache (design §6)
+	// — it only changes which sender ResolveDefault returns next turn. However it
+	// MUST update s.model immediately so that handleCreateSession (which reads
+	// s.model directly) picks up the new default, not the stale startup fallback
+	// (e.g. claude-sonnet-4-6 on a fresh install). Without this, the first
+	// onboard session is created with the wrong model and fails with 500 because
+	// senderForSession later pairs the reconfigured sender with a stale model.
+	if err := s.reloadDefaultSender(); err != nil {
+		log.Printf("[server] reload default sender after default change: %v", err)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "default": newDefault})
+}
+
+// handleSetEndpointLite: POST /api/config/endpoints/{id}/lite[?model=<model>]
+// Sets cfg.Lite to "<id>::<model>". If ?model is omitted, the endpoint's first
+// model is used. A model that does not exist under the endpoint is rejected with
+// 400.
+func (s *Server) handleSetEndpointLite(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing endpoint id")
+		return
+	}
+	model := r.URL.Query().Get("model")
+	var newLite string
+	if err := config.Mutate(func(cfg *config.Config) error {
+		for _, ep := range cfg.Endpoints {
+			if ep.ID != id {
+				continue
+			}
+			m, err := resolveEndpointModel(ep, model)
+			if err != nil {
+				return err
+			}
+			newLite = ep.CompositeID(m)
+			cfg.Lite = newLite
+			return nil
+		}
+		return fmt.Errorf("%w: %s", config.ErrEndpointNotFound, id)
+	}); err != nil {
+		if errors.Is(err, config.ErrEndpointNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "lite": newLite})
+}
+
+// handleUnsetEndpointLite: DELETE /api/config/endpoints/{id}/lite
+// Clears cfg.Lite if it currently points at this endpoint. If lite is assigned
+// to a different endpoint, the call is a no-op and returns the existing value.
+func (s *Server) handleUnsetEndpointLite(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing endpoint id")
+		return
+	}
+	var cleared bool
+	var currentLite string
+	if err := config.Mutate(func(cfg *config.Config) error {
+		for _, ep := range cfg.Endpoints {
+			if ep.ID != id {
+				continue
+			}
+			currentLite = cfg.Lite
+			if strings.HasPrefix(cfg.Lite, id+"::") {
+				cfg.Lite = ""
+				cleared = true
+			}
+			return nil
+		}
+		return fmt.Errorf("%w: %s", config.ErrEndpointNotFound, id)
+	}); err != nil {
+		if errors.Is(err, config.ErrEndpointNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": cleared, "lite": currentLite})
+}
+
+// handleSetEndpointVisionHelper: POST /api/config/endpoints/{id}/vision_helper[?model=<model>]
+// Sets cfg.VisionHelper to "<id>::<model>". If ?model is omitted, the
+// endpoint's first vision-capable model is used. A model that doesn't exist
+// under the endpoint, or that can't accept images, is rejected with 400 — a
+// text-only helper would leave the feature silently dead.
+func (s *Server) handleSetEndpointVisionHelper(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing endpoint id")
+		return
+	}
+	model := r.URL.Query().Get("model")
+	var newHelper string
+	if err := config.Mutate(func(cfg *config.Config) error {
+		for _, ep := range cfg.Endpoints {
+			if ep.ID != id {
+				continue
+			}
+			m, err := resolveVisionEndpointModel(ep, model)
+			if err != nil {
+				return err
+			}
+			newHelper = ep.CompositeID(m)
+			cfg.VisionHelper = newHelper
+			return nil
+		}
+		return fmt.Errorf("%w: %s", config.ErrEndpointNotFound, id)
+	}); err != nil {
+		if errors.Is(err, config.ErrEndpointNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "vision_helper": newHelper})
+}
+
+// handleUnsetEndpointVisionHelper: DELETE /api/config/endpoints/{id}/vision_helper
+// Clears cfg.VisionHelper if it currently points at this endpoint. If it names
+// a different endpoint, the call is a no-op and returns the existing value.
+func (s *Server) handleUnsetEndpointVisionHelper(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing endpoint id")
+		return
+	}
+	var cleared bool
+	var current string
+	if err := config.Mutate(func(cfg *config.Config) error {
+		for _, ep := range cfg.Endpoints {
+			if ep.ID != id {
+				continue
+			}
+			current = cfg.VisionHelper
+			if strings.HasPrefix(cfg.VisionHelper, id+"::") {
+				cfg.VisionHelper = ""
+				cleared = true
+			}
+			return nil
+		}
+		return fmt.Errorf("%w: %s", config.ErrEndpointNotFound, id)
+	}); err != nil {
+		if errors.Is(err, config.ErrEndpointNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": cleared, "vision_helper": current})
+}
+
+// resolveVisionEndpointModel is resolveEndpointModel with the extra rule that
+// the model must accept image input. An empty model picks the endpoint's first
+// vision-capable one rather than its first model outright.
+func resolveVisionEndpointModel(ep config.Endpoint, model string) (string, error) {
+	if len(ep.Models) == 0 {
+		return "", fmt.Errorf("endpoint %q has no models", ep.ID)
+	}
+	if model == "" {
+		for _, m := range ep.Models {
+			if m.Vision {
+				return m.Model, nil
+			}
+		}
+		return "", fmt.Errorf("endpoint %q has no vision-capable model", ep.ID)
+	}
+	for _, m := range ep.Models {
+		if m.Model != model {
+			continue
+		}
+		if !m.Vision {
+			return "", fmt.Errorf("model %q in endpoint %q does not accept image input", model, ep.ID)
+		}
+		return model, nil
+	}
+	return "", fmt.Errorf("model %q not found in endpoint %q", model, ep.ID)
+}

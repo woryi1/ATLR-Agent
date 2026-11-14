@@ -1,0 +1,752 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/config"
+	"github.com/open-octo/octo-agent/internal/hooks"
+	"github.com/open-octo/octo-agent/internal/mcp"
+	"github.com/open-octo/octo-agent/internal/memory"
+	"github.com/open-octo/octo-agent/internal/permission"
+	"github.com/open-octo/octo-agent/internal/skills"
+	"github.com/open-octo/octo-agent/internal/tools"
+)
+
+// replConfig holds everything runREPL needs.
+type replConfig struct {
+	a          *agent.Agent
+	session    *agent.Session
+	noSave     bool
+	suggest    bool               // true → after each turn, offer an LLM follow-up suggestion (TUI ghost text)
+	plain      bool               // true → fall back to terse ↳ status lines for all tool events
+	verbosity  verbosity          // quiet | normal | verbose; controls spinner + chrome
+	permEngine *permission.Engine // nil → no tool-permission gating
+	stdin      io.Reader
+	stdout     io.Writer
+	stderr     io.Writer
+	tools      []agent.ToolDefinition
+	// toolCtx is the context the tool-list builders read. It carries the
+	// agent-profile store so sub_agent's subagent_type parameter can name the
+	// agents installed on this machine — without it the CLI advertises only
+	// the built-in tiers, and a user agent stays undiscoverable even though
+	// it resolves fine. Every recompute of cfg.tools must go through it (see
+	// toolContext), or the tool list silently reverts to the store-less
+	// schema. nil in tests → toolContext falls back to context.Background.
+	toolCtx     context.Context
+	executor    agent.ToolExecutor
+	subAgentMgr *tools.SubAgentManager // nil → sub-agent tools disabled
+	skillReg    *skills.Registry       // discovered skills; backs /skills and /<name>
+	memDir      string                 // per-repo memory directory; backs /memory ("" → disabled)
+	// cwd is the directory this session works in: the process's launch
+	// directory, or the resumed session's project directory when it has one.
+	// Backs /sessions, which lists the sessions belonging to it — the same set
+	// `octo -c` offers from there.
+	cwd string
+	// reader, when non-nil, is the line reader to use instead of building
+	// one fresh inside runREPL. Set by cmd/octo so the same instance is
+	// shared with the permission gate and the ask_user_question asker.
+	// Tests that only pass cfg.stdin leave this nil; runREPL builds a
+	// scanner-backed reader over stdin for them.
+	reader lineReader
+	// view, when non-nil, is the ViewSink driving turn rendering and Ask
+	// prompts. Set by cmd/octo so the same instance backs the turn loop, the
+	// permission gate, and the asker. Tests leave it nil; runREPL builds a
+	// plainView over the resolved reader.
+	view ViewSink
+	// mcpBoot, when non-nil, tells runTUI to connect the MCP servers in the
+	// background after first paint instead of blocking startup on them. Only
+	// the TUI path sets it; the headless one-shot connects synchronously
+	// (its single turn needs the full tool surface up front). nil → no MCP.
+	mcpBoot *mcpBootstrap
+	// recomposeMCPManifest, when non-nil, re-renders the "# Available MCP
+	// tools" system-prompt layer (see tools.MCPManifestFor) against the
+	// now-live MCP registry and writes the result into a.System/a.LeanSystem.
+	// mcpBoot means the manifest is necessarily empty at first paint (no
+	// registry yet); mcpReadyMsg calls this once the background connect in
+	// runTUI's mcpConnectCmd finishes, mirroring how it already refreshes
+	// cfg.tools via tools.DefaultToolsForCtx. nil for the headless one-shot,
+	// which connects synchronously before its system prompt is composed and
+	// so never needs a second pass.
+	recomposeMCPManifest func()
+	// recomposeSystemPrompt, when non-nil, fully rebuilds the system prompt
+	// against live skills/MCP/memory and writes the result into
+	// a.System/a.LeanSystem. Backs the /reload slash command: the web/IM
+	// transports freeze the composed prompt onto the session file (see
+	// Session.SetComposedSystem) and /reload there just clears that field for
+	// the next turn to recompose, but the CLI/TUI freezes purely in this
+	// process's memory, so reloading means redoing the compose in place. nil
+	// for the headless one-shot, which has no slash-command REPL to call it
+	// from.
+	recomposeSystemPrompt func()
+	// afterFirstSave, when non-nil, is called once after the session first
+	// lands on disk. It files the session under the project the startup
+	// adoption resolved (server.FileSessionInProject), deferred to here rather
+	// than done at session creation because a session that never received a
+	// message never gets a transcript — filing a ghost id would be harmless
+	// but pointless. nil when saving is off, on a resumed session, when the
+	// adoption resolved to "task", or for the headless one-shot.
+	afterFirstSave func()
+	// modelName is the resolved model displayed in the TUI status bar.
+	modelName string
+	// reasoningEffort is the resolved reasoning level ("low" | "medium" | "high" | "xhigh" | "max" | "")
+	// displayed in the TUI status bar; empty means off.
+	reasoningEffort string
+	// providerName is the resolved provider (e.g. "anthropic", "openai") used
+	// to rebuild the sender when the user switches model or thinking level.
+	providerName string
+	// configEntry is the config entry the session resolved at startup; sender
+	// rebuilds (e.g. /thinking) anchor base URL and stored key on it.
+	configEntry config.ModelEntry
+	// showReasoning controls whether the reasoning/thinking trace is displayed
+	// in the TUI (when true) or suppressed (when false). Mirrors the --show-reasoning
+	// flag and config file setting.
+	showReasoning bool
+	// autoFirstInput, when non-empty, is submitted as the TUI's first turn as if
+	// the user typed it (e.g. "/onboard" on a first run). Multi-turn interaction
+	// continues normally afterward. Empty → no auto-submit.
+	autoFirstInput string
+	// notify, when true, emits a desktop notification (OSC per terminal) when a
+	// turn completes and the TUI is waiting for input. Defaults on; the global
+	// config's notify field can disable it.
+	notify bool
+	// terminalTitle, when true, sets the terminal tab/window title to the session
+	// name on TUI startup (OSC 2). Defaults on; the global config's
+	// terminal_title field can disable it.
+	terminalTitle bool
+}
+
+// toolContext returns the context the tool-list builders should read, falling
+// back to a bare context when none was wired (tests, and any path that builds
+// a replConfig by hand).
+func (c *replConfig) toolContext() context.Context {
+	if c == nil || c.toolCtx == nil {
+		return context.Background()
+	}
+	return c.toolCtx
+}
+
+// ensureSender rebuilds cfg.a.Sender when targetModel resolves to a different
+// provider or base URL than the one currently in use. The existing sender is
+// kept when provider and base URL match (no rebuild, no cache-key rotation).
+// cfg.providerName / cfg.configEntry are updated to match the new sender. On
+// error (missing key for the target provider, unknown model) cfg is left
+// unchanged.
+//
+// Returns the resolved config entry. targetModel may be a composite id
+// "<endpoint>::<model>" (the picker's accept form); the returned entry's
+// Model is always the bare model id — the only form providers accept on the
+// wire — so callers must take a.Model from it rather than from targetModel.
+func (cfg *replConfig) ensureSender(targetModel string, tuning senderTuning) (config.ModelEntry, error) {
+	models, err := config.Load()
+	if err != nil {
+		return config.ModelEntry{}, fmt.Errorf("loading config: %w", err)
+	}
+	// Reject models not present in the config — resolveProviderModel would
+	// silently fall back to the current provider (matching on flagProvider),
+	// sending the request to the wrong endpoint (e.g. longcat base URL with a
+	// deepseek model name → HTTP 500).
+	if _, found := models.EntryByModel(targetModel); !found {
+		// PR5: build the available list from Endpoints (Config.Models deleted).
+		// Emit composite ids so the user can disambiguate when a model name
+		// exists on multiple endpoints.
+		var available []string
+		for _, ep := range models.Endpoints {
+			for _, m := range ep.Models {
+				available = append(available, ep.ID+"::"+m.Model)
+			}
+		}
+		sort.Strings(available)
+		return config.ModelEntry{}, fmt.Errorf("model %q is not configured (available: %s)", targetModel, strings.Join(available, ", "))
+	}
+	provName, _, entry, ok := resolveProviderModel(cfg.providerName, targetModel, models)
+	if !ok {
+		return config.ModelEntry{}, fmt.Errorf("cannot resolve provider for model %q", targetModel)
+	}
+	if provName == cfg.providerName && entry.BaseURL == cfg.configEntry.BaseURL {
+		return entry, nil // no rebuild needed
+	}
+	newSender, err := buildSender(provName, entry, cfg.stderr, tuning)
+	if err != nil {
+		return config.ModelEntry{}, err
+	}
+	cfg.a.SetSender(newSender)
+	cfg.providerName = provName
+	cfg.configEntry = entry
+	return entry, nil
+}
+
+// mcpBootstrap carries the inputs runTUI needs to connect MCP servers from a
+// background tea.Cmd: the resolved config, our client identity, and the writer
+// that receives stdio servers' child stderr (a log file under the TUI).
+type mcpBootstrap struct {
+	cfg      *mcp.Config
+	info     mcp.Implementation
+	childErr io.Writer
+}
+
+// isFirstEverSession reports whether no sessions exist on disk yet — the
+// signal for a genuinely new user, used to show one-time orientation. Called
+// before the current session is saved, so an empty store means first run. A
+// read error degrades to false (don't show the hint) rather than guessing.
+func isFirstEverSession() bool {
+	sessions, err := agent.ListSessions(1)
+	return err == nil && len(sessions) == 0
+}
+
+// runOnce executes a single agentic turn headlessly, then exits — octo's
+// claude -p-style mode. It backs every non-TUI invocation: a positional
+// message, --prompt-file, or piped stdin. The full tool loop runs (tools are
+// on by default); rendering, the spinner, and permission/Ask prompts all flow
+// through the same plainView the interactive path used. Interactive multi-turn
+// now lives only in the TUI.
+//
+// One-shot does not persist a session (matching the original single-turn mode);
+// resuming with -c stays a TUI-only affordance.
+//
+// stream=true (the default) renders the turn live through the view; stream=false
+// runs the same agentic loop but prints only the final reply text to stdout,
+// keeping it clean for capture (`octo --stream=false ... > out`).
+func runOnce(cfg replConfig, prompt string, stream bool) int {
+	a := cfg.a
+
+	// Reap background processes the turn spawned so none outlive the run.
+	defer tools.KillAllBackground()
+	// Flush queued async hooks (retention) to disk so exit doesn't drop them.
+	defer hooks.DrainSpill(5 * time.Second)
+	defer tools.CleanSpillFiles()
+
+	// Background-process notices ride the inbox, so a later iteration of this
+	// single agentic turn picks them up (the agent drains the inbox at the
+	// start of each loop step). Sub-agent completions can no longer arrive
+	// this way — the one-shot forces sub-agents synchronous (see runChat), so
+	// the OnExit hook below is a defensive backstop only; the wiring stays for
+	// the KillAll cleanup.
+	if cfg.subAgentMgr != nil {
+		tools.SetDefaultSubAgentManager(cfg.subAgentMgr)
+		cfg.subAgentMgr.SetOnExit(func(ev tools.SubAgentNotification) {
+			a.Inbox.Enqueue(tools.FormatSubAgentNote(ev))
+		})
+		defer func() {
+			cfg.subAgentMgr.SetOnExit(nil)
+			tools.SetDefaultSubAgentManager(nil)
+			cfg.subAgentMgr.KillAll()
+		}()
+	}
+	tools.SetBackgroundOnExit(func(e tools.BgExit) {
+		a.Inbox.Enqueue(tools.FormatBgNoteWithSummary(tools.DefaultBackgroundManager(), e))
+	})
+	defer tools.SetBackgroundOnExit(nil)
+
+	// Workflows run foreground-blocking in one-shot mode (SetWorkflowForeground
+	// in runChat): the result returns through the tool call itself, so no
+	// completion notification is wired here. The kill on exit is a safety net —
+	// a foreground run that survives the turn shouldn't exist.
+	defer tools.KillDefaultWorkflows()
+
+	// A foreground workflow blocks its tool call for the whole run; surface its
+	// progress lines as they happen so a long run isn't minutes of silence.
+	// stderr, like the usage line, so piped stdout stays clean.
+	if !cfg.verbosity.quiet() {
+		tools.SetDefaultWorkflowOnEvent(func(ev tools.WorkflowEvent) {
+			if ev.Kind == "progress" {
+				fmt.Fprintf(cfg.stderr, "  · %s\n", ev.Line)
+			}
+		})
+		defer tools.SetDefaultWorkflowOnEvent(nil)
+	}
+
+	// The view sink renders the turn (spinner, streamed text, tool-event lines,
+	// cache/error) and raises Ask prompts. With a TTY reader (a positional
+	// message typed at a terminal) permission prompts are interactive; over a
+	// pipe the reader is exhausted, so plainView auto-denies — the headless
+	// posture.
+	view := cfg.view
+	if view == nil {
+		view = newPlainView(cfg.reader, cfg.stdout, cfg.stderr, cfg.verbosity, cfg.plain)
+	}
+	if cfg.permEngine != nil {
+		a.Gate = newCLIGate(cfg.permEngine, view)
+	}
+
+	// SIGINT cancels the in-flight turn; the agent finalizes well-formed history
+	// and runTurn returns context.Canceled, which we treat as a clean stop.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	// Buffered: run the full agentic loop silently, then print just the final
+	// reply text. Bypasses the live view (and its spinner / tool lines) so
+	// captured stdout carries only the answer.
+	if !stream {
+		reply, err := a.Run(ctx, prompt, cfg.tools, cfg.executor)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return 0
+			}
+			fmt.Fprintf(cfg.stderr, "octo: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(cfg.stdout, reply.Content)
+		if !cfg.verbosity.quiet() {
+			printUsageLine(cfg.stderr, reply)
+		}
+		return 0
+	}
+
+	_, err := runTurn(ctx, a, cfg, view, prompt)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		return 1
+	}
+	return 0
+}
+
+// printTuiHelp lists the slash commands the TUI supports. Slash commands live
+// only in the TUI; the plain REPL is a pure conversation loop (see runREPL).
+func printTuiHelp(w io.Writer) {
+	fmt.Fprintln(w, "Commands:")
+	fmt.Fprintln(w, "  /help        Show this message")
+	fmt.Fprintln(w, "  /agent       Show the current agent, or list available ones (/agent list)")
+	fmt.Fprintln(w, "  /init        Analyze the repo and generate/update .octorules (needs --tools)")
+	fmt.Fprintln(w, "  /compact     Summarize older history now to free up context")
+	fmt.Fprintln(w, "  /reload      Reload the system prompt to pick up a newly installed/toggled skill")
+	fmt.Fprintln(w, "  /transcript  Re-print the last (or last N) tool call(s) uncapped")
+	fmt.Fprintln(w, "  /loop        Repeat a task this session (/loop [interval] <task>; stop with Ctrl-C)")
+	fmt.Fprintln(w, "  /clear       Wipe the conversation and start fresh (keeps model + tools)")
+	fmt.Fprintln(w, "  /save        Save the session now (it also auto-saves after each turn)")
+	fmt.Fprintln(w, "  /sessions    List the 10 most recent sessions")
+	fmt.Fprintln(w, "  /skills      List available skills (trigger one with /<name>)")
+	fmt.Fprintln(w, "  /memory      List what's remembered across sessions")
+	fmt.Fprintln(w, "  /mcp         Show connected MCP servers and their surfaces")
+	fmt.Fprintln(w, "  /workflows   List available workflows (run one by asking, e.g. \"run <name>\")")
+	fmt.Fprintln(w, "  /trash       Recover deleted/overwritten files (/trash restore <id> to undo)")
+	fmt.Fprintln(w, "  /exit        Save and exit  (also: /quit, Ctrl-C, Ctrl-D)")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Keys:")
+	fmt.Fprintln(w, "  Ctrl+V      Paste an image from the clipboard (rides your next message; Esc discards)")
+	fmt.Fprintln(w, "  Paste       A large text paste collapses to a [#N pasted …] token; the full text is")
+	fmt.Fprintln(w, "              sent on submit. Tab folds/expands the whole box for long typed input.")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Type / to open the completion menu (Tab/↑↓ select, Enter complete) — it lists")
+	fmt.Fprintln(w, "every command and skill, so you don't have to remember names.")
+}
+
+// printMemory lists the project's memory directory: MEMORY.md (the index
+// injected every session) plus any topic files the agent has created. The
+// agent reads/writes/edits these with its file tools; this is just a viewer.
+func printMemory(w io.Writer, memDir string) {
+	if memDir == "" {
+		fmt.Fprintln(w, "Memory is disabled for this session (--no-memory).")
+		return
+	}
+	// This directory's memory IS the shared tier — say so, or the header reads
+	// as if it had memory of its own. True when running in the home directory,
+	// and equally true for a project pointed at it. Same disclosure
+	// `octo memory list` makes; a TUI user has no reason to run that.
+	if home, err := memory.HomeDir(); err == nil && home == memDir {
+		fmt.Fprintln(w, "These are the shared notes, read by every session — this directory has no separate memory of its own.")
+	}
+	fmt.Fprintf(w, "Memory directory: %s\n", memDir)
+	entries, err := os.ReadDir(memDir)
+	if err != nil || len(entries) == 0 {
+		fmt.Fprintln(w, "  (empty — nothing remembered yet)")
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			fmt.Fprintf(w, "  %s/\n", e.Name())
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			fmt.Fprintf(w, "  %s\n", e.Name())
+			continue
+		}
+		fmt.Fprintf(w, "  %-28s %5dB\n", e.Name(), info.Size())
+	}
+}
+
+// printMCP lists the connected MCP servers and the surface they advertised
+// (tool count + resource count + prompt count, plus the server-supplied
+// instructions if non-empty). Drives the /mcp REPL command.
+func printMCP(w io.Writer) {
+	reg := tools.ActiveMCPRegistry()
+	if reg == nil || reg.Len() == 0 {
+		fmt.Fprintln(w, "No MCP servers connected.")
+		fmt.Fprintln(w, "Configure one in the selected profile's mcp.json (run `octo help mcp` for the format).")
+		return
+	}
+	conns := reg.Connections()
+	if len(conns) == 1 {
+		fmt.Fprintln(w, "1 MCP server connected:")
+	} else {
+		fmt.Fprintf(w, "%d MCP servers connected:\n", len(conns))
+	}
+	for _, c := range conns {
+		info := c.Client.ServerInfo()
+		nameVer := info.Name
+		if info.Version != "" {
+			nameVer = fmt.Sprintf("%s %s", info.Name, info.Version)
+		}
+		nTools, nRes, nPrompts := len(c.Tools()), len(c.Resources()), len(c.Prompts())
+		fmt.Fprintf(w, "  %s (%s): %d tool%s, %d resource%s, %d prompt%s\n",
+			c.Name, nameVer,
+			nTools, pluralS(nTools),
+			nRes, pluralS(nRes),
+			nPrompts, pluralS(nPrompts))
+		if instr := c.Client.Instructions(); instr != "" {
+			for _, line := range strings.Split(instr, "\n") {
+				fmt.Fprintf(w, "      %s\n", line)
+			}
+		}
+	}
+}
+
+func pluralS(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// reservedReplCommands are the built-in slash commands; a skill may not shadow
+// one (so /help always means help even if a skill dir is named "help").
+var reservedReplCommands = map[string]bool{
+	"init": true, "exit": true, "quit": true, "help": true,
+	"save": true, "sessions": true, "skills": true,
+	"memory": true, "mcp": true, "workflows": true,
+}
+
+// skillTrigger reports whether line is a /<name> invocation of a discovered
+// skill (and not a reserved command), returning the skill and any trailing
+// args (the text after the command word).
+func skillTrigger(reg *skills.Registry, line string) (skills.Skill, string, bool) {
+	if reg == nil || !strings.HasPrefix(line, "/") {
+		return skills.Skill{}, "", false
+	}
+	fields := strings.Fields(line)
+	name := strings.TrimPrefix(fields[0], "/")
+	if reservedReplCommands[strings.ToLower(name)] {
+		return skills.Skill{}, "", false
+	}
+	s, ok := reg.Get(name)
+	if !ok {
+		// Re-scan once in case the skill was added after session start: the
+		// frozen manifest won't list it, but the user can still trigger it by
+		// name. Mirrors the skill tool's reload-on-miss; the rescan only runs
+		// on a non-reserved /command that didn't match a known skill.
+		reg.Reload()
+		s, ok = reg.Get(name)
+	}
+	if !ok {
+		return skills.Skill{}, "", false
+	}
+	args := strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
+	return s, args, true
+}
+
+// printSkills lists the discovered skills, or a hint when there are none.
+func printSkills(w io.Writer, reg *skills.Registry) {
+	if reg == nil || reg.Len() == 0 {
+		fmt.Fprintln(w, "No skills found (looked in the selected profile's skills directory and ./.octo/skills).")
+		return
+	}
+	fmt.Fprintln(w, "Available skills (trigger with /<name>):")
+	for _, s := range reg.List() {
+		fmt.Fprintf(w, "  /%-16s [%-7s] %s\n", s.Name, s.Source, s.Description)
+	}
+}
+
+// printWorkflows lists the available named workflows (embedded presets + user +
+// project). They aren't slash-triggered — you run one by asking the agent, e.g.
+// "run daily-triage" — so this is purely for discovery.
+func printWorkflows(w io.Writer) {
+	wfs := tools.ListNamedWorkflows()
+	if len(wfs) == 0 {
+		fmt.Fprintln(w, "No workflows found (looked in the selected profile's workflows directory and ./.octo/workflows).")
+		return
+	}
+	fmt.Fprintln(w, "Available workflows (run by asking, e.g. \"run <name>\"):")
+	for _, wf := range wfs {
+		if wf.Description != "" {
+			fmt.Fprintf(w, "  %-20s %s\n", wf.Name, wf.Description)
+		} else {
+			fmt.Fprintf(w, "  %s\n", wf.Name)
+		}
+	}
+}
+
+func saveSession(w io.Writer, sess *agent.Session, a *agent.Agent) error {
+	sess.SyncFrom(a.History)
+	if err := sess.Save(); err != nil {
+		return err
+	}
+	path, _ := sess.SavePath()
+	fmt.Fprintf(w, "Saved → %s\n", path)
+	return nil
+}
+
+// printSessions lists the sessions belonging to dir — the directory this
+// session works in, not the process cwd, which resuming a project's session
+// leaves behind. Scoped like `octo -c` so the ids on offer are the ones that
+// can actually be resumed from here.
+func printSessions(w io.Writer, dir string) error {
+	sessions, err := sessionsForDir(dir, 10)
+	if err != nil {
+		return err
+	}
+	if len(sessions) == 0 {
+		fmt.Fprintf(w, "No sessions in %s yet.\n", dir)
+		return nil
+	}
+	fmt.Fprintf(w, "Recent sessions in %s (newest first):\n", dir)
+	fmt.Fprintln(w, formatSessionList(sessions))
+	return nil
+}
+
+// formatSessionList renders the columns the user cares about for a "pick one to
+// resume" overview: 8-char short ID (the thing they paste back into
+// `octo -c`), a human-readable created-at, the title (generated, or a
+// first-message fallback so older sessions stay recognisable), the model, and
+// the turn count. Shared between `octo --list-sessions` and REPL /sessions
+// so both views agree on shape.
+func formatSessionList(sessions []*agent.Session) string {
+	var b strings.Builder
+	for _, s := range sessions {
+		turns := s.TurnCount()
+		plural := "s"
+		if turns == 1 {
+			plural = ""
+		}
+		when := s.CreatedAt.Local().Format("2006-01-02 15:04")
+		// padCol (not %-40s) because titles are often CJK: %-Ns pads by byte/rune
+		// count, which over- or under-pads double-width runes and leaves the model
+		// column ragged.
+		title := padCol(s.DisplayTitle(), 40)
+		fmt.Fprintf(&b, "  %s  %s  %s  %-22s  %d turn%s\n",
+			s.ShortID(), when, title, s.Model, turns, plural)
+	}
+	// strings.Builder result has no trailing newline trimmed — printSessions
+	// uses Fprintln below which would add one if we kept it. Drop the final
+	// "\n" we just emitted so the outer caller controls spacing.
+	out := b.String()
+	return strings.TrimRight(out, "\n")
+}
+
+// padCol collapses whitespace in s, truncates it to maxW display columns
+// (appending an ellipsis when cut), and right-pads with spaces to exactly maxW
+// columns. It measures with lipgloss.Width so wide (CJK) runes count as two
+// columns, keeping the following column aligned.
+func padCol(s string, maxW int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if lipgloss.Width(s) > maxW {
+		r := []rune(s)
+		for len(r) > 0 && lipgloss.Width(string(r))+1 > maxW {
+			r = r[:len(r)-1]
+		}
+		s = string(r) + "…"
+	}
+	if pad := maxW - lipgloss.Width(s); pad > 0 {
+		s += strings.Repeat(" ", pad)
+	}
+	return s
+}
+
+// replToolEventHandler returns an EventHandler that paints tool activity
+// onto the terminal between assistant text streams. Layout:
+//
+//	…assistant text streamed…
+//	↳ terminal: ls -la                                          ← tool_started
+//	↳ terminal ✓ (142ms)                                        ← tool_done
+//	…more assistant text…
+//
+// Status lines start with "↳ " so they're visually distinct from the
+// assistant's reply, and each is on its own line. We also insert a leading
+// newline before the FIRST status line of a turn — without it the marker
+// would butt up against the trailing character of the assistant's
+// "I'll now run terminal..." sentence.
+// plain is retained for signature stability but no longer toggles card
+// rendering: the plain / non-TTY path is always one-line tool status now;
+// rich cards are TUI-only (see dev-docs/tui-ux-upgrade-design.md decision #8).
+// replToolEventHandler renders a streamed turn. Model reply text goes to
+// stdout; tool-event chrome (↳ status rows, progress, the ⋯ typing indicator)
+// goes to chrome. Splitting them keeps a headless one-shot's stdout carrying
+// only the answer, so `octo "…" | program` pipes cleanly — pass stderr as
+// chrome there. Interactive callers where both are the terminal can pass the
+// same writer for both; the rendering is unchanged.
+func replToolEventHandler(stdout, chrome io.Writer, plain bool) func(agent.AgentEvent) {
+	_ = plain
+	// Per-tool-call start times so EventToolDone can report elapsed.
+	startedAt := make(map[string]time.Time)
+	// Track whether the previous event was a text delta — if so, a tool
+	// status line needs a leading newline to start cleanly.
+	prevWasText := false
+	// Count of `·` typing-indicator dots emitted while the LLM streams the
+	// in-flight tool's input arguments. Reset on tool_started.
+	inputDots := 0
+
+	return func(ev agent.AgentEvent) {
+		switch ev.Kind {
+		case agent.EventThinkingDelta:
+			// The terminal never renders the reasoning trace — that display
+			// lives only on the Web UI (gated by show_reasoning). Drop it here.
+
+		case agent.EventTextDelta:
+			fmt.Fprint(stdout, ev.Text)
+			prevWasText = true
+
+		case agent.EventToolInputDelta:
+			// One dot per JSON fragment, capped so a 500-line write_file
+			// content field doesn't wrap the typing indicator across the
+			// terminal. The dots line is closed when tool_started fires.
+			if inputDots == 0 {
+				if prevWasText {
+					fmt.Fprintln(chrome)
+					prevWasText = false
+				}
+				fmt.Fprint(chrome, "⋯ ")
+			}
+			if inputDots < inputDotsCap {
+				fmt.Fprint(chrome, "·")
+				inputDots++
+			}
+
+		case agent.EventToolStarted:
+			if inputDots > 0 {
+				// Close the typing-indicator line so the ↳ row starts clean.
+				fmt.Fprintln(chrome)
+				inputDots = 0
+			} else if prevWasText {
+				fmt.Fprintln(chrome)
+				prevWasText = false
+			}
+			startedAt[ev.ToolID] = time.Now()
+			fmt.Fprintf(chrome, "↳ %s: %s\n", ev.ToolName, summariseInput(ev.Input))
+
+		case agent.EventToolProgress:
+			fmt.Fprintf(chrome, "│ %s\n", boundProgressChunk(ev.Chunk))
+
+		case agent.EventToolDone:
+			elapsed := time.Duration(0)
+			if t, ok := startedAt[ev.ToolID]; ok {
+				elapsed = time.Since(t).Round(time.Millisecond)
+				delete(startedAt, ev.ToolID)
+			}
+			fmt.Fprintf(chrome, "↳ %s ✓ (%s)\n", ev.ToolName, elapsed)
+
+		case agent.EventToolError:
+			elapsed := time.Duration(0)
+			if t, ok := startedAt[ev.ToolID]; ok {
+				elapsed = time.Since(t).Round(time.Millisecond)
+				delete(startedAt, ev.ToolID)
+			}
+			fmt.Fprintf(chrome, "↳ %s ✗ (%s) — %s\n", ev.ToolName, elapsed, truncate1Line(ev.Err))
+
+			// EventTurnDone is silent — the trailing newline emitted by the
+			// REPL loop after RunStream returns serves as the turn boundary.
+		}
+	}
+}
+
+// inputDotsCap caps the typing indicator at a width that fits in any
+// reasonably-sized terminal without wrapping. The exact value isn't
+// load-bearing — pick something visually pleasant.
+const inputDotsCap = 40
+
+// summariseInput renders a short single-line description of the tool's input
+// for inline display. Keys are sorted so the line is stable; long values are
+// truncated. The goal is "enough for the user to know which call this is",
+// not full fidelity.
+func summariseInput(input map[string]any) string {
+	if len(input) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(input))
+	for k := range input {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		v := fmt.Sprintf("%v", input[k])
+		v = truncateRunes(v, 30)
+		parts = append(parts, fmt.Sprintf("%s=%s", k, v))
+	}
+	joined := strings.Join(parts, " ")
+	return truncateRunes(joined, 60)
+}
+
+// progressLineCap bounds one streamed progress line's display length. The full
+// output still reaches the model; this only keeps a single enormous line (e.g.
+// minified JSON) from flooding the live transcript.
+const progressLineCap = 300
+
+// boundProgressChunk caps each line of a streamed tool-progress chunk at
+// progressLineCap runes for display.
+func boundProgressChunk(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = truncateRunes(l, progressLineCap)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// truncate1Line collapses a multi-line error to its first non-empty line and
+// caps total length, so the status row stays single-line.
+func truncate1Line(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		return truncateRunes(line, 100)
+	}
+	return "(empty error)"
+}
+
+// truncate1LineOr is like truncate1Line but returns fallback when s contains no
+// non-empty line, avoiding the error-oriented "(empty error)" placeholder in
+// UI labels.
+func truncate1LineOr(s, fallback string) string {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		return truncateRunes(line, 100)
+	}
+	return fallback
+}
+
+// truncateRunes returns s truncated to at most max runes. If truncation is
+// needed, the result ends with "..." and never splits a multi-byte UTF-8
+// character (byte slicing a CJK string in the middle of a rune produces the
+// replacement-character garbage users see as "�").
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	if max <= 3 {
+		return string(r[:max])
+	}
+	return string(r[:max-3]) + "..."
+}

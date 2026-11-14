@@ -1,0 +1,1831 @@
+package server
+
+import (
+	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/config"
+)
+
+func setTestHome(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	// The portable data root anchors on the exe directory at runtime, which
+	// the whole test binary would share; pin it to the fake home per test so
+	// config.Load/Save stay isolated (internal/datahome.Root).
+	t.Setenv("OCTO_PORTABLE_ROOT", tmp)
+	return tmp
+}
+
+func seedModels(t *testing.T, cfg config.Config) {
+	t.Helper()
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func getConfigResponse(t *testing.T, srv *Server) configResponse {
+	t.Helper()
+	w := doJSON(t, srv, http.MethodGet, "/api/config", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /api/config = %d: %s", w.Code, w.Body.String())
+	}
+	var resp configResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func TestConfig_CoauthorGlobalDefault(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	// No config.yml value yet — GET reports the built-in default (true).
+	resp := getConfigResponse(t, srv)
+	if resp.Coauthor == nil || !*resp.Coauthor {
+		t.Fatalf("initial coauthor = %+v, want true", resp.Coauthor)
+	}
+
+	// Set global default to false.
+	if w := doJSON(t, srv, http.MethodPut, "/api/config/coauthor", `{"coauthor":false}`); w.Code != http.StatusOK {
+		t.Fatalf("PUT = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if cfg.Coauthor == nil || *cfg.Coauthor {
+		t.Fatalf("stored global = %+v, want false", cfg.Coauthor)
+	}
+	resp = getConfigResponse(t, srv)
+	if resp.Coauthor == nil || *resp.Coauthor {
+		t.Fatalf("response coauthor = %+v, want false", resp.Coauthor)
+	}
+
+	// OCTO_COAUTHOR overrides the stored config value — GET must reflect the
+	// effective value the agent actually uses, not the raw config.yml field,
+	// since Coauthor (unlike ShowReasoning) has an env-var layer above it.
+	t.Setenv("OCTO_COAUTHOR", "1")
+	resp = getConfigResponse(t, srv)
+	if resp.Coauthor == nil || !*resp.Coauthor {
+		t.Fatalf("response coauthor with OCTO_COAUTHOR=1 = %+v, want true (env should win over stored false)", resp.Coauthor)
+	}
+}
+
+func TestConfig_ShowReasoningReloadsDefaultSender(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	before := srv.getSender()
+	if before == nil {
+		t.Fatal("server should have a default sender after startup")
+	}
+
+	// Toggle global show_reasoning off.
+	if w := doJSON(t, srv, http.MethodPut, "/api/config/show_reasoning", `{"show_reasoning":false}`); w.Code != http.StatusOK {
+		t.Fatalf("PUT = %d: %s", w.Code, w.Body.String())
+	}
+
+	// The default sender should have been rebuilt (new pointer).
+	after := srv.getSender()
+	if after == nil {
+		t.Fatal("server default sender missing after reload")
+	}
+	if after == before {
+		t.Error("default sender pointer did not change after show_reasoning toggle")
+	}
+
+	// An unbound session should resolve to the newly-reloaded default sender.
+	sess := agent.NewSession("claude-sonnet-4-6", "")
+	sender, model := srv.senderForSession(sess)
+	if sender != after {
+		t.Error("unbound session should use the reloaded default sender")
+	}
+	if model != "claude-sonnet-4-6" {
+		t.Errorf("model = %q, want claude-sonnet-4-6", model)
+	}
+
+	// The effective show_reasoning broadcast value should reflect the new default.
+	_, _, _, sr, _ := srv.sessionStatusFields(sess)
+	if sr == nil || *sr {
+		t.Fatalf("effective show_reasoning = %+v, want false", sr)
+	}
+}
+
+// TestOnboardAttempt_StopsSoulSetupNudge covers #1660: once /api/onboard/attempt
+// has fired, detectOnboardPhase must not keep reporting soul_setup even
+// though soul.md is still missing (the user interrupted the first attempt) —
+// the Profile page's manual "Update" buttons remain the way back in.
+func TestOnboardAttempt_StopsSoulSetupNudge(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	if got := detectOnboardPhase(""); got != "soul_setup" {
+		t.Fatalf("detectOnboardPhase = %q before any attempt, want soul_setup", got)
+	}
+
+	w := doJSON(t, srv, http.MethodPost, "/api/onboard/attempt", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST /api/onboard/attempt = %d: %s", w.Code, w.Body.String())
+	}
+
+	if !config.OnboardAttempted() {
+		t.Fatal("config.OnboardAttempted() = false after POST /api/onboard/attempt")
+	}
+	if got := detectOnboardPhase(""); got != "" {
+		t.Fatalf("detectOnboardPhase = %q after attempt (identity still missing), want \"\" (no repeat nudge)", got)
+	}
+
+	// The regression this fix targets: a config.yml rewrite AFTER the marker was
+	// set (first-run key save, language, the /onboard skill) must NOT re-open the
+	// nudge. The marker lives in its own file, so a full config Save can't clobber
+	// it — detectOnboardPhase still returns "" (#1660 follow-up).
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Language = "zh"
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectOnboardPhase(""); got != "" {
+		t.Fatalf("detectOnboardPhase = %q after a later config.yml Save, want \"\" (marker must survive)", got)
+	}
+}
+
+// TestDetectOnboardPhase_ExistingIdentitySkipsNudge covers the trigger gate:
+// the soul_setup nudge fires only when the user has NO identity at all. If
+// either soul.md or user.md already exists — even without the attempt marker —
+// detectOnboardPhase must return "".
+func TestDetectOnboardPhase_ExistingIdentitySkipsNudge(t *testing.T) {
+	for _, name := range []string{"soul.md", "user.md"} {
+		t.Run(name, func(t *testing.T) {
+			home := setTestHome(t)
+			seedModels(t, config.Config{
+				Endpoints: []config.Endpoint{
+					{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+				},
+				Default: "ep-a::claude-sonnet-4-6",
+			})
+			octo := filepath.Join(home, "Data")
+			if err := os.MkdirAll(octo, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(octo, name), []byte("# identity"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if got := detectOnboardPhase(""); got != "" {
+				t.Fatalf("detectOnboardPhase = %q with %s present, want \"\" (no nudge when identity exists)", got, name)
+			}
+		})
+	}
+}
+
+func TestListProviders_MarksCustomCatchAll(t *testing.T) {
+	presets := buildProviderPresets()
+	byID := map[string]providerPreset{}
+	for _, p := range presets {
+		byID[p.ID] = p
+	}
+	p, ok := byID["custom"]
+	if !ok {
+		t.Fatal("custom missing from /api/providers presets")
+	}
+	if !p.CustomEndpoint || p.BaseURL != "" || p.API != "" {
+		t.Errorf("custom: CustomEndpoint=%v BaseURL=%q API=%q, want true/empty/empty", p.CustomEndpoint, p.BaseURL, p.API)
+	}
+	// The retired compatible catch-alls must no longer appear.
+	for _, id := range []string{"openai_compatible", "anthropic_compatible", "mistral"} {
+		if _, ok := byID[id]; ok {
+			t.Errorf("retired vendor %q still present in presets", id)
+		}
+	}
+	if byID["deepseek"].CustomEndpoint {
+		t.Error("deepseek must not be flagged custom_endpoint")
+	}
+}
+
+func TestListProviders_IncludesModelVision(t *testing.T) {
+	byID := map[string]providerPreset{}
+	for _, p := range buildProviderPresets() {
+		byID[p.ID] = p
+	}
+	mv := byID["bailian"].ModelVision
+	if mv["qwen3.7-plus"] != true || mv["qwen3.7-max"] != false {
+		t.Errorf("bailian model_vision = %v, want qwen3.7-plus:true qwen3.7-max:false", mv)
+	}
+	// The Custom vendor has no catalogue, so no model_vision map.
+	if byID["custom"].ModelVision != nil {
+		t.Errorf("custom model_vision = %v, want nil", byID["custom"].ModelVision)
+	}
+}
+
+func TestCreateSession_EntryIDBindsSession(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-anthropic", Provider: "anthropic", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+			{ID: "ep-kimi", Provider: "kimi", Models: []config.EndpointModel{{Model: "kimi-k2.6"}}},
+		},
+		Default: "ep-anthropic::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/sessions", `{"model":"kimi-k2.6"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST /api/sessions = %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Session struct {
+			ID    string `json:"id"`
+			Model string `json:"model"`
+		} `json:"session"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Session.Model != "kimi-k2.6" {
+		t.Errorf("session model = %q, want kimi-k2.6 (entry id resolved)", resp.Session.Model)
+	}
+	sess, err := agent.LoadSession(resp.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.ModelConfig != "kimi-k2.6" {
+		t.Errorf("model_config = %q, want kimi-k2.6", sess.ModelConfig)
+	}
+
+	// A raw model string stays unbound.
+	w = doJSON(t, srv, http.MethodPost, "/api/sessions", `{"model":"some-other-model"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST raw = %d: %s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	sess, err = agent.LoadSession(resp.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.ModelConfig != "" || sess.Model != "some-other-model" {
+		t.Errorf("raw session = (%q, %q), want (some-other-model, \"\")", sess.Model, sess.ModelConfig)
+	}
+}
+
+// Regression guard: with no workspace dir configured, a newly created
+// session's WorkingDir defaults to the portable <exe dir>\Workspace — the
+// global default every user gets unless they explicitly override it.
+func TestCreateSession_NoWorkspaceDir_DefaultsToOcto(t *testing.T) {
+	home := setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{{ID: "ep-a", Provider: "anthropic", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}}},
+		Default:   "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/sessions", `{}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST /api/sessions = %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Session struct {
+			ID string `json:"id"`
+		} `json:"session"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	sess, err := agent.LoadSession(resp.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDir := filepath.Join(home, "Workspace", "tasks", sess.ID)
+	if sess.WorkingDir != wantDir {
+		t.Errorf("WorkingDir = %q, want the task workspace %q under the default ~/Octo", sess.WorkingDir, wantDir)
+	}
+}
+
+// With a configured workspace dir, a newly created session's WorkingDir
+// defaults to it (the caller requested no working dir of its own).
+func TestCreateSession_WorkspaceDirConfigured_SetsWorkingDir(t *testing.T) {
+	home := setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{{ID: "ep-a", Provider: "anthropic", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}}},
+		Default:   "ep-a::claude-sonnet-4-6",
+	})
+	wantDir := filepath.Join(home, "octo-workspace")
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", WorkspaceDir: wantDir})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/sessions", `{}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST /api/sessions = %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Session struct {
+			ID string `json:"id"`
+		} `json:"session"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	sess, err := agent.LoadSession(resp.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTask := filepath.Join(wantDir, "tasks", sess.ID)
+	if sess.WorkingDir != wantTask {
+		t.Errorf("WorkingDir = %q, want the task workspace %q", sess.WorkingDir, wantTask)
+	}
+	if st, err := os.Stat(wantTask); err != nil || !st.IsDir() {
+		t.Errorf("task workspace %q was not created: %v", wantTask, err)
+	}
+}
+
+// getEndpointsResponse calls GET /api/config/endpoints and decodes the body.
+func getEndpointsResponse(t *testing.T, srv *Server) endpointsResponse {
+	t.Helper()
+	w := doJSON(t, srv, http.MethodGet, "/api/config/endpoints", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /api/config/endpoints = %d: %s", w.Code, w.Body.String())
+	}
+	var resp endpointsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode endpoints response: %v (body: %s)", err, w.Body.String())
+	}
+	return resp
+}
+
+// TestGetEndpoints_ReturnsTwoLevelShape pins the PR4b contract: a legacy flat
+// models: config is served as the two-level { endpoints, default, lite } shape
+// described in design §10.1, with has_api_key reporting key presence (never
+// the key itself) and default/lite expressed as composite ids.
+func TestGetEndpoints_ReturnsTwoLevelShape(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-anthropic", Provider: "anthropic", APIKey: "sk-main-12345678", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6", Vision: true}, {Model: "claude-haiku-4-5"}}},
+			{ID: "ep-kimi", Provider: "kimi", BaseURL: "https://kimi.example", APIKey: "sk-kimi", Models: []config.EndpointModel{{Model: "kimi-k2.6"}}},
+		},
+		Default: "ep-anthropic::claude-sonnet-4-6",
+		Lite:    "ep-anthropic::claude-haiku-4-5",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	// Capture the raw body too so we can assert the API keys never appear in
+	// the response at all — the JSON shape has no api_key field, only the
+	// has_api_key boolean.
+	w := doJSON(t, srv, http.MethodGet, "/api/config/endpoints", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /api/config/endpoints = %d: %s", w.Code, w.Body.String())
+	}
+	raw := w.Body.String()
+	if strings.Contains(raw, "sk-main-12345678") || strings.Contains(raw, "sk-kimi") {
+		t.Errorf("response body leaks an API key: %s", raw)
+	}
+
+	var resp endpointsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode endpoints response: %v (body: %s)", err, w.Body.String())
+	}
+
+	// Two distinct (provider, base_url) groups → two endpoints. Both
+	// anthropic entries have empty base_url, so they aggregate by
+	// (anthropic, "") — the shared API key is NOT the grouping key (it's
+	// (provider, base_url) per design §4.1). The kimi entry has a distinct
+	// base_url, so it forms its own endpoint.
+	if len(resp.Endpoints) != 2 {
+		t.Fatalf("endpoints = %d, want 2 (one per distinct (provider, base_url)): %+v", len(resp.Endpoints), resp.Endpoints)
+	}
+
+	// Find the anthropic endpoint (two models) and the kimi endpoint (one).
+	var anthropicEP, kimiEP *endpointConfigJSON
+	for i := range resp.Endpoints {
+		switch resp.Endpoints[i].Provider {
+		case "anthropic":
+			anthropicEP = &resp.Endpoints[i]
+		case "kimi":
+			kimiEP = &resp.Endpoints[i]
+		}
+	}
+	if anthropicEP == nil || kimiEP == nil {
+		t.Fatalf("missing expected providers: %+v", resp.Endpoints)
+	}
+	if len(anthropicEP.Models) != 2 {
+		t.Errorf("anthropic endpoint models = %d, want 2: %+v", len(anthropicEP.Models), anthropicEP.Models)
+	}
+	if len(kimiEP.Models) != 1 {
+		t.Errorf("kimi endpoint models = %d, want 1: %+v", len(kimiEP.Models), kimiEP.Models)
+	}
+	// Vision flag is per-model and migrates from the flat entry.
+	var sonnetVision bool
+	for _, m := range anthropicEP.Models {
+		if m.Model == "claude-sonnet-4-6" {
+			sonnetVision = m.Vision
+		}
+	}
+	if !sonnetVision {
+		t.Errorf("claude-sonnet-4-6 vision = false, want true (migrated from flat entry)")
+	}
+
+	// default + lite are composite ids whose endpoint prefix is the synthesised
+	// legacy-<host>-<n> id.
+	if resp.Default == "" || !strings.Contains(resp.Default, "::") {
+		t.Errorf("default = %q, want a composite id <endpoint>::<model>", resp.Default)
+	}
+	if !strings.HasSuffix(resp.Default, "::claude-sonnet-4-6") {
+		t.Errorf("default = %q, want suffix ::claude-sonnet-4-6", resp.Default)
+	}
+	if resp.Lite == "" || !strings.HasSuffix(resp.Lite, "::claude-haiku-4-5") {
+		t.Errorf("lite = %q, want suffix ::claude-haiku-4-5", resp.Lite)
+	}
+	// default and lite should point at the same endpoint (anthropic group).
+	if strings.Split(resp.Default, "::")[0] != strings.Split(resp.Lite, "::")[0] {
+		t.Errorf("default endpoint %q != lite endpoint %q", strings.Split(resp.Default, "::")[0], strings.Split(resp.Lite, "::")[0])
+	}
+
+	// has_api_key reports presence; the response must NOT expose the key —
+	// there is no api_key field in the JSON shape at all, only the boolean.
+	if !anthropicEP.HasAPIKey {
+		t.Errorf("anthropic endpoint has_api_key = false, want true (key seeded)")
+	}
+	if !kimiEP.HasAPIKey {
+		t.Errorf("kimi endpoint has_api_key = false, want true (key seeded)")
+	}
+}
+
+// TestGetEndpoints_NoKeyReportsAbsent covers the key-missing side of
+// has_api_key so a frontend "未设置" badge is reachable.
+func TestGetEndpoints_NoKeyReportsAbsent(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "deepseek", Models: []config.EndpointModel{{Model: "deepseek-v4-pro"}}}, // no APIKey
+		},
+		Default: "ep-a::deepseek-v4-pro",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	resp := getEndpointsResponse(t, srv)
+	if len(resp.Endpoints) != 1 {
+		t.Fatalf("endpoints = %d, want 1: %+v", len(resp.Endpoints), resp.Endpoints)
+	}
+	if resp.Endpoints[0].HasAPIKey {
+		t.Errorf("has_api_key = true, want false (no key seeded)")
+	}
+}
+
+// TestGetEndpoints_EmptyConfigReturnsEmptyShape pins the zero-config contract:
+// a fresh install (no models, no endpoints) returns an empty (but well-formed)
+// { endpoints: [], default: "", lite: "" } shape rather than a 404 or null.
+func TestGetEndpoints_EmptyConfigReturnsEmptyShape(t *testing.T) {
+	setTestHome(t)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	resp := getEndpointsResponse(t, srv)
+	if resp.Endpoints == nil {
+		t.Fatal("endpoints = nil, want an empty non-null array")
+	}
+	if len(resp.Endpoints) != 0 {
+		t.Errorf("endpoints = %d, want 0: %+v", len(resp.Endpoints), resp.Endpoints)
+	}
+	if resp.Default != "" || resp.Lite != "" {
+		t.Errorf("empty config: default=%q lite=%q, want both empty", resp.Default, resp.Lite)
+	}
+}
+
+// TestGetEndpoints_HeadersRoundTrip pins that an endpoint with custom Headers
+// echoes them back under the "headers" key, while an endpoint with none
+// reports an empty/absent map (design's Server API DTO extension).
+func TestGetEndpoints_HeadersRoundTrip(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-with-headers", Provider: "custom", BaseURL: "https://gw.example", APIKey: "sk-a", Headers: map[string]string{"X-Tenant-Id": "abc"}, Models: []config.EndpointModel{{Model: "m1"}}},
+			{ID: "ep-no-headers", Provider: "custom", BaseURL: "https://plain.example", APIKey: "sk-b", Models: []config.EndpointModel{{Model: "m2"}}},
+		},
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	resp := getEndpointsResponse(t, srv)
+	var withHeaders, noHeaders *endpointConfigJSON
+	for i := range resp.Endpoints {
+		switch resp.Endpoints[i].ID {
+		case "ep-with-headers":
+			withHeaders = &resp.Endpoints[i]
+		case "ep-no-headers":
+			noHeaders = &resp.Endpoints[i]
+		}
+	}
+	if withHeaders == nil || noHeaders == nil {
+		t.Fatalf("missing expected endpoints: %+v", resp.Endpoints)
+	}
+	if got := withHeaders.Headers["X-Tenant-Id"]; got != "abc" {
+		t.Errorf("ep-with-headers headers[X-Tenant-Id] = %q, want %q", got, "abc")
+	}
+	if len(noHeaders.Headers) != 0 {
+		t.Errorf("ep-no-headers headers = %+v, want empty/absent", noHeaders.Headers)
+	}
+}
+
+// Without a configured lite entry the agent carries no lite pair at all —
+// compaction stays on the primary sender. Nothing is inferred from the vendor.
+func TestBuildAgent_NoLiteWithoutExplicitEntry(t *testing.T) {
+	setTestHome(t)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+	srv.provider = "deepseek"
+	srv.model = "deepseek-flash"
+
+	sess := agent.NewSession("deepseek-flash", "")
+	a := srv.buildAgent(sess)
+	if a.LiteSender != nil || a.LiteModel != "" {
+		t.Errorf("lite pair = (%T, %q), want unset", a.LiteSender, a.LiteModel)
+	}
+}
+
+// The configured lite entry is the only source of the lite pair, and it is
+// endpoint-independent: a session bound to an endpoint other than the default
+// still compacts on the lite entry's own sender.
+func TestBuildAgent_ExplicitLiteEntry(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-anthropic", Provider: "anthropic", APIKey: "sk-a", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+			{ID: "ep-deepseek", Provider: "deepseek", APIKey: "sk-x", Models: []config.EndpointModel{{Model: "deepseek-flash"}}},
+			{ID: "ep-kimi", Provider: "kimi", APIKey: "sk-y", Models: []config.EndpointModel{{Model: "kimi-k2.5"}}},
+		},
+		Default: "ep-anthropic::claude-sonnet-4-6",
+		Lite:    "ep-kimi::kimi-k2.5",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+	srv.provider = "anthropic"
+	srv.model = "claude-sonnet-4-6"
+
+	// Session on the default endpoint.
+	a := srv.buildAgent(agent.NewSession("claude-sonnet-4-6", ""))
+	if a.LiteModel != "kimi-k2.5" {
+		t.Errorf("LiteModel = %q, want the explicit entry kimi-k2.5", a.LiteModel)
+	}
+	if a.LiteSender == srv.sender {
+		t.Error("explicit lite entry must get its own sender, not the default one")
+	}
+
+	// Session bound to a different endpoint — the lite pair is unchanged and
+	// still runs on the lite entry's sender, not the session's.
+	bound := agent.NewSession("deepseek-flash", "")
+	bound.ModelConfig = "ep-deepseek::deepseek-flash"
+	b := srv.buildAgent(bound)
+	if b.LiteModel != "kimi-k2.5" {
+		t.Errorf("bound session LiteModel = %q, want kimi-k2.5", b.LiteModel)
+	}
+	if b.LiteSender == nil || b.LiteSender == b.GetSender() {
+		t.Error("bound session's lite must be the lite entry's own sender")
+	}
+}
+
+func TestGetConfig_WorkspaceDir(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints:    []config.Endpoint{{ID: "ep-a", Provider: "anthropic", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}}},
+		Default:      "ep-a::claude-sonnet-4-6",
+		WorkspaceDir: "~/octo-projects",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	resp := getConfigResponse(t, srv)
+	if resp.WorkspaceDir != "~/octo-projects" {
+		t.Errorf("workspace_dir = %q, want %q", resp.WorkspaceDir, "~/octo-projects")
+	}
+}
+
+// GET /api/config always reports the resolved effective default too, so the
+// Settings UI can show it instead of a bare, easily-misread "auto" — even
+// when the raw config value is empty and resolves to the portable Workspace.
+func TestGetConfig_WorkspaceDirDefault_ResolvesToOcto(t *testing.T) {
+	home := setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{{ID: "ep-a", Provider: "anthropic", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}}},
+		Default:   "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	resp := getConfigResponse(t, srv)
+	wantDefault := filepath.Join(home, "Workspace")
+	if resp.WorkspaceDirDefault != wantDefault {
+		t.Errorf("workspace_dir_default = %q, want %q", resp.WorkspaceDirDefault, wantDefault)
+	}
+	if resp.WorkspaceDir != "" {
+		t.Errorf("workspace_dir = %q, want \"\" (not customized)", resp.WorkspaceDir)
+	}
+}
+
+func TestPutWorkspaceDir_UpdatesConfigAndServerDefault(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{{ID: "ep-a", Provider: "anthropic", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}}},
+		Default:   "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	wantDir := filepath.Join(t.TempDir(), "workspace")
+	reqBody, err := json.Marshal(map[string]string{"workspace_dir": wantDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := doJSON(t, srv, http.MethodPut, "/api/config/workspace_dir", string(reqBody))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT /api/config/workspace_dir = %d: %s", w.Code, w.Body.String())
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WorkspaceDir != wantDir {
+		t.Errorf("config.WorkspaceDir = %q, want %q", cfg.WorkspaceDir, wantDir)
+	}
+	if srv.workspaceDir != wantDir {
+		t.Errorf("server.workspaceDir = %q, want %q", srv.workspaceDir, wantDir)
+	}
+}
+
+func TestPutReasoningEffort_ValidLevel_SavesAndReturns(t *testing.T) {
+	setTestHome(t)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	reqBody, err := json.Marshal(map[string]string{"reasoning_effort": "xhigh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := doJSON(t, srv, http.MethodPut, "/api/config/reasoning_effort", string(reqBody))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT /api/config/reasoning_effort = %d: %s", w.Code, w.Body.String())
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReasoningEffort != "xhigh" {
+		t.Errorf("config.ReasoningEffort = %q, want %q", cfg.ReasoningEffort, "xhigh")
+	}
+}
+
+func TestPutReasoningEffort_InvalidLevel_Rejects(t *testing.T) {
+	setTestHome(t)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	reqBody, err := json.Marshal(map[string]string{"reasoning_effort": "ultra"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := doJSON(t, srv, http.MethodPut, "/api/config/reasoning_effort", string(reqBody))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("PUT /api/config/reasoning_effort (invalid) = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReasoningEffort != "" {
+		t.Errorf("config.ReasoningEffort = %q, want empty (reject should not save)", cfg.ReasoningEffort)
+	}
+}
+
+func TestPutPermissionMode_ValidMode_SavesAndReturns(t *testing.T) {
+	setTestHome(t)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	reqBody, err := json.Marshal(map[string]string{"permission_mode": "strict"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := doJSON(t, srv, http.MethodPut, "/api/config/permission_mode", string(reqBody))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT /api/config/permission_mode = %d: %s", w.Code, w.Body.String())
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PermissionMode != "strict" {
+		t.Errorf("config.PermissionMode = %q, want %q", cfg.PermissionMode, "strict")
+	}
+}
+
+func TestPutPermissionMode_InvalidMode_Rejects(t *testing.T) {
+	setTestHome(t)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	reqBody, err := json.Marshal(map[string]string{"permission_mode": "yes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := doJSON(t, srv, http.MethodPut, "/api/config/permission_mode", string(reqBody))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("PUT /api/config/permission_mode (invalid) = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PermissionMode != "" {
+		t.Errorf("config.PermissionMode = %q, want empty (reject should not save)", cfg.PermissionMode)
+	}
+}
+
+// TestCreateEndpoint_DocumentedModelsShape sends the exact request body
+// documented in config-setup/SKILL.md's "Create an Endpoint" example — a
+// models array of {"model": ..., "vision": ...} objects, matching
+// createEndpointRequest.Models []endpointModelIn. Regression guard for #1941,
+// where the doc and the wire format had drifted apart.
+func TestCreateEndpoint_DocumentedModelsShape(t *testing.T) {
+	setTestHome(t)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	body := `{
+		"id": "my-relay",
+		"name": "My Relay",
+		"provider": "custom",
+		"api_key": "sk-test",
+		"base_url": "https://api.example.com",
+		"protocol": "openai",
+		"models": [{"model": "gpt-4o", "vision": false}]
+	}`
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints", body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /api/config/endpoints = %d, want %d: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+
+	var resp endpointJSONOut
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v (body: %s)", err, w.Body.String())
+	}
+	if len(resp.Models) != 1 || resp.Models[0].Model != "gpt-4o" {
+		t.Fatalf("models = %+v, want one gpt-4o entry", resp.Models)
+	}
+}
+
+func TestEndpointModelContextWindowAPI(t *testing.T) {
+	setTestHome(t)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	body := `{
+		"id": "intranet",
+		"provider": "custom",
+		"base_url": "http://localhost:8000/v1",
+		"protocol": "openai",
+		"models": [{"model": "Qwen3-32B", "context_window": 32000, "vision": false}]
+	}`
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints", body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /api/config/endpoints = %d, want %d: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+	var created endpointJSONOut
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if len(created.Models) != 1 || created.Models[0].ContextWindow != 32_000 {
+		t.Fatalf("create response models = %+v, want context_window 32000", created.Models)
+	}
+
+	listed := getEndpointsResponse(t, srv)
+	if len(listed.Endpoints) != 1 || len(listed.Endpoints[0].Models) != 1 || listed.Endpoints[0].Models[0].ContextWindow != 32_000 {
+		t.Fatalf("GET endpoints = %+v, want context_window 32000", listed.Endpoints)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := cfg.EntryByModel("intranet::Qwen3-32B")
+	if !ok || entry.ContextWindow != 32_000 {
+		t.Fatalf("saved entry = (%v, %+v), want context_window 32000", ok, entry)
+	}
+}
+
+func TestEndpointModelContextWindowAPIRejectsUnitMistake(t *testing.T) {
+	setTestHome(t)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints", `{"id":"intranet","provider":"custom","models":[{"model":"Qwen3-32B","context_window":32}]}`)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "at least 1000") {
+		t.Fatalf("create with context_window 32 = %d %q, want 400 with floor", w.Code, w.Body.String())
+	}
+
+	seedModels(t, config.Config{Endpoints: []config.Endpoint{{ID: "intranet", Provider: "custom", Models: []config.EndpointModel{{Model: "existing"}}}}})
+	w = doJSON(t, srv, http.MethodPost, "/api/config/endpoints/intranet/models", `{"model":"Qwen3-32B","context_window":32}`)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "at least 1000") {
+		t.Fatalf("add model with context_window 32 = %d %q, want 400 with floor", w.Code, w.Body.String())
+	}
+}
+
+func TestAddEndpointModelPreservesOmittedContextWindow(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{Endpoints: []config.Endpoint{{
+		ID:       "intranet",
+		Provider: "custom",
+		Models:   []config.EndpointModel{{Model: "Qwen3-32B", ContextWindow: 32_000, Vision: false}},
+	}}})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/intranet/models", `{"model":"Qwen3-32B","vision":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("upsert without context_window = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := cfg.EntryByModel("intranet::Qwen3-32B")
+	if !ok || entry.ContextWindow != 32_000 || !entry.Vision {
+		t.Fatalf("saved entry = (%v, %+v), want preserved 32000 window and updated vision", ok, entry)
+	}
+}
+
+func TestAddEndpointModelExplicitZeroClearsContextWindow(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{Endpoints: []config.Endpoint{{
+		ID:       "intranet",
+		Provider: "custom",
+		Models:   []config.EndpointModel{{Model: "Qwen3-32B", ContextWindow: 32_000}},
+	}}})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/intranet/models", `{"model":"Qwen3-32B","context_window":0,"vision":false}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("upsert with explicit zero = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := cfg.EntryByModel("intranet::Qwen3-32B")
+	if !ok || entry.ContextWindow != 0 {
+		t.Fatalf("saved entry = (%v, %+v), want cleared context window", ok, entry)
+	}
+}
+
+func TestAddEndpointModelOmittedContextWindowDefaultsToZero(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{Endpoints: []config.Endpoint{{ID: "intranet", Provider: "custom"}}})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/intranet/models", `{"model":"new-model","vision":false}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("add without context_window = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := cfg.EntryByModel("intranet::new-model")
+	if !ok || entry.ContextWindow != 0 {
+		t.Fatalf("saved entry = (%v, %+v), want zero context window", ok, entry)
+	}
+}
+
+// TestCreateEndpoint_HeadersPersisted covers a create request that includes a
+// headers object — it must be persisted onto the new config.Endpoint and
+// echoed back both in the create response and a subsequent GET.
+func TestCreateEndpoint_HeadersPersisted(t *testing.T) {
+	setTestHome(t)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	body := `{
+		"id": "my-relay",
+		"provider": "custom",
+		"base_url": "https://api.example.com",
+		"headers": {"X-Tenant-Id": "abc", "X-Trace": "1"}
+	}`
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints", body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /api/config/endpoints = %d, want %d: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+	var resp endpointJSONOut
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v (body: %s)", err, w.Body.String())
+	}
+	if resp.Headers["X-Tenant-Id"] != "abc" || resp.Headers["X-Trace"] != "1" {
+		t.Fatalf("create response headers = %+v, want both custom headers echoed", resp.Headers)
+	}
+
+	// Also verify persistence via a fresh GET.
+	cfg, _ := config.Load()
+	var saved *config.Endpoint
+	for i := range cfg.Endpoints {
+		if cfg.Endpoints[i].ID == "my-relay" {
+			saved = &cfg.Endpoints[i]
+		}
+	}
+	if saved == nil {
+		t.Fatalf("endpoint my-relay not found in saved config: %+v", cfg.Endpoints)
+	}
+	if saved.Headers["X-Tenant-Id"] != "abc" || saved.Headers["X-Trace"] != "1" {
+		t.Errorf("saved config headers = %+v, want both custom headers persisted", saved.Headers)
+	}
+}
+
+// TestCreateEndpoint_StringModelsRejectedWithDetail covers the failure mode
+// #1941 actually hit: a plain string models array (the shape SKILL.md wrongly
+// documented before this fix) doesn't unmarshal into []endpointModelIn. The
+// 400 must explain why instead of the old bare "invalid JSON body".
+func TestCreateEndpoint_StringModelsRejectedWithDetail(t *testing.T) {
+	setTestHome(t)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	body := `{"id": "my-relay", "provider": "custom", "models": ["gpt-4o"]}`
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints", body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("POST /api/config/endpoints with string models = %d, want %d: %s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "cannot unmarshal") {
+		t.Errorf("error body = %q, want the underlying decode error, not a bare message", w.Body.String())
+	}
+}
+
+// TestUpdateEndpoint_HeadersOmitted_LeavesUnchanged covers the nil-vs-empty-map
+// distinction: a PATCH body that omits "headers" entirely must not touch the
+// existing custom headers.
+func TestUpdateEndpoint_HeadersOmitted_LeavesUnchanged(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "custom", BaseURL: "https://api.example.com", APIKey: "sk-test", Headers: map[string]string{"X-Old": "1"}, Models: []config.EndpointModel{{Model: "m1"}}},
+		},
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPatch, "/api/config/endpoints/ep-a", `{"name": "renamed"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH /api/config/endpoints/ep-a = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if len(cfg.Endpoints) != 1 || cfg.Endpoints[0].Headers["X-Old"] != "1" {
+		t.Errorf("headers after omitted-headers PATCH = %+v, want X-Old=1 unchanged", cfg.Endpoints[0].Headers)
+	}
+}
+
+// TestUpdateEndpoint_NameExplicitEmpty_Clears covers the display-name
+// analogue of the headers nil-vs-empty distinction: an explicit "" clears the
+// optional name, while a body that omits "name" leaves it alone. Before the
+// name field became a pointer, clearing was impossible from the web form —
+// the emptied field saved fine and came back on reopen.
+func TestUpdateEndpoint_NameExplicitEmpty_Clears(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Name: "Abc", Provider: "custom", BaseURL: "https://api.example.com", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "m1"}}},
+		},
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPatch, "/api/config/endpoints/ep-a", `{"base_url": "https://api2.example.com"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH (name omitted) = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if got := cfg.Endpoints[0].Name; got != "Abc" {
+		t.Fatalf("name after omitted-name PATCH = %q, want Abc unchanged", got)
+	}
+
+	w = doJSON(t, srv, http.MethodPatch, "/api/config/endpoints/ep-a", `{"name": ""}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH (name cleared) = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ = config.Load()
+	if got := cfg.Endpoints[0].Name; got != "" {
+		t.Errorf("name after explicit-empty PATCH = %q, want cleared", got)
+	}
+}
+
+// TestUpdateEndpoint_HeadersReplace_WholesaleNotMerge covers that a PATCH
+// with a non-empty "headers" object wholesale replaces the existing map
+// rather than merging keys.
+func TestUpdateEndpoint_HeadersReplace_WholesaleNotMerge(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "custom", BaseURL: "https://api.example.com", APIKey: "sk-test", Headers: map[string]string{"X-Old": "1"}, Models: []config.EndpointModel{{Model: "m1"}}},
+		},
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPatch, "/api/config/endpoints/ep-a", `{"headers": {"X-New": "1"}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH /api/config/endpoints/ep-a = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	got := cfg.Endpoints[0].Headers
+	if len(got) != 1 || got["X-New"] != "1" {
+		t.Errorf("headers after replace PATCH = %+v, want only X-New=1 (wholesale replace, not merge)", got)
+	}
+}
+
+// TestUpdateEndpoint_HeadersExplicitEmpty_ClearsAll covers that an explicit
+// "headers": {} clears all existing custom headers.
+func TestUpdateEndpoint_HeadersExplicitEmpty_ClearsAll(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "custom", BaseURL: "https://api.example.com", APIKey: "sk-test", Headers: map[string]string{"X-Old": "1"}, Models: []config.EndpointModel{{Model: "m1"}}},
+		},
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPatch, "/api/config/endpoints/ep-a", `{"headers": {}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH /api/config/endpoints/ep-a = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if len(cfg.Endpoints[0].Headers) != 0 {
+		t.Errorf("headers after explicit-empty PATCH = %+v, want cleared to empty/nil", cfg.Endpoints[0].Headers)
+	}
+}
+
+// TestUpdateEndpoint_PreservesRateLimits: rpm / max_concurrency are
+// hand-edited in config.yml and deliberately have no UI, so every write path
+// the UI does have must leave them alone — including a rename, which rewrites
+// the endpoint's composite-id references.
+func TestUpdateEndpoint_PreservesRateLimits(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "custom", BaseURL: "https://api.example.com", APIKey: "sk-test",
+				Protocol: "openai", RPM: 8, MaxConcurrency: 1,
+				Models: []config.EndpointModel{{Model: "m1"}}},
+		},
+		Default: "ep-a::m1",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	// The rename lands last, so every earlier PATCH still addresses ep-a.
+	for _, body := range []string{
+		`{"name": "renamed"}`,
+		`{"api_key": "sk-new"}`,
+		`{"headers": {"X-New": "1"}}`,
+		`{"new_id": "ep-b"}`,
+	} {
+		w := doJSON(t, srv, http.MethodPatch, "/api/config/endpoints/ep-a", body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("PATCH %s = %d: %s", body, w.Code, w.Body.String())
+		}
+		cfg, _ := config.Load()
+		if got := cfg.Endpoints[0]; got.RPM != 8 || got.MaxConcurrency != 1 {
+			t.Fatalf("after PATCH %s rpm/max_concurrency = %d/%d, want 8/1", body, got.RPM, got.MaxConcurrency)
+		}
+	}
+}
+
+// TestUpdateEndpoint_ReloadsDefaultSender is the regression test for the
+// missing reloadDefaultSender call in handleUpdateEndpoint: editing an
+// endpoint's connection params (base_url, api_key, headers, …) used to reach
+// only bound sessions via invalidateEndpointSenders, while unbound sessions
+// kept riding the server's stale default sender until restart — e.g. a newly
+// added custom User-Agent header never hit the wire for them.
+func TestUpdateEndpoint_ReloadsDefaultSender(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "custom", BaseURL: "https://api.example.com", Protocol: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "m1"}}},
+		},
+		Default: "ep-a::m1",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	before := srv.getSender()
+	if before == nil {
+		t.Fatal("server should have a default sender after startup")
+	}
+
+	w := doJSON(t, srv, http.MethodPatch, "/api/config/endpoints/ep-a", `{"headers": {"user-agent": "cc-test"}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH /api/config/endpoints/ep-a = %d: %s", w.Code, w.Body.String())
+	}
+
+	after := srv.getSender()
+	if after == nil {
+		t.Fatal("server default sender missing after endpoint update")
+	}
+	if after == before {
+		t.Error("default sender pointer did not change after endpoint update — unbound sessions would keep the stale connection params")
+	}
+
+	// An unbound session must resolve to the rebuilt default sender.
+	sess := agent.NewSession("m1", "")
+	sender, _ := srv.senderForSession(sess)
+	if sender != after {
+		t.Error("unbound session did not pick up the rebuilt default sender")
+	}
+}
+
+// TestDeleteEndpoint_ReloadsDefaultSender covers the same wiring gap in
+// handleDeleteEndpoint: removing an endpoint can clear Default, and even when
+// it doesn't, the default sender must be rebuilt from the post-delete config.
+func TestDeleteEndpoint_ReloadsDefaultSender(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "custom", BaseURL: "https://api.example.com", Protocol: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "m1"}}},
+			{ID: "ep-b", Provider: "custom", BaseURL: "https://api2.example.com", Protocol: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "m2"}}},
+		},
+		Default: "ep-a::m1",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	before := srv.getSender()
+	if before == nil {
+		t.Fatal("server should have a default sender after startup")
+	}
+
+	w := doJSON(t, srv, http.MethodDelete, "/api/config/endpoints/ep-b", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("DELETE /api/config/endpoints/ep-b = %d: %s", w.Code, w.Body.String())
+	}
+
+	after := srv.getSender()
+	if after == nil {
+		t.Fatal("server default sender missing after endpoint delete")
+	}
+	if after == before {
+		t.Error("default sender pointer did not change after endpoint delete")
+	}
+}
+
+// TestDeleteEndpointModel_ReloadsDefaultSender covers the same wiring gap in
+// handleDeleteEndpointModel: deleting a model can clear Default (when it
+// pointed at "<id>::<model>"), so the default sender must be rebuilt.
+func TestDeleteEndpointModel_ReloadsDefaultSender(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "custom", BaseURL: "https://api.example.com", Protocol: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "m1"}, {Model: "m2"}}},
+		},
+		Default: "ep-a::m1",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	before := srv.getSender()
+	if before == nil {
+		t.Fatal("server should have a default sender after startup")
+	}
+
+	w := doJSON(t, srv, http.MethodDelete, "/api/config/endpoints/ep-a/models/m2", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("DELETE /api/config/endpoints/ep-a/models/m2 = %d: %s", w.Code, w.Body.String())
+	}
+
+	after := srv.getSender()
+	if after == nil {
+		t.Fatal("server default sender missing after endpoint model delete")
+	}
+	if after == before {
+		t.Error("default sender pointer did not change after endpoint model delete")
+	}
+}
+
+func TestSetEndpointDefault_WithModelQuery_SetsSpecificModel(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{
+				{Model: "claude-sonnet-4-6"},
+				{Model: "claude-haiku-4-5"},
+			}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/ep-a/default?model=claude-haiku-4-5", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST default?model = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if cfg.Default != "ep-a::claude-haiku-4-5" {
+		t.Errorf("default = %q, want ep-a::claude-haiku-4-5", cfg.Default)
+	}
+}
+
+func TestSetEndpointDefault_WithoutModelQuery_FallsBackToFirstModel(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{
+				{Model: "claude-haiku-4-5"},
+				{Model: "claude-sonnet-4-6"},
+			}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/ep-a/default", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST default = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if cfg.Default != "ep-a::claude-haiku-4-5" {
+		t.Errorf("default = %q, want ep-a::claude-haiku-4-5 (first model)", cfg.Default)
+	}
+}
+
+func TestSetEndpointDefault_MissingModel_ReturnsBadRequest(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/ep-a/default?model=missing-model", "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	cfg, _ := config.Load()
+	if cfg.Default != "ep-a::claude-sonnet-4-6" {
+		t.Errorf("default changed to %q, want unchanged", cfg.Default)
+	}
+}
+
+func TestSetEndpointLite_WithModelQuery_SetsSpecificModel(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{
+				{Model: "claude-sonnet-4-6"},
+				{Model: "claude-haiku-4-5"},
+			}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/ep-a/lite?model=claude-haiku-4-5", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST lite?model = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if cfg.Lite != "ep-a::claude-haiku-4-5" {
+		t.Errorf("lite = %q, want ep-a::claude-haiku-4-5", cfg.Lite)
+	}
+}
+
+func TestSetEndpointLite_WithoutModelQuery_FallsBackToFirstModel(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{
+				{Model: "claude-haiku-4-5"},
+				{Model: "claude-sonnet-4-6"},
+			}},
+		},
+		Default: "ep-a::claude-haiku-4-5",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/ep-a/lite", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST lite = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if cfg.Lite != "ep-a::claude-haiku-4-5" {
+		t.Errorf("lite = %q, want ep-a::claude-haiku-4-5 (first model)", cfg.Lite)
+	}
+}
+
+func TestSetEndpointLite_MissingModel_ReturnsBadRequest(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/ep-a/lite?model=missing-model", "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	cfg, _ := config.Load()
+	if cfg.Lite != "" {
+		t.Errorf("lite = %q, want empty", cfg.Lite)
+	}
+}
+
+func TestUnsetEndpointLite_ClearsLite(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{
+				{Model: "claude-sonnet-4-6"},
+				{Model: "claude-haiku-4-5"},
+			}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+		Lite:    "ep-a::claude-haiku-4-5",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodDelete, "/api/config/endpoints/ep-a/lite", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("DELETE lite = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if cfg.Lite != "" {
+		t.Errorf("lite = %q, want empty", cfg.Lite)
+	}
+}
+
+func TestUnsetEndpointLite_UnknownEndpoint_ReturnsNotFound(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodDelete, "/api/config/endpoints/unknown/lite", "")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestSetEndpointDefault_UnknownEndpoint_ReturnsNotFound(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/unknown/default", "")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestSetEndpointLite_UnknownEndpoint_ReturnsNotFound(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/unknown/lite", "")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestSetEndpointDefault_EmptyEndpoint_ReturnsBadRequest(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-empty", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{}},
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/ep-empty/default", "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	cfg, _ := config.Load()
+	if cfg.Default != "ep-a::claude-sonnet-4-6" {
+		t.Errorf("default changed to %q, want unchanged", cfg.Default)
+	}
+}
+
+func TestSetEndpointLite_EmptyEndpoint_ReturnsBadRequest(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-empty", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{}},
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/ep-empty/lite", "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	cfg, _ := config.Load()
+	if cfg.Lite != "" {
+		t.Errorf("lite = %q, want empty", cfg.Lite)
+	}
+}
+
+func TestUnsetEndpointLite_DifferentEndpointHoldsLite_IsNoOp(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+			{ID: "ep-b", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{{Model: "claude-haiku-4-5"}}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+		Lite:    "ep-b::claude-haiku-4-5",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodDelete, "/api/config/endpoints/ep-a/lite", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("DELETE lite = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if cfg.Lite != "ep-b::claude-haiku-4-5" {
+		t.Errorf("lite = %q, want ep-b::claude-haiku-4-5 (unchanged)", cfg.Lite)
+	}
+}
+
+// TestPutReasoningEffort_Off_PersistsEmptyAndDisablesShowReasoning pins the
+// global PUT to the same "off is a wire sentinel" contract as the per-session
+// PATCH: persist "" (a stored literal "off" reads as thinking-ON at the
+// provider layer) and drop show_reasoning, which has nothing to show.
+func TestPutReasoningEffort_Off_PersistsEmptyAndDisablesShowReasoning(t *testing.T) {
+	setTestHome(t)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPut, "/api/config/reasoning_effort", `{"reasoning_effort":"off"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT /api/config/reasoning_effort = %d: %s", w.Code, w.Body.String())
+	}
+	// The response echoes the wire sentinel, not the stored "".
+	var resp struct {
+		ReasoningEffort string `json:"reasoning_effort"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.ReasoningEffort != "off" {
+		t.Errorf("response reasoning_effort = %q, want \"off\"", resp.ReasoningEffort)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReasoningEffort != "" {
+		t.Errorf("config.ReasoningEffort = %q, want \"\" (off persists as empty)", cfg.ReasoningEffort)
+	}
+	if cfg.ShowReasoning == nil || *cfg.ShowReasoning {
+		t.Errorf("config.ShowReasoning = %v, want false when reasoning is off", cfg.ShowReasoning)
+	}
+
+	// The broadcast/status surface applies the same sentinel: "" must never
+	// reach session_update consumers (ChatView drops empty-string updates).
+	if _, _, re, _, _ := srv.sessionStatusFields(nil); re != "off" {
+		t.Errorf("sessionStatusFields reasoning_effort = %q, want \"off\"", re)
+	}
+}
+
+// TestGetConfig_ReasoningEffortOffSentinel: "" (the stored form of off) must
+// surface as "off" on the wire — through omitempty the field used to vanish,
+// and the frontend defaulted an absent value to "medium".
+func TestGetConfig_ReasoningEffortOffSentinel(t *testing.T) {
+	setTestHome(t)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodGet, "/api/config", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /api/config = %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		ReasoningEffort string `json:"reasoning_effort"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.ReasoningEffort != "off" {
+		t.Errorf("reasoning_effort = %q, want \"off\"", resp.ReasoningEffort)
+	}
+}
+
+// visionSeed is an endpoint carrying one vision model and one text-only model.
+func visionSeed() config.Config {
+	return config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", APIKey: "sk-test", Models: []config.EndpointModel{
+				{Model: "text-model", Vision: false},
+				{Model: "vision-model", Vision: true},
+			}},
+		},
+		Default: "ep-a::text-model",
+	}
+}
+
+func TestSetEndpointVisionHelper(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, visionSeed())
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/ep-a/vision_helper?model=vision-model", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST vision_helper = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if cfg.VisionHelper != "ep-a::vision-model" {
+		t.Errorf("vision_helper = %q, want ep-a::vision-model", cfg.VisionHelper)
+	}
+	if _, ok := cfg.ResolveVisionHelper(); !ok {
+		t.Error("the value written by the API must resolve")
+	}
+}
+
+// Omitting ?model picks the first vision-capable model, not simply the first
+// model — the endpoint's first entry here is text-only.
+func TestSetEndpointVisionHelper_WithoutModelPicksFirstVisionModel(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, visionSeed())
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/ep-a/vision_helper", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST vision_helper = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if cfg.VisionHelper != "ep-a::vision-model" {
+		t.Errorf("vision_helper = %q, want ep-a::vision-model", cfg.VisionHelper)
+	}
+}
+
+func TestSetEndpointVisionHelper_RejectsTextOnlyModel(t *testing.T) {
+	setTestHome(t)
+	seedModels(t, visionSeed())
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodPost, "/api/config/endpoints/ep-a/vision_helper?model=text-model", "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("POST vision_helper (text-only) = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if cfg.VisionHelper != "" {
+		t.Errorf("vision_helper = %q, want it left unset", cfg.VisionHelper)
+	}
+}
+
+func TestUnsetEndpointVisionHelper(t *testing.T) {
+	setTestHome(t)
+	seed := visionSeed()
+	seed.VisionHelper = "ep-a::vision-model"
+	seedModels(t, seed)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodDelete, "/api/config/endpoints/ep-a/vision_helper", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("DELETE vision_helper = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if cfg.VisionHelper != "" {
+		t.Errorf("vision_helper = %q, want cleared", cfg.VisionHelper)
+	}
+}
+
+// A dangling vision_helper would silently disable the feature and show up in
+// `octo doctor`, so deleting the model it names must clear it.
+func TestDeleteEndpointModel_ClearsVisionHelper(t *testing.T) {
+	setTestHome(t)
+	seed := visionSeed()
+	seed.VisionHelper = "ep-a::vision-model"
+	seedModels(t, seed)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodDelete, "/api/config/endpoints/ep-a/models/vision-model", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("DELETE model = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if cfg.VisionHelper != "" {
+		t.Errorf("vision_helper = %q, want cleared with the model it named", cfg.VisionHelper)
+	}
+}
+
+func TestDeleteEndpoint_ClearsVisionHelper(t *testing.T) {
+	setTestHome(t)
+	seed := visionSeed()
+	seed.VisionHelper = "ep-a::vision-model"
+	seed.Endpoints = append(seed.Endpoints, config.Endpoint{
+		ID: "ep-b", Provider: "anthropic", APIKey: "sk-test",
+		Models: []config.EndpointModel{{Model: "other"}},
+	})
+	seed.Default = "ep-b::other"
+	seedModels(t, seed)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodDelete, "/api/config/endpoints/ep-a", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("DELETE endpoint = %d: %s", w.Code, w.Body.String())
+	}
+	cfg, _ := config.Load()
+	if cfg.VisionHelper != "" {
+		t.Errorf("vision_helper = %q, want cleared with its endpoint", cfg.VisionHelper)
+	}
+}
+
+func TestListEndpoints_ExposesVisionHelper(t *testing.T) {
+	setTestHome(t)
+	seed := visionSeed()
+	seed.VisionHelper = "ep-a::vision-model"
+	seedModels(t, seed)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodGet, "/api/config/endpoints", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET endpoints = %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"vision_helper":"ep-a::vision-model"`) {
+		t.Errorf("response should carry vision_helper so the UI can mark the chip: %s", w.Body.String())
+	}
+}
+
+// A machine that exports some OTHER provider's API key — DeepSeek's, left by a
+// CLI, while nothing points octo at DeepSeek — must still get first-run setup.
+// The key configures nothing: with no endpoint the server falls back to
+// anthropic, whose key is absent, so the first message would fail. Scanning
+// every vendor for any key at all is what used to hide the panel here.
+func TestDetectOnboardPhase_UnrelatedEnvKeyStillNeedsSetup(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("OCTO_PROVIDER", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("DEEPSEEK_API_KEY", "sk-from-some-other-tool")
+	if got := detectOnboardPhase(""); got != "key_setup" {
+		t.Fatalf("detectOnboardPhase = %q with only an unrelated vendor key, want key_setup", got)
+	}
+}
+
+// The same rule one level in: an endpoint exists, but its own key is nowhere —
+// not stored, not in ITS vendor's env var — while an unrelated vendor's key is
+// exported. Still unconfigured; the old whole-registry scan called this ready.
+func TestDetectOnboardPhase_EndpointWithoutItsOwnKeyNeedsSetup(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("OCTO_PROVIDER", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("DEEPSEEK_API_KEY", "sk-from-some-other-tool")
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	if got := detectOnboardPhase(""); got != "key_setup" {
+		t.Fatalf("detectOnboardPhase = %q; the endpoint's own vendor has no key anywhere, want key_setup", got)
+	}
+}
+
+// A key on its own no longer configures anything: without OCTO_PROVIDER nothing
+// has named a vendor, so there is nothing to run and setup is still needed.
+// octo used to default to anthropic here and call a vendor the user never chose.
+func TestDetectOnboardPhase_EnvKeyWithoutProviderNeedsSetup(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("OCTO_PROVIDER", "")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-but-nobody-asked-for-anthropic")
+	if got := detectOnboardPhase(""); got != "key_setup" {
+		t.Fatalf("detectOnboardPhase = %q; a key alone names no vendor, want key_setup", got)
+	}
+}
+
+// The env-only deployment as it must now be written: OCTO_PROVIDER names the
+// vendor, its key sits in the environment, config.yml is empty. That runs, so
+// it must not be pushed through the setup panel.
+func TestDetectOnboardPhase_EnvOnlyWithProviderIsConfigured(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("OCTO_PROVIDER", "anthropic")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-env-only-deployment")
+	if got := detectOnboardPhase(""); got == "key_setup" {
+		t.Fatalf("detectOnboardPhase = %q; an env-only install that names its vendor runs, want anything but key_setup", got)
+	}
+}
+
+// `octo serve --provider X` names the vendor just as OCTO_PROVIDER does, and
+// that server resolves a sender and runs. Reading only the environment left it
+// staring at a setup panel it could never need.
+func TestDetectOnboardPhase_ServeProviderFlagCounts(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("OCTO_PROVIDER", "")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-env-only-deployment")
+	if got := detectOnboardPhase("anthropic"); got == "key_setup" {
+		t.Fatalf("detectOnboardPhase = %q with serve --provider anthropic and its key, want anything but key_setup", got)
+	}
+	// The flag names a vendor; it does not conjure a key for one that has none.
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	if got := detectOnboardPhase("anthropic"); got != "key_setup" {
+		t.Fatalf("detectOnboardPhase = %q with a named vendor but no key, want key_setup", got)
+	}
+}
+
+// Same, but pointed at another vendor through OCTO_PROVIDER — the key that
+// counts is that vendor's, and anthropic's absence is irrelevant.
+func TestDetectOnboardPhase_EnvOnlyHonoursOctoProvider(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("OCTO_PROVIDER", "deepseek")
+	t.Setenv("DEEPSEEK_API_KEY", "sk-env-only-deployment")
+	if got := detectOnboardPhase(""); got == "key_setup" {
+		t.Fatalf("detectOnboardPhase = %q; OCTO_PROVIDER picks the vendor whose key counts", got)
+	}
+}
+
+// The other half of that rule: an endpoint whose key is deliberately left to
+// the environment is a working setup (senderForEntry reads the environment
+// first), so it must not be sent back through the panel.
+func TestDetectOnboardPhase_EndpointKeyFromEnvIsConfigured(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("ANTHROPIC_API_KEY", "sk-test")
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "ep-a", Provider: "anthropic", Models: []config.EndpointModel{{Model: "claude-sonnet-4-6"}}},
+		},
+		Default: "ep-a::claude-sonnet-4-6",
+	})
+	if got := detectOnboardPhase(""); got == "key_setup" {
+		t.Fatalf("detectOnboardPhase = %q; an endpoint keyed from the environment is configured", got)
+	}
+}
+
+// TestEndpointsReportKeyEnvInEffect: a key coming from the vendor env var is
+// the one requests use (env before stored key), so the endpoint view names
+// that var — and only the name, never the value — on both the read and the
+// mutation responses.
+func TestEndpointsReportKeyEnvInEffect(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("CUSTOM_API_KEY", "sk-env-secret")
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	seedModels(t, config.Config{
+		Endpoints: []config.Endpoint{
+			{ID: "relay", Provider: "custom", BaseURL: "https://relay.example", Protocol: "openai", APIKey: "sk-stored", Models: []config.EndpointModel{{Model: "m1"}}},
+			{ID: "env-only", Provider: "custom", BaseURL: "https://other.example", Protocol: "openai", Models: []config.EndpointModel{{Model: "m2"}}},
+			{ID: "ds", Provider: "deepseek", APIKey: "sk-ds", Models: []config.EndpointModel{{Model: "deepseek-v4-flash"}}},
+		},
+		Default: "relay::m1",
+	})
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+
+	w := doJSON(t, srv, http.MethodGet, "/api/config/endpoints", "")
+	if strings.Contains(w.Body.String(), "sk-env-secret") {
+		t.Fatalf("response leaked the env key value: %s", w.Body.String())
+	}
+	got := map[string]endpointConfigJSON{}
+	for _, ep := range getEndpointsResponse(t, srv).Endpoints {
+		got[ep.ID] = ep
+	}
+	if ep := got["relay"]; ep.APIKeyEnv != "CUSTOM_API_KEY" || !ep.HasAPIKey {
+		t.Errorf("relay: api_key_env=%q has_api_key=%v, want CUSTOM_API_KEY/true", ep.APIKeyEnv, ep.HasAPIKey)
+	}
+	// The case the badge exists for: nothing stored, key supplied by the env.
+	if ep := got["env-only"]; ep.APIKeyEnv != "CUSTOM_API_KEY" || ep.HasAPIKey {
+		t.Errorf("env-only: api_key_env=%q has_api_key=%v, want CUSTOM_API_KEY/false", ep.APIKeyEnv, ep.HasAPIKey)
+	}
+	if ep := got["ds"]; ep.APIKeyEnv != "" {
+		t.Errorf("ds: api_key_env=%q, want empty (DEEPSEEK_API_KEY unset)", ep.APIKeyEnv)
+	}
+
+	w = doJSON(t, srv, http.MethodPatch, "/api/config/endpoints/relay", `{"name":"Relay"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH = %d: %s", w.Code, w.Body.String())
+	}
+	var out endpointJSONOut
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.APIKeyEnv != "CUSTOM_API_KEY" {
+		t.Errorf("PATCH response api_key_env=%q, want CUSTOM_API_KEY", out.APIKeyEnv)
+	}
+}

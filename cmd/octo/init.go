@@ -1,0 +1,111 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/config"
+	"github.com/open-octo/octo-agent/internal/permission"
+	"github.com/open-octo/octo-agent/internal/prompt"
+	"github.com/open-octo/octo-agent/internal/tools"
+)
+
+// initInstruction is the prompt that drives `.octorules` generation, shared by
+// the `octo init` subcommand and the REPL `/init` command. It tells the agent
+// to investigate the repo with its tools before writing, and to keep the
+// output terse — the file is loaded into the system prompt every session.
+const initInstruction = `Analyze this repository and create (or update) a ` + "`.octorules`" + ` file at its root to help an AI coding agent work here effectively.
+
+Investigate with your tools BEFORE writing:
+- List the top-level layout and the important directories.
+- Read the build/dependency manifests (go.mod, package.json, Makefile, etc.), the README, and any CI config.
+- Determine the language(s), how to build / test / run / lint, and the main entry points.
+- Note conventions that aren't obvious from a single file: architecture, naming, testing approach, branch/PR workflow.
+
+Then write ` + "`.octorules`" + ` with concise, factual content — short sections, real commands and real paths, no marketing or filler. If ` + "`.octorules`" + ` already exists, read it first and improve it rather than discarding useful content. Keep it tight: every line is sent to the model on every turn.`
+
+// runInit handles `octo init [flags]`: a one-shot agentic run that generates
+// or updates the project's .octorules. It mirrors chat's tool setup but is
+// non-interactive and exits when the file is written.
+func runInit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	providerName := fs.String("provider", "", "Provider: anthropic | openai | … (default from `octo config` or OCTO_PROVIDER)")
+	model := fs.String("model", "", "Model name (defaults to the provider's cheapest reasoning model)")
+	plain := fs.Bool("plain", false, "Render tool events as one-line ↳ status lines instead of rich diff cards")
+	permMode := fs.String("permission-mode", "strict", "Tool permission handling: interactive | strict | auto")
+	useSandbox := fs.Bool("sandbox", false, "Confine commands to the project dir + tmp with no network (OS-enforced; macOS/Linux). Fails closed if unavailable.")
+	sandboxAllowNet := fs.Bool("sandbox-allow-net", false, "Under --sandbox, permit network access (default: denied)")
+	var sandboxWrite, sandboxRead stringList
+	fs.Var(&sandboxWrite, "sandbox-write", "Under --sandbox, an extra writable directory (repeatable)")
+	fs.Var(&sandboxRead, "sandbox-read", "Under --sandbox, an extra read-only directory (repeatable)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *permMode != string(permission.ModeInteractive) &&
+		*permMode != string(permission.ModeAutoApprove) &&
+		*permMode != string(permission.ModeStrict) {
+		fmt.Fprintf(stderr, "octo init: invalid --permission-mode %q (want 'interactive', 'strict' or 'auto')\n", *permMode)
+		return 2
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(stderr, "octo init: %v\n", err)
+		fmt.Fprintln(stderr, "Run `octo config` to rewrite ~/.octo/config.yml.")
+		return 1
+	}
+	provName, resolvedModel, entry, ok := resolveProviderModel(*providerName, *model, cfg)
+	if !ok {
+		fmt.Fprintln(stderr, providerSetupError(provName))
+		return 2
+	}
+
+	llmSender, err := buildSender(provName, entry, stderr, senderTuning{})
+	if err != nil {
+		return 1
+	}
+
+	cwd, _ := os.Getwd()
+	env := buildEnvContext(cwd)
+
+	if *useSandbox {
+		opts := sandboxOpts{allowNet: *sandboxAllowNet, writeRoots: sandboxWrite, readRoots: sandboxRead}
+		if err := activateSandbox(cwd, opts, stderr); err != nil {
+			return 1
+		}
+	}
+
+	a := agent.New(llmSender, resolvedModel)
+	// init keeps no session; the process is the conversation.
+	a.UpstreamSessionID = newCacheKey()
+	a.System = prompt.Compose("", cwd, env, "", "", "", true, false) // init is a one-shot task; no skills/mcp/memory
+
+	// init's whole job is writing/updating .octorules at cwd's root, and it
+	// defaults to strict (no one is watching an ask prompt for a one-shot
+	// analysis run) — so cwd must be an explicit allowWriteRoot rather than
+	// relying on an ask-turned-deny under strict mode.
+	engine, err := permission.New(permissionConfigPath(), cwd, resolvePermissionMode(*permMode), cwd)
+	if err != nil {
+		fmt.Fprintf(stderr, "octo init: permission config: %v\n", err)
+		return 1
+	}
+	initView := newPlainView(newScannerLineReader(stdin, stdout), stdout, stderr, verbosityNormal, *plain)
+	a.Gate = newCLIGate(engine, initView)
+
+	fmt.Fprintln(stdout, "Analyzing the repository to generate .octorules…")
+	handler := replToolEventHandler(stdout, stderr, *plain)
+	_, err = a.RunStream(context.Background(), initInstruction, tools.DefaultTools(), tools.NewDefaultRegistry(), handler)
+	tools.KillAllBackground()
+	tools.CleanSpillFiles()
+	fmt.Fprintln(stdout)
+	if err != nil {
+		fmt.Fprintf(stderr, "octo init: %v\n", err)
+		return 1
+	}
+	return 0
+}

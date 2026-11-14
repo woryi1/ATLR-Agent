@@ -1,0 +1,778 @@
+package mcp
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// HTTPTransport speaks JSON-RPC 2.0 over a single HTTP endpoint, per the
+// MCP "Streamable HTTP" transport in spec 2024-11-05.
+//
+// What we implement
+//   - POST one JSON-RPC frame per request, body Content-Type application/json.
+//   - A plain application/json response body holds exactly one JSON-RPC
+//     frame (the response to the request we just sent): treated as a
+//     synchronous RPC.
+//   - A text/event-stream response is read as a sequence of SSE "data:"
+//     frames, each decoded as a JSON-RPC message and queued for Receive in
+//     order; reading stops once the frame whose id matches our request
+//     arrives (the spec has the server close the stream at that point
+//     anyway) or the stream itself closes.
+//   - The server-issued Mcp-Session-Id header is captured on the first
+//     response and echoed on every subsequent request, so the server can
+//     resume per-client state. Close releases it with a DELETE.
+//   - The protocol revision the server picks during initialize is echoed
+//     back in MCP-Protocol-Version on every later request. That header is a
+//     2025-06-18 requirement ("Require negotiated protocol version to be
+//     specified via MCP-Protocol-Version header in subsequent requests when
+//     using HTTP"); it does not exist in 2025-03-26. Sending it regardless
+//     costs nothing against older servers and is mandatory for newer ones.
+//   - A response stream that breaks before answering is resumed with a GET
+//     carrying Last-Event-ID, when the server tagged its events with ids.
+//   - A 404 answering a request that carried a session id is reported as
+//     ErrSessionExpired so the Client can re-handshake and replay.
+//
+// What we don't implement (v1 omission)
+//   - A standing GET listener for server-initiated messages outside of a
+//     request/response cycle. The GET above is only used to resume a broken
+//     response stream.
+//
+// Receive is wired through an in-memory channel: each Send queues the
+// frame(s) decoded from its response, Receive pops the next one. This
+// keeps the same "Send / Receive interleaved" interface stdio uses, so the
+// client logic is transport-agnostic.
+type HTTPTransport struct {
+	url     string
+	headers map[string]string
+	hc      *http.Client
+	oauth   OAuthProvider // nil = no OAuth; static headers only
+
+	// Session id is empty until the first server response sets it via
+	// Mcp-Session-Id. Subsequent requests echo it back.
+	sessionMu sync.Mutex
+	sessionID string
+
+	// protocolVersion is the revision the server chose during initialize,
+	// pushed in by Client.Initialize via SetProtocolVersion. Echoed back in
+	// MCP-Protocol-Version on every request once known — a 2025-06-18 server
+	// requires that header and answers 400 without it. Empty until the
+	// handshake completes (initialize carries the version in its params, not a
+	// header) and again after an expiry, so it is simply omitted then.
+	protoMu         sync.Mutex
+	protocolVersion string
+
+	// inbox queues the response of each Send so Receive can hand it back.
+	// Buffered so a Send never blocks (paired with one Receive per Send,
+	// the channel never grows unboundedly).
+	inbox chan *Message
+	// done is closed by Close to signal shutdown. We never close inbox itself:
+	// an in-flight doRequest may still be about to send on it, and a send on a
+	// closed channel panics (and would crash the process). Producers and Receive
+	// select on done instead.
+	done   chan struct{}
+	closed atomic.Bool
+}
+
+// HTTPConfig is the configuration end-users pass via mcp.json — URL plus
+// optional static headers (Authorization, custom auth, etc.). Headers
+// values are sent verbatim; we don't expand env-var placeholders here, that
+// happens in the config layer before we land on this struct.
+type HTTPConfig struct {
+	URL     string
+	Headers map[string]string
+	// OAuth, when non-nil, drives bearer-token injection + 401 retry.
+	// The transport calls OAuth.Token before each request and
+	// OAuth.Invalidate on a 401 response, then retries once.
+	OAuth OAuthProvider
+}
+
+// NewHTTPTransport builds an HTTPTransport ready to Send / Receive.
+// No network I/O happens until the first Send.
+func NewHTTPTransport(cfg HTTPConfig) (*HTTPTransport, error) {
+	if cfg.URL == "" {
+		return nil, errors.New("mcp: http transport: empty URL")
+	}
+	return &HTTPTransport{
+		url:     cfg.URL,
+		headers: cfg.Headers,
+		oauth:   cfg.OAuth,
+		hc:      &http.Client{},
+		// Several response streams can be open at once (one per in-flight
+		// request); the receive loop drains this continuously, so 16 is
+		// only smoothing, not a bound anything depends on.
+		inbox: make(chan *Message, 16),
+		done:  make(chan struct{}),
+	}, nil
+}
+
+// Send POSTs msg to the configured URL and queues the decoded response
+// frame(s) for Receive. One Send does exactly one HTTP round-trip; a plain
+// JSON response yields exactly one queued frame, an SSE response may yield
+// several.
+//
+// When an OAuth provider is configured: every request injects the cached
+// access token; a 401 response invalidates the cache and triggers exactly
+// one retry (so the user doesn't see two authorization prompts in a row).
+func (t *HTTPTransport) Send(ctx context.Context, msg *Message) error {
+	finish, err := t.StartSend(ctx, msg)
+	if err != nil || finish == nil {
+		return err
+	}
+	return finish()
+}
+
+// StartSend is Send split at the response headers: it returns once those are
+// handled, with a plain-JSON response already queued. For an SSE response it
+// returns finish, which reads the stream (and resumes it if it breaks) and
+// must be called exactly once — it also closes the body. ctx keeps governing
+// the stream after StartSend returns.
+func (t *HTTPTransport) StartSend(ctx context.Context, msg *Message) (finish func() error, err error) {
+	if t.closed.Load() {
+		return nil, errors.New("mcp: http transport: closed")
+	}
+
+	// At most one retry on 401 — the retry uses a freshly-acquired token.
+	for attempt := 0; attempt < 2; attempt++ {
+		retry, finish, err := t.doRequest(ctx, msg, attempt > 0)
+		if !retry {
+			return finish, err
+		}
+		// retry==true means 401 was observed; loop to retry once.
+	}
+	return nil, errors.New("mcp: http: still unauthorized after retry")
+}
+
+// doRequest performs one HTTP round-trip up to the response body. Returns
+// (retry, finish, err):
+//
+//   - retry=true means "401 observed, OAuth was invalidated, caller should
+//     loop one more time with a freshly-acquired token". err is non-nil
+//     here but only as breadcrumb context.
+//   - retry=false means "this attempt is terminal — either the response
+//     was queued for Receive, finish will read it, or err describes a hard
+//     failure".
+//
+// forceFreshToken=true on the retry attempt forces a token refresh path
+// even if the cached token still looks unexpired.
+func (t *HTTPTransport) doRequest(ctx context.Context, msg *Message, forceFreshToken bool) (retry bool, finish func() error, err error) {
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return false, nil, fmt.Errorf("mcp: marshal: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.url, bytes.NewReader(body))
+	if err != nil {
+		return false, nil, fmt.Errorf("mcp: request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// MCP spec: clients MUST include Accept with both JSON and SSE so the
+	// server can pick. We hand-pick the order so a server that supports
+	// both prefers plain JSON (which we know how to decode synchronously).
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	for k, v := range t.headers {
+		req.Header.Set(k, v)
+	}
+	t.sessionMu.Lock()
+	sentSession := t.sessionID
+	t.sessionMu.Unlock()
+	if sentSession != "" {
+		req.Header.Set("Mcp-Session-Id", sentSession)
+	}
+	t.protoMu.Lock()
+	sentVersion := t.protocolVersion
+	t.protoMu.Unlock()
+	if sentVersion != "" {
+		req.Header.Set("MCP-Protocol-Version", sentVersion)
+	}
+
+	// Bearer-token injection from OAuth provider, if configured.
+	bestEffort := isBestEffort(ctx)
+	if t.oauth != nil && bestEffort {
+		// Never escalate to refresh or a browser prompt for a send nobody is
+		// waiting on: the cached token or nothing.
+		tok := ""
+		if cp, ok := t.oauth.(cachedTokenProvider); ok {
+			tok = cp.CachedToken()
+		}
+		if tok == "" {
+			return false, nil, notSentError{errors.New("mcp: no cached oauth token for a best-effort send")}
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+	} else if t.oauth != nil {
+		if forceFreshToken {
+			t.oauth.Invalidate()
+		}
+		tok, terr := t.oauth.Token(ctx)
+		if terr != nil {
+			// Nothing has gone out yet — an interrupt during an authorization
+			// prompt lands here, and there is no request to cancel.
+			return false, nil, notSentError{fmt.Errorf("mcp: oauth token: %w", terr)}
+		}
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+	}
+
+	resp, err := t.hc.Do(req)
+	if err != nil {
+		return false, nil, fmt.Errorf("mcp: do: %w", err)
+	}
+	// Closed on return, except when the body is handed to finish.
+	keepBody := false
+	defer func() {
+		if !keepBody {
+			_ = resp.Body.Close()
+		}
+	}()
+
+	// The session this response belongs to: what we sent, unless the server
+	// rotated it just now.
+	stream := streamSession{id: sentSession, version: sentVersion}
+
+	// Capture session id on first response (and tolerate the server
+	// rotating it on subsequent calls — spec lets them).
+	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
+		stream.id = sid
+		t.sessionMu.Lock()
+		t.sessionID = sid
+		t.sessionMu.Unlock()
+	}
+
+	if resp.StatusCode == http.StatusNoContent {
+		// 204 with nothing to parse. For a notification that's the accepted
+		// outcome (the spec's own answer is 202, and both are handled below
+		// anyway). For a request it's a protocol violation — the spec requires
+		// either application/json or an SSE stream — and returning success
+		// would queue nothing, leaving the caller to wait out its whole
+		// timeout for a response that is never coming. Name it instead.
+		if !msg.IsNotification() {
+			return false, nil, fmt.Errorf("mcp: http 204 to a %s request: server must answer with JSON or an SSE stream", msg.Method)
+		}
+		return false, nil, nil
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		// If we have OAuth and this isn't already our second attempt, ask
+		// the caller to retry with a fresh token. The provider's
+		// Invalidate is what makes the next Token() do real work.
+		if t.oauth != nil && !forceFreshToken && !bestEffort {
+			return true, nil, errors.New("mcp: http 401, will retry")
+		}
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return false, nil, fmt.Errorf("mcp: http 401: %s", bytes.TrimSpace(b))
+	}
+	if resp.StatusCode == http.StatusNotFound && sentSession != "" {
+		// A 404 answering a request that carried a session id is how the spec
+		// says a server reports that session gone (idle timeout, restart).
+		// Drop it so the caller's recovery handshake goes out clean, and
+		// report it as the typed error Client watches for. A 404 on a request
+		// with no session id is an ordinary wrong-endpoint error and falls
+		// through below.
+		//
+		// A best-effort send leaves the session alone and is not reported as
+		// an expiry: it must not trigger a recovery handshake of its own, and
+		// clearing the session without one would send every later request
+		// out with no session id at all.
+		if bestEffort {
+			return false, nil, fmt.Errorf("mcp: http 404 to a best-effort %s", msg.Method)
+		}
+		t.forgetSession(sentSession)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return false, nil, fmt.Errorf("%w: %s", ErrSessionExpired, bytes.TrimSpace(b))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return false, nil, fmt.Errorf("mcp: http %d: %s", resp.StatusCode, bytes.TrimSpace(b))
+	}
+
+	if msg.IsNotification() {
+		// The spec has servers accept a notification with 202 and no body,
+		// but 204 is handled above and some servers instead answer 200 with
+		// an empty (or non-JSON-RPC) body. Notify never registers a pending
+		// response, so there's nothing to decode or queue either way —
+		// drain the small ack body so the connection can be reused.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return false, nil, nil
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	switch {
+	case ct == "" || isJSONContentType(ct):
+		var m Message
+		if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+			return false, nil, fmt.Errorf("mcp: decode response: %w", err)
+		}
+		return false, nil, t.queue(ctx, &m)
+	case isEventStreamContentType(ct):
+		keepBody = true
+		return false, func() error {
+			defer resp.Body.Close()
+			return t.readSSE(ctx, resp.Body, msg.ID, stream)
+		}, nil
+	default:
+		return false, nil, fmt.Errorf("mcp: http: unsupported response Content-Type %q (expected application/json or text/event-stream)", ct)
+	}
+}
+
+// queue hands a decoded frame to the next Receive call. Shared by the
+// plain-JSON and SSE response paths so both honor transport shutdown and
+// context cancellation identically.
+func (t *HTTPTransport) queue(ctx context.Context, m *Message) error {
+	select {
+	case t.inbox <- m:
+		return nil
+	case <-t.done:
+		// Transport closed while this request was in flight — drop the response
+		// rather than send on a channel teardown is tearing down.
+		return errors.New("mcp: http transport: closed")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// errSSEResponseReceived is an internal sentinel scanSSE uses to stop
+// scanning once the frame answering our request has been queued — it is
+// never returned to the caller.
+var errSSEResponseReceived = errors.New("mcp: sse response received")
+
+// errSSEIncomplete marks a stream that ended or broke before delivering the
+// response we were waiting for. It's the one failure resumption can repair,
+// so it's what separates "try Last-Event-ID" from "give up". Wrapped with
+// detail at each return site; callers match it with errors.Is.
+var errSSEIncomplete = errors.New("mcp: sse stream incomplete")
+
+// maxSSEResumeAttempts bounds Last-Event-ID replays for a single request. A
+// server that drops the stream this many times running isn't going to deliver
+// it, and retrying past that turns a visible failure into a hang.
+const maxSSEResumeAttempts = 3
+
+// ErrSessionExpired reports that the server no longer recognises the session
+// id we were using — it answered 404 to a request that carried one, which is
+// how the spec has a server say a session is gone (idle timeout, restart).
+// Answering a request, the transport has already dropped the dead id by the
+// time this surfaces; found on a response stream it is a *streamExpiredError
+// instead, dropped later under the client's send slot. Client.Call watches
+// for it and recovers by re-running the handshake and replaying the request
+// once; callers of Call therefore never normally see it.
+var ErrSessionExpired = errors.New("mcp: session expired")
+
+type bestEffortKey struct{}
+
+// withBestEffort marks a send as one nobody waits on (a cancellation): the
+// HTTP transport then uses only a cached OAuth token, never retries a 401,
+// and treats a 404 as a plain failure rather than a session expiry to
+// recover from. Losing such a send costs nothing; prompting the user,
+// re-handshaking, or wiping the session for it would.
+func withBestEffort(ctx context.Context) context.Context {
+	return context.WithValue(ctx, bestEffortKey{}, true)
+}
+
+func isBestEffort(ctx context.Context) bool {
+	v, _ := ctx.Value(bestEffortKey{}).(bool)
+	return v
+}
+
+// streamSession is the session a response stream belongs to. A resume
+// request carries it, not whatever is current: by then another sender may
+// have replaced the session, and the stream cannot continue on a different
+// one.
+type streamSession struct {
+	id, version string
+}
+
+// streamExpiredError is ErrSessionExpired found while reading a response
+// stream — after the client released its send slot, so the transport does
+// not clear the session itself: another sender would then go out with no
+// session id, which a server rejects outright rather than with the 404 that
+// lets it recover. It names the dead session for ForgetExpired instead.
+type streamExpiredError struct {
+	session string
+	detail  string
+}
+
+func (e *streamExpiredError) Error() string { return ErrSessionExpired.Error() + ": " + e.detail }
+func (e *streamExpiredError) Unwrap() error { return ErrSessionExpired }
+
+// ForgetExpired drops the session a *streamExpiredError names if it is still
+// the current one, and reports whether a recovery handshake is needed: false
+// when another sender has already replaced it. The client calls it holding
+// its send slot, so no request can go out between the forgetting and the
+// handshake that follows.
+func (t *HTTPTransport) ForgetExpired(err error) bool {
+	var se *streamExpiredError
+	if errors.As(err, &se) {
+		t.forgetSession(se.session)
+	}
+	t.sessionMu.Lock()
+	defer t.sessionMu.Unlock()
+	return t.sessionID == ""
+}
+
+// sessionDeleteTimeout bounds the best-effort session-termination DELETE that
+// Close fires. Short on purpose: Close runs on teardown paths (process exit,
+// /exit, a server being removed) where blocking is worse than leaking a
+// session the server will time out on its own. A var so tests can shrink it.
+var sessionDeleteTimeout = 3 * time.Second
+
+// maxSSEEventBytes bounds both a single SSE line (via scanner.Buffer) and
+// the total size of one event's "data:" lines accumulated across multiple
+// lines before a blank line flushes them. Without the latter bound, a
+// server that never emits the terminating blank line would grow readSSE's
+// buffer unboundedly. A var (not const) so tests can shrink it.
+var maxSSEEventBytes = 16 * 1024 * 1024
+
+// readSSE parses a Streamable-HTTP SSE response body: a sequence of events
+// separated by blank lines, each carrying its payload on one or more
+// "data:" lines (joined with "\n" per the SSE spec). Every decoded frame is
+// queued in arrival order — including any notifications the server
+// interleaves ahead of the response — so the Client's by-ID demuxer sees
+// them exactly as it would over the plain-JSON or stdio transports.
+//
+// wantID is the id of the request this response body answers; once a
+// queued frame is a response carrying that id, we stop reading rather than
+// wait for the server to close the stream — which also means we return
+// before resp.Body reaches EOF, so Go's http.Transport can't recycle the
+// underlying connection (it requires the body be read to completion). We
+// accept that cost: waiting for EOF instead would hang forever against a
+// server that intentionally keeps the SSE stream open past the response
+// (e.g. for later server-initiated messages), which is worse than an extra
+// TCP/TLS handshake on the next call. wantID is empty for notifications,
+// which expect no response; every frame is still queued as it arrives
+// (some servers may emit acks or other notifications on that stream), the
+// loop just never exits early and instead runs to stream close.
+//
+// A stream that dies before delivering the response is resumed rather than
+// failed, provided the server opted into resumability by tagging events with
+// id: — see resumeSSE.
+func (t *HTTPTransport) readSSE(ctx context.Context, body io.Reader, wantID []byte, stream streamSession) error {
+	lastID, err := t.scanSSE(ctx, body, wantID)
+	if !errors.Is(err, errSSEIncomplete) {
+		return err
+	}
+	return t.resumeSSE(ctx, wantID, lastID, err, stream)
+}
+
+// resumeSSE picks up a response stream that broke before answering. The spec's
+// mechanism is a GET to the same endpoint carrying Last-Event-ID, which the
+// server answers by replaying what came after that event.
+//
+// Resumption needs an event id to resume from: a server that never tagged its
+// events hasn't opted in and has no way to know where to restart, so there the
+// original failure stands. Attempts are capped — a server that keeps dropping
+// the stream is broken, and retrying forever would just hide that.
+func (t *HTTPTransport) resumeSSE(ctx context.Context, wantID []byte, lastID string, cause error, stream streamSession) error {
+	for attempt := 0; attempt < maxSSEResumeAttempts; attempt++ {
+		if lastID == "" {
+			break
+		}
+		body, err := t.openResumeStream(ctx, lastID, stream)
+		if err != nil {
+			// An expiry discovered here must stay recognisable: it's the one
+			// failure the Client can repair, and burying it under the
+			// stream-incomplete cause would strand the connection.
+			if errors.Is(err, ErrSessionExpired) {
+				return err
+			}
+			return fmt.Errorf("%w (resume attempt %d: %v)", cause, attempt+1, err)
+		}
+		var next string
+		next, err = t.scanSSE(ctx, body, wantID)
+		_ = body.Close()
+		if !errors.Is(err, errSSEIncomplete) {
+			return err // delivered the response, or failed for a reason resuming won't fix
+		}
+		cause = err
+		if next == "" || next == lastID {
+			break // no forward progress; resuming again would replay the same gap
+		}
+		lastID = next
+	}
+	return cause
+}
+
+// openResumeStream issues the spec's replay request: a GET on the endpoint
+// with Last-Event-ID set, asking the server to continue an interrupted stream.
+func (t *HTTPTransport) openResumeStream(ctx context.Context, lastID string, stream streamSession) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Last-Event-ID", lastID)
+	for k, v := range t.headers {
+		req.Header.Set(k, v)
+	}
+	sid := stream.id
+	if sid != "" {
+		req.Header.Set("Mcp-Session-Id", sid)
+	}
+	if stream.version != "" {
+		req.Header.Set("MCP-Protocol-Version", stream.version)
+	}
+	if t.oauth != nil {
+		tok, terr := t.oauth.Token(ctx)
+		if terr != nil {
+			return nil, fmt.Errorf("oauth token: %w", terr)
+		}
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+	}
+
+	resp, err := t.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusNotFound && sid != "" {
+		// The spec names an expiring session as the one sanctioned reason for a
+		// server to close a response stream early, so this is a likely way for
+		// a resume to fail rather than an exotic one. Report it as the expiry
+		// it is — the caller propagates it so the Client re-handshakes — and
+		// not as "the stream broke", which would fail the call with an
+		// unrelated message and never replace the dead session.
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		_ = resp.Body.Close()
+		return nil, &streamExpiredError{session: sid, detail: string(bytes.TrimSpace(b))}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		_ = resp.Body.Close()
+		// A server with no GET endpoint (405) lands here; the caller reports
+		// the original stream failure, which is the more useful error.
+		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, bytes.TrimSpace(b))
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "" && !isEventStreamContentType(ct) {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("resume stream Content-Type %q, want text/event-stream", ct)
+	}
+	return resp.Body, nil
+}
+
+// scanSSE consumes one SSE body, queuing every frame it decodes. It returns
+// the last event id the server tagged (empty if it tagged none, which means
+// the stream isn't resumable) plus:
+//
+//   - nil once the frame answering wantID has been queued, or once a
+//     wantID-less (notification) stream ends;
+//   - errSSEIncomplete if the stream ended or broke before that, which is the
+//     resumable case;
+//   - any other error for failures resuming can't fix (undecodable frame,
+//     oversized event, transport shutdown).
+func (t *HTTPTransport) scanSSE(ctx context.Context, body io.Reader, wantID []byte) (string, error) {
+	scanner := bufio.NewScanner(body)
+	// Default 64KiB line limit is too small for a single-line JSON-RPC
+	// frame carrying a large tool result; give it room.
+	scanner.Buffer(make([]byte, 0, 64*1024), maxSSEEventBytes)
+
+	var data []string
+	var dataLen int
+	// lastID is the most recent id: the server tagged an event with. It's what
+	// a resume request replays from, so it's tracked even though nothing else
+	// here acts on it.
+	var lastID string
+	flush := func() error {
+		if len(data) == 0 {
+			return nil
+		}
+		payload := strings.Join(data, "\n")
+		data = data[:0]
+		dataLen = 0
+		var m Message
+		if err := json.Unmarshal([]byte(payload), &m); err != nil {
+			return fmt.Errorf("mcp: decode sse frame: %w", err)
+		}
+		if err := t.queue(ctx, &m); err != nil {
+			return err
+		}
+		if len(wantID) > 0 && m.IsResponse() && bytes.Equal(m.ID, wantID) {
+			return errSSEResponseReceived
+		}
+		return nil
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case line == "":
+			if err := flush(); err != nil {
+				if err == errSSEResponseReceived {
+					return lastID, nil
+				}
+				return lastID, err
+			}
+		case strings.HasPrefix(line, "data:"):
+			field := strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ")
+			// A server that never emits the blank line ending an event would
+			// otherwise grow data unboundedly — bufio.Scanner's per-line cap
+			// doesn't help since this accumulates across many lines.
+			dataLen += len(field) + 1 // +1 for the "\n" separator flush joins lines with
+			if dataLen > maxSSEEventBytes {
+				return lastID, fmt.Errorf("mcp: sse event exceeds %d bytes without a terminating blank line", maxSSEEventBytes)
+			}
+			data = append(data, field)
+		case strings.HasPrefix(line, "id:"):
+			lastID = strings.TrimPrefix(strings.TrimPrefix(line, "id:"), " ")
+		default:
+			// event:, retry:, or a comment line — nothing acts on these.
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		// A mid-stream read failure is exactly what resumption is for.
+		return lastID, fmt.Errorf("%w: read sse stream: %v", errSSEIncomplete, err)
+	}
+	// Stream closed without a trailing blank line before EOF: flush
+	// whatever event was still buffered.
+	if err := flush(); err != nil {
+		if err == errSSEResponseReceived {
+			return lastID, nil
+		}
+		return lastID, err
+	}
+	if len(wantID) > 0 {
+		return lastID, fmt.Errorf("%w: stream closed without a response to request id %s",
+			errSSEIncomplete, wantID)
+	}
+	return lastID, nil
+}
+
+// Receive blocks for the next queued frame. A plain-JSON response queues
+// exactly one frame per Send; an SSE response may queue several (server
+// notifications ahead of the response), each delivered by its own Receive
+// call in arrival order.
+func (t *HTTPTransport) Receive(ctx context.Context) (*Message, error) {
+	select {
+	case m, ok := <-t.inbox:
+		if !ok {
+			return nil, io.EOF
+		}
+		return m, nil
+	case <-t.done:
+		return nil, io.EOF
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// forgetSession drops the state that belonged to a session the server has
+// declared gone, so the recovery handshake starts from nothing.
+//
+// The protocol version goes with the session id, not just the id alone: a
+// revision is negotiated per session, and the recovery initialize is precisely
+// the request that renegotiates it. Carrying the old value into it would make
+// a server that restarted onto a revision it no longer supports answer 400
+// (which the spec requires for an unsupported version header) instead of
+// negotiating, turning a recoverable expiry into a wedged connection.
+//
+// sentSession guards against clobbering a newer session: by the time a 404
+// lands, a concurrent request may already have established a replacement.
+func (t *HTTPTransport) forgetSession(sentSession string) {
+	t.sessionMu.Lock()
+	stale := t.sessionID == sentSession
+	if stale {
+		t.sessionID = ""
+	}
+	t.sessionMu.Unlock()
+	if !stale {
+		return
+	}
+	t.protoMu.Lock()
+	t.protocolVersion = ""
+	t.protoMu.Unlock()
+}
+
+// SetProtocolVersion records the revision the server chose during the
+// initialize handshake so later requests can advertise it. Called by
+// Client.Initialize before it sends notifications/initialized, so every
+// post-handshake request carries the header.
+func (t *HTTPTransport) SetProtocolVersion(v string) {
+	t.protoMu.Lock()
+	t.protocolVersion = v
+	t.protoMu.Unlock()
+}
+
+// Close tears the transport down. Idempotent. After Close, any pending
+// Receive caller is unblocked with io.EOF; further Sends return an error.
+//
+// If the server issued a session id, Close first tries to release it with a
+// DELETE (the spec's session-termination request) so the server can drop its
+// per-client state instead of holding it until an idle timeout. That is a
+// courtesy on a teardown path: it gets a short independent timeout — the
+// caller's context is typically already cancelled by the time we're closing —
+// and any failure is ignored, since there is nothing useful to do about a
+// server that won't let go of a session we're abandoning anyway.
+func (t *HTTPTransport) Close() error {
+	if !t.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	t.deleteSession()
+	close(t.done)
+	return nil
+}
+
+func (t *HTTPTransport) deleteSession() {
+	t.sessionMu.Lock()
+	sid := t.sessionID
+	t.sessionMu.Unlock()
+	if sid == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sessionDeleteTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, t.url, nil)
+	if err != nil {
+		return
+	}
+	for k, v := range t.headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Mcp-Session-Id", sid)
+	t.protoMu.Lock()
+	if t.protocolVersion != "" {
+		req.Header.Set("MCP-Protocol-Version", t.protocolVersion)
+	}
+	t.protoMu.Unlock()
+	// Reuse an already-cached OAuth token if there is one, but never start an
+	// interactive authorization just to say goodbye. This must not call
+	// Token: that escalates through refresh to a full authorize, which opens
+	// a browser — so a near-expired token whose refresh failed would pop an
+	// authorization page when the user typed /exit, then fail anyway on this
+	// path's short deadline.
+	if cp, ok := t.oauth.(cachedTokenProvider); ok {
+		if tok := cp.CachedToken(); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+	}
+	resp, err := t.hc.Do(req)
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
+}
+
+// isJSONContentType reports whether ct (a Content-Type header value)
+// indicates a JSON-RPC body. Tolerant of the "; charset=utf-8" suffix and
+// the legacy "application/json-rpc" alias some servers use.
+func isJSONContentType(ct string) bool {
+	for _, prefix := range []string{"application/json", "application/json-rpc"} {
+		if len(ct) >= len(prefix) && ct[:len(prefix)] == prefix {
+			return true
+		}
+	}
+	return false
+}
+
+// isEventStreamContentType reports whether ct indicates an SSE body.
+// Tolerant of the "; charset=utf-8" suffix.
+func isEventStreamContentType(ct string) bool {
+	const prefix = "text/event-stream"
+	return len(ct) >= len(prefix) && ct[:len(prefix)] == prefix
+}

@@ -1,0 +1,179 @@
+# Troubleshooting
+
+Common issues and their fixes.
+
+## Installation
+
+### `octo: command not found`
+
+- Ensure the binary is on your `$PATH`:
+  ```bash
+  export PATH="$PATH:/path/to/octo/bin"
+  ```
+- Or use the full path: `./octo`
+
+### macOS "cannot be opened because the developer cannot be verified"
+
+- Right-click the binary → Open, or run:
+  ```bash
+  xattr -d com.apple.quarantine /path/to/octo
+  ```
+
+## Configuration
+
+### `octo` says "no API key"
+
+- Check that the env var is set: `echo $ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`)
+- Or run `octo config` to store the key in `~/.octo/config.yml` (mode 0600)
+- Check `octo config show` to see where the provider/model resolve from
+
+### Provider/model not what I expected
+
+Precedence (highest first): CLI flag > env var > config file > built-in default.
+
+- `--provider` / `--model` flags override everything
+- `OCTO_PROVIDER` / `ANTHROPIC_MODEL` env vars override the config file
+- The config file's model is only honored when the resolved provider matches
+
+Also remember that a session is **bound to a model at creation time**. Changing the global default (`octo config`, the web UI Settings panel, or `POST /api/config/endpoints/{id}/default`) only affects **new** sessions. Existing sessions keep their current model until you explicitly switch them via the TUI `/model` command, the web UI Composer's model chip, the IM `/model` command, or `PATCH /api/sessions/{id}/model`.
+
+### `HTTP 429` / "rate limit exceeded" mid-turn
+
+The endpoint refused a request for exceeding its quota. octo already retries a transient 429 with
+backoff (4 attempts, honouring `Retry-After` for up to 2 minutes) — an error that still surfaced
+means the quota is being exceeded steadily, not by a blip.
+
+Free-tier endpoints are the usual case: they cap requests per minute and simultaneous requests, and
+octo's own fan-out (sub-agents, workflow steps, background title generation, the vision helper) adds
+up fast on top of a turn's tool-call rounds. Cap octo's side to match the provider's published
+quota by hand-editing the endpoint in `~/.octo/config.yml`:
+
+```yaml
+endpoints:
+  - id: free-tier
+    rpm: 8              # requests per rolling minute
+    max_concurrency: 1  # requests in flight at once
+```
+
+Requests then queue instead of failing. See `CONFIG.md` → "Rate-limiting an endpoint" for the full
+rules. There is no UI for these keys.
+
+## TUI
+
+### TUI doesn't start (falls back to plain REPL)
+
+- TUI requires a TTY. Piped input (`echo "hello" | octo`) runs headless
+- Check `octo --help` for `--no-tui` or TTY-related flags
+
+### Image paste (Ctrl+V) doesn't work
+
+- Only works on **macOS** today (uses AppleScript to read clipboard)
+- Ensure the clipboard actually contains an image, not a file reference
+- Try dragging the image into the terminal instead
+
+### Input history not persisting
+
+- History is saved to `~/.octo/history` (or `$OCTO_HISTORY_FILE`)
+- Ensure `~/.octo` is writable
+
+## Serve (Web UI / IM bridge)
+
+### Web UI or IM bot isn't responding
+
+- Web UI and IM bridge both run inside the same `octo serve` process — check it's actually up: `octo serve --status`
+- Foreground (no `-d`) prints errors straight to the terminal it was started in
+- Started with `-d`/`--daemon`? There's no terminal, so output goes to `~/.octo/serve.log` instead — tail it for the real error:
+  ```bash
+  tail -f ~/.octo/serve.log
+  ```
+- The daemon's pid is tracked in `~/.octo/serve.pid`; `octo serve --status`/`--stop` read it directly
+
+### IM channel (Feishu/WeChat/Telegram/DingTalk/WeCom/Discord) not connecting
+
+- The bridge has no log of its own — connection and credential errors land in the same `~/.octo/serve.log` as the rest of `octo serve`
+- Credentials live in `~/.octo/channels.yml`; edits made through the Web UI's Channels panel hot-reload immediately, but a direct edit to the file (no filesystem watcher) needs `octo serve --stop` + restart to take effect — see the `channel-manager` skill
+- For a precise per-platform status instead of grepping logs, use the `channel-manager` skill's `doctor` subcommand, which reads `/api/channels`
+- `octo serve --no-channel` disables the bridge entirely — useful to isolate whether an issue is the bridge or the API server
+
+### "daemon already running" but nothing responds
+
+- A stale pid pointing at a dead process clears itself on the next `--status`/`--stop`/start
+- If the pid is alive but the port doesn't answer, the worker is likely stuck mid-startup — check the tail of `~/.octo/serve.log` for the last line logged before it stalled
+
+### Port already in use
+
+- `octo serve --status` tells you whether the process holding the port is octo's own daemon
+- Use a different port (`-addr :<port>`) or stop the existing instance (`octo serve --stop`) first
+
+### Agent says "refusing to kill the octo server process"
+
+- Expected behavior, not an error: the agent runs inside `octo serve`, so shell commands that would kill the server (`kill <pid>`, `pkill octo`, including variable-expanded forms like `kill $P`) are refused — otherwise the agent would drop your session mid-turn
+- To restart properly: let the agent call the `restart_server` tool (it asks for confirmation), hit `POST /api/restart`, or run `octo serve --stop` and start it again yourself
+- Desktop app: the server runs in-process with no supervisor, so `restart_server` doesn't exist there — restart the app instead
+
+## MCP
+
+### "No MCP servers connected"
+
+- Verify `~/.octo/mcp.json` exists and is valid JSON
+- Check that the server command is on `$PATH` (or use absolute path)
+- Run with `--verbose` to see connection errors
+
+### MCP server keeps disconnecting
+
+- Some servers (especially stdio-based) crash on malformed input — check their logs
+- OAuth servers: delete `~/.octo/mcp-tokens/<server>.json` to force re-auth
+
+## Permissions
+
+### "permission_denied" on safe operations
+
+- Check current mode with `Shift+Tab` (cycles interactive → strict → auto)
+- In strict mode, all unmatched operations are denied — switch to interactive
+- Or add an allow rule to `~/.octo/permissions.yml`
+
+### Accidentally denied "always allow this session"
+
+- Restart octo — session memory is cleared on exit
+- Or switch permission mode to auto (Shift+Tab) temporarily
+
+## Sessions
+
+### Session not found when resuming
+
+- Sessions are saved to `~/.octo/sessions/`
+- Resume with `octo -c <session-id>`
+- List recent sessions with `/sessions` in TUI
+
+### Session file corrupted
+
+- Sessions are JSON — validate with `python3 -m json.tool ~/.octo/sessions/<id>.json`
+- Corrupted sessions are skipped at load; remove the file to clear the error
+
+## Performance
+
+### Slow first turn / long "Thinking" spinner
+
+- Large repos: the initial `.octorules` + file tree scan can take time
+- Use `--quiet` to reduce rendering overhead
+- Check context usage in the status bar — high ctx% triggers compaction which pauses the stream
+
+### "Context too long" error
+
+- History compaction runs automatically when context usage is high
+- If it still fails, start a new session (`/exit` then `octo`)
+- Or use a model with a larger context window
+
+## Git
+
+### Co-authored-by not appearing
+
+- Check `octo config show` — `coauthor` should be "on"
+- Only applies to commits written by octo (via `terminal: git commit`)
+- The trailer is appended automatically; if you edit the message manually, it may be lost
+
+## Getting help
+
+- Run `octo help <command>` for detailed command docs
+- Run `/help` in the TUI for keyboard shortcuts
+- Check the status bar hints — they change based on current state

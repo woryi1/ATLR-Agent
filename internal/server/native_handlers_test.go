@@ -1,0 +1,946 @@
+package server
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// fakeNative records what it was asked and returns canned results.
+type fakeNative struct {
+	gotStartDir        string
+	retPath            string
+	retCancel          bool
+	gotTitle, gotBody  string
+	notifyCalls        int
+	gotSessionID       string
+	notifySessionCalls int
+	dismissCalls       int
+	gotDismissID       string
+	autostart          bool
+	toggleMaxCalls     int
+	minimiseCalls      int
+	closeCalls         int
+	maximised          bool
+	gotOpenURL         string
+	openCalls          int
+	gotOpenDir         string
+	openDirCalls       int
+	gotSaveName        string
+	gotSaveContent     string
+	saveCalls          int
+	printCalls         int
+	printErr           error
+	heartbeatCalls     int
+	gotFrameAgeMS      int64
+	gotHidden          bool
+}
+
+func (f *fakeNative) PickFolder(_ context.Context, startDir string) (string, bool, error) {
+	f.gotStartDir = startDir
+	return f.retPath, f.retCancel, nil
+}
+func (f *fakeNative) PickFile(_ context.Context, startDir string) (string, bool, error) {
+	f.gotStartDir = startDir
+	return f.retPath, f.retCancel, nil
+}
+func (f *fakeNative) Notify(title, body string) {
+	f.notifyCalls++
+	f.gotTitle, f.gotBody = title, body
+}
+func (f *fakeNative) NotifySession(title, body, sessionID string) {
+	f.notifySessionCalls++
+	f.gotTitle, f.gotBody = title, body
+	f.gotSessionID = sessionID
+}
+func (f *fakeNative) DismissSessionNotification(sessionID string) {
+	f.dismissCalls++
+	f.gotDismissID = sessionID
+}
+func (f *fakeNative) AutostartEnabled() (bool, error) { return f.autostart, nil }
+func (f *fakeNative) SetAutostart(enable bool) error  { f.autostart = enable; return nil }
+func (f *fakeNative) ToggleMaximise()                 { f.toggleMaxCalls++ }
+func (f *fakeNative) Minimise()                       { f.minimiseCalls++ }
+func (f *fakeNative) Close()                          { f.closeCalls++ }
+func (f *fakeNative) WindowState() bool               { return f.maximised }
+func (f *fakeNative) OpenExternal(url string) error {
+	f.openCalls++
+	f.gotOpenURL = url
+	return nil
+}
+func (f *fakeNative) OpenFolder(dir string) error {
+	f.openDirCalls++
+	f.gotOpenDir = dir
+	return nil
+}
+func (f *fakeNative) SaveFile(_ context.Context, defaultName, content string) (string, bool, error) {
+	f.saveCalls++
+	f.gotSaveName, f.gotSaveContent = defaultName, content
+	return f.retPath, f.retCancel, nil
+}
+func (f *fakeNative) Print() error {
+	f.printCalls++
+	return f.printErr
+}
+func (f *fakeNative) Heartbeat(frameAgeMS int64, hidden bool) {
+	f.heartbeatCalls++
+	f.gotFrameAgeMS = frameAgeMS
+	f.gotHidden = hidden
+}
+
+func TestNativePickFolderNotRegisteredWithoutBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/pick-folder", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("without a bridge the route must not exist: got %d, want 404", w.Code)
+	}
+}
+
+func TestNativePickFolderDelegatesToBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{retPath: "/picked/dir"}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/pick-folder", strings.NewReader(`{"start_dir":"/seed"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.gotStartDir != "/seed" {
+		t.Errorf("start_dir handed to bridge = %q, want /seed", fake.gotStartDir)
+	}
+	var resp struct {
+		Path      string `json:"path"`
+		Cancelled bool   `json:"cancelled"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Path != "/picked/dir" || resp.Cancelled {
+		t.Errorf("resp = %+v, want {path:/picked/dir cancelled:false}", resp)
+	}
+}
+
+func TestNativePickFolderRejectsNonLoopback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: &fakeNative{retPath: "/x"}})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/pick-folder", strings.NewReader(`{}`))
+	req.RemoteAddr = "203.0.113.5:1000" // non-loopback
+	req.Host = "127.0.0.1:8080"
+	// Valid key clears requireAuth (which would otherwise 401 a non-loopback
+	// peer), so the request reaches the handler's own same-machine guard.
+	req.Header.Set("Authorization", "Bearer "+srv.AccessKey())
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback peer: got %d, want 403", w.Code)
+	}
+}
+
+func TestNativeNotifyDelegatesToBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/notify", strings.NewReader(`{"title":"Done","body":"turn complete"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.notifyCalls != 1 || fake.gotTitle != "Done" || fake.gotBody != "turn complete" {
+		t.Errorf("bridge.Notify got calls=%d title=%q body=%q, want 1/Done/turn complete", fake.notifyCalls, fake.gotTitle, fake.gotBody)
+	}
+}
+
+func TestNativeNotifyRoutesToNotifySessionWhenSessionIDPresent(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/notify", strings.NewReader(`{"title":"Question","body":"needs input","session_id":"sess-123"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.notifyCalls != 0 {
+		t.Errorf("bridge.Notify calls = %d, want 0 (NotifySession should be used)", fake.notifyCalls)
+	}
+	if fake.notifySessionCalls != 1 || fake.gotTitle != "Question" || fake.gotBody != "needs input" || fake.gotSessionID != "sess-123" {
+		t.Errorf("bridge.NotifySession got calls=%d title=%q body=%q sessionID=%q, want 1/Question/needs input/sess-123",
+			fake.notifySessionCalls, fake.gotTitle, fake.gotBody, fake.gotSessionID)
+	}
+}
+
+func TestNativeNotifyNotRegisteredWithoutBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/notify", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("without a bridge the route must not exist: got %d, want 404", w.Code)
+	}
+}
+
+func TestNativeNotifyDismissRoutesToBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/notify/dismiss", strings.NewReader(`{"session_id":"sess-123"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.dismissCalls != 1 || fake.gotDismissID != "sess-123" {
+		t.Errorf("bridge.DismissSessionNotification got calls=%d sessionID=%q, want 1/sess-123",
+			fake.dismissCalls, fake.gotDismissID)
+	}
+}
+
+func TestNativeNotifyDismissWithoutSessionIDNoOps(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/notify/dismiss", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.dismissCalls != 0 {
+		t.Errorf("bridge.DismissSessionNotification calls = %d, want 0 for a missing session_id", fake.dismissCalls)
+	}
+}
+
+func TestNativeNotifyDismissRejectsNonLoopback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: &fakeNative{}})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/notify/dismiss", strings.NewReader(`{"session_id":"sess-123"}`))
+	req.RemoteAddr = "203.0.113.5:1000" // non-loopback
+	req.Host = "127.0.0.1:8080"
+	// Valid key clears requireAuth (which would otherwise 401 a non-loopback
+	// peer), so the request reaches the handler's own same-machine guard.
+	req.Header.Set("Authorization", "Bearer "+srv.AccessKey())
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback peer: got %d, want 403", w.Code)
+	}
+}
+
+func TestNativeAutostartRoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+
+	getEnabled := func() bool {
+		req := httptest.NewRequest(http.MethodGet, "/api/native/autostart", nil)
+		w := httptest.NewRecorder()
+		serveLoopback(srv.mux, w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET autostart: got %d, want 200", w.Code)
+		}
+		var body struct {
+			Enabled bool `json:"enabled"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &body)
+		return body.Enabled
+	}
+
+	if getEnabled() {
+		t.Fatalf("initial autostart should be false")
+	}
+	req := httptest.NewRequest(http.MethodPut, "/api/native/autostart", strings.NewReader(`{"enabled":true}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT autostart: got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if !getEnabled() {
+		t.Errorf("autostart should be enabled after PUT true")
+	}
+}
+
+func TestNativeToggleMaximise(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/window/toggle-maximise", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.toggleMaxCalls != 1 {
+		t.Errorf("ToggleMaximise calls = %d, want 1", fake.toggleMaxCalls)
+	}
+}
+
+func TestNativeHeartbeatDelegatesToBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/heartbeat", strings.NewReader(`{"frame_age_ms":1234}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.heartbeatCalls != 1 || fake.gotFrameAgeMS != 1234 || fake.gotHidden {
+		t.Errorf("Heartbeat calls = %d frameAge = %d hidden = %v, want 1 / 1234 / false",
+			fake.heartbeatCalls, fake.gotFrameAgeMS, fake.gotHidden)
+	}
+
+	// The hidden flag rides separately from the frame age: a hidden page owes
+	// no frames, which is NOT the same as a visible page that never painted.
+	req = httptest.NewRequest(http.MethodPost, "/api/native/heartbeat", strings.NewReader(`{"frame_age_ms":-1,"hidden":true}`))
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("hidden beat: got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.heartbeatCalls != 2 || fake.gotFrameAgeMS != -1 || !fake.gotHidden {
+		t.Errorf("hidden beat: calls = %d frameAge = %d hidden = %v, want 2 / -1 / true",
+			fake.heartbeatCalls, fake.gotFrameAgeMS, fake.gotHidden)
+	}
+
+	// A body-less beat still counts as liveness, but must claim NO frame
+	// evidence: defaulting the age to zero would read as "just painted" and let
+	// a malformed beat mask a black window.
+	req = httptest.NewRequest(http.MethodPost, "/api/native/heartbeat", nil)
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("body-less beat: got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.heartbeatCalls != 3 || fake.gotFrameAgeMS != -1 || fake.gotHidden {
+		t.Errorf("body-less beat: calls = %d frameAge = %d hidden = %v, want 3 / -1 / false",
+			fake.heartbeatCalls, fake.gotFrameAgeMS, fake.gotHidden)
+	}
+}
+
+func TestNativeWindowState(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{maximised: true}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodGet, "/api/native/window/state", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	var body struct {
+		Maximised bool `json:"maximised"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !body.Maximised {
+		t.Errorf("maximised = false, want true")
+	}
+
+	// Non-maximised window reports false.
+	fake.maximised = false
+	w = httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.Maximised {
+		t.Errorf("maximised = true, want false")
+	}
+}
+
+func TestNativeWindowStateRejectsNonLoopback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: &fakeNative{maximised: true}})
+	req := httptest.NewRequest(http.MethodGet, "/api/native/window/state", nil)
+	req.RemoteAddr = "203.0.113.5:1000"
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("Authorization", "Bearer "+srv.AccessKey())
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback peer: got %d, want 403", w.Code)
+	}
+}
+
+func TestVersionNativeFlag(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	get := func(srv *Server) bool {
+		req := httptest.NewRequest(http.MethodGet, "/api/version", nil)
+		w := httptest.NewRecorder()
+		serveLoopback(srv.mux, w, req)
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		native, _ := body["native"].(bool)
+		return native
+	}
+
+	if get(mustServer(t, Config{Addr: "127.0.0.1:0"})) {
+		t.Error("serve build: native flag should be false")
+	}
+	if !get(mustServer(t, Config{Addr: "127.0.0.1:0", Native: &fakeNative{}})) {
+		t.Error("desktop build: native flag should be true")
+	}
+}
+
+func TestNativeOpenExternalDelegatesToBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	const link = "https://github.com/open-octo/octo-agent/releases/latest"
+	req := httptest.NewRequest(http.MethodPost, "/api/native/open-external", strings.NewReader(`{"url":"`+link+`"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.openCalls != 1 || fake.gotOpenURL != link {
+		t.Errorf("bridge.OpenExternal calls=%d url=%q, want 1/%s", fake.openCalls, fake.gotOpenURL, link)
+	}
+}
+
+func TestNativeOpenExternalAllowsMailtoAndTel(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	for _, link := range []string{"mailto:someone@example.com", "tel:+15551234567"} {
+		fake := &fakeNative{}
+		srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+		req := httptest.NewRequest(http.MethodPost, "/api/native/open-external", strings.NewReader(`{"url":"`+link+`"}`))
+		w := httptest.NewRecorder()
+		serveLoopback(srv.mux, w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: got %d, want 200 (%s)", link, w.Code, w.Body.String())
+		}
+		if fake.openCalls != 1 || fake.gotOpenURL != link {
+			t.Errorf("%s: bridge.OpenExternal calls=%d url=%q, want 1/%s", link, fake.openCalls, fake.gotOpenURL, link)
+		}
+	}
+}
+
+func TestNativeOpenExternalRejectsDisallowedScheme(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	for _, link := range []string{"file:///etc/passwd", "javascript:alert(1)", "custom-app://open"} {
+		fake := &fakeNative{}
+		srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+		req := httptest.NewRequest(http.MethodPost, "/api/native/open-external", strings.NewReader(`{"url":"`+link+`"}`))
+		w := httptest.NewRecorder()
+		serveLoopback(srv.mux, w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: got %d, want 400", link, w.Code)
+		}
+		if fake.openCalls != 0 {
+			t.Errorf("%s: bridge must not be called for a rejected scheme (calls=%d)", link, fake.openCalls)
+		}
+	}
+}
+
+func TestNativeOpenExternalRejectsNonLoopback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: &fakeNative{}})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/open-external", strings.NewReader(`{"url":"https://example.com"}`))
+	req.RemoteAddr = "203.0.113.5:1000" // non-loopback
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("Authorization", "Bearer "+srv.AccessKey())
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback peer: got %d, want 403", w.Code)
+	}
+}
+
+func TestNativeOpenExternalNotRegisteredWithoutBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/open-external", strings.NewReader(`{"url":"https://example.com"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("without a bridge the route must not exist: got %d, want 404", w.Code)
+	}
+}
+
+func TestNativeSaveFileDelegatesToBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{retPath: "/Users/x/Downloads/notes.md"}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/save-file",
+		strings.NewReader(`{"name":"notes.md","content":"# hello"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.saveCalls != 1 || fake.gotSaveName != "notes.md" || fake.gotSaveContent != "# hello" {
+		t.Errorf("SaveFile calls=%d name=%q content=%q, want 1/notes.md/# hello",
+			fake.saveCalls, fake.gotSaveName, fake.gotSaveContent)
+	}
+	var resp struct {
+		Path      string `json:"path"`
+		Cancelled bool   `json:"cancelled"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Path != "/Users/x/Downloads/notes.md" || resp.Cancelled {
+		t.Errorf("got path=%q cancelled=%v, want the chosen path/false", resp.Path, resp.Cancelled)
+	}
+}
+
+func TestNativeSaveFileReportsCancel(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{retCancel: true}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/save-file",
+		strings.NewReader(`{"name":"a.txt","content":"x"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Path      string `json:"path"`
+		Cancelled bool   `json:"cancelled"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Cancelled || resp.Path != "" {
+		t.Errorf("dismissed dialog: got path=%q cancelled=%v, want empty/true", resp.Path, resp.Cancelled)
+	}
+}
+
+// A binary payload (e.g. a skill zip) round-trips through the JSON body as a
+// base64 string. The SaveFile bridge receives the decoded bytes as a string,
+// so the written file must match the original bytes — not the base64 encoding.
+func TestNativeSaveFileDecodesBase64(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	original := []byte{0x50, 0x4B, 0x03, 0x04, 0x00, 0x01, 0x02, 0x03, 0xFF, 0xFE}
+	b64 := base64.StdEncoding.EncodeToString(original)
+	fake := &fakeNative{retPath: "/Users/x/Downloads/b.pk"}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/save-file",
+		strings.NewReader(`{"name":"b.pk","content":"`+b64+`","encoding":"base64"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.saveCalls != 1 || fake.gotSaveName != "b.pk" {
+		t.Fatalf("SaveFile calls=%d name=%q, want 1/b.pk", fake.saveCalls, fake.gotSaveName)
+	}
+	// The bridge writes the raw decoded bytes, not the base64 string itself.
+	if fake.gotSaveContent != string(original) {
+		t.Errorf("written bytes differ")
+	}
+}
+
+// Garbage in the content field must be caught and rejected with 400 rather
+// than propagated to a native dialog.
+func TestNativeSaveFileRejectsInvalidBase64(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/save-file",
+		strings.NewReader(`{"name":"x.zip","content":"not_base64!!","encoding":"base64"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400 (%s)", w.Code, w.Body.String())
+	}
+	if fake.saveCalls != 0 {
+		t.Errorf("SaveFile called %d times; invalid input should short-circuit before the bridge", fake.saveCalls)
+	}
+}
+
+func TestNativePrintDelegatesToBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/print", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.printCalls != 1 {
+		t.Errorf("Print calls=%d, want 1", fake.printCalls)
+	}
+}
+
+func TestNativePrintReportsBridgeError(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{printErr: errors.New("no window")}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/print", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("got %d, want 500 (%s)", w.Code, w.Body.String())
+	}
+}
+
+// The print dialog is an OS-level surface driven from the served page, so a
+// remote browser on the same hub must not be able to raise it on the desktop.
+func TestNativePrintRejectsNonLoopback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/print", nil)
+	req.RemoteAddr = "203.0.113.9:5000" // non-loopback
+	req.Host = "127.0.0.1:8080"
+	// Valid key clears requireAuth (which would otherwise 401 a non-loopback
+	// peer), so the request reaches the handler's own same-machine guard.
+	req.Header.Set("Authorization", "Bearer "+srv.AccessKey())
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("got %d, want 403 (%s)", w.Code, w.Body.String())
+	}
+	if fake.printCalls != 0 {
+		t.Errorf("bridge must not be called for a non-loopback peer (calls=%d)", fake.printCalls)
+	}
+}
+
+func TestNativePrintNotRegisteredWithoutBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/print", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("without a bridge the route must not exist: got %d, want 404", w.Code)
+	}
+}
+
+func TestNativeSaveFileNotRegisteredWithoutBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/save-file",
+		strings.NewReader(`{"name":"a.txt","content":"x"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("without a bridge the route must not exist: got %d, want 404", w.Code)
+	}
+}
+
+func TestNativeOpenFolderDelegatesToBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	proj := filepath.Join(tmp, "project")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+
+	post := func(path, body string) map[string]any {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		w := httptest.NewRecorder()
+		serveLoopback(srv.mux, w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("POST %s -> %d (%s)", path, w.Code, w.Body.String())
+		}
+		var out map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		return out
+	}
+
+	grp := post("/api/session-groups", `{"name":"proj","working_dir":"`+jsonPath(proj)+`"}`)
+	groupID, _ := grp["group"].(map[string]any)["id"].(string)
+	groupWS, _ := grp["group"].(map[string]any)["working_dir"].(string)
+	sess := post("/api/sessions", `{"name":"loose"}`)
+	sessionID, _ := sess["session"].(map[string]any)["id"].(string)
+	sessionDir, _ := sess["session"].(map[string]any)["working_dir"].(string)
+	if groupID == "" || sessionID == "" || sessionDir == "" {
+		t.Fatalf("fixture ids: group=%q session=%q dir=%q", groupID, sessionID, sessionDir)
+	}
+
+	// A project opens its workspace — where its sessions actually run and
+	// write; a loose session the dir the server resolved for it. Neither
+	// caller names a path.
+	for _, tc := range []struct{ name, body, wantDir string }{
+		{"group", `{"group_id":"` + groupID + `"}`, groupWS},
+		{"session", `{"session_id":"` + sessionID + `"}`, sessionDir},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := fake.openDirCalls
+			req := httptest.NewRequest(http.MethodPost, "/api/native/open-folder", strings.NewReader(tc.body))
+			w := httptest.NewRecorder()
+			serveLoopback(srv.mux, w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+			}
+			if fake.openDirCalls != before+1 || fake.gotOpenDir != tc.wantDir {
+				t.Errorf("bridge.OpenFolder calls=%d dir=%q, want %d/%s", fake.openDirCalls, fake.gotOpenDir, before+1, tc.wantDir)
+			}
+		})
+	}
+}
+
+// The endpoint resolves the directory itself, so a caller cannot name one: a
+// path in the body is not a path, an unknown id opens nothing, and a project
+// whose folder has since been deleted fails loudly instead of opening the
+// server's default directory.
+func TestNativeOpenFolderRefusesWhatItCannotResolve(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	gone := filepath.Join(tmp, "deleted-project")
+	if err := os.MkdirAll(gone, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/session-groups", strings.NewReader(`{"name":"proj","working_dir":"`+jsonPath(gone)+`"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create group: %d (%s)", w.Code, w.Body.String())
+	}
+	var created map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	goneID, _ := created["group"].(map[string]any)["id"].(string)
+	// The directory a project opens is its generated workspace; deleting THAT
+	// is what must fail loudly.
+	goneWS, _ := created["group"].(map[string]any)["working_dir"].(string)
+	if goneWS == "" {
+		t.Fatal("create group: no workspace in response")
+	}
+	if err := os.RemoveAll(goneWS); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name, body string
+		want       int
+	}{
+		{"a path is not an id", `{"path":"` + jsonPath(tmp) + `"}`, http.StatusBadRequest},
+		{"neither id given", `{}`, http.StatusBadRequest},
+		{"unknown session", `{"session_id":"20260101-000000-deadbeef"}`, http.StatusNotFound},
+		{"session id escaping its dir", `{"session_id":"../../etc"}`, http.StatusNotFound},
+		{"unknown group", `{"group_id":"g-nope"}`, http.StatusNotFound},
+		{"project folder deleted", `{"group_id":"` + goneID + `"}`, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/native/open-folder", strings.NewReader(tc.body))
+			w := httptest.NewRecorder()
+			serveLoopback(srv.mux, w, req)
+			if w.Code != tc.want {
+				t.Errorf("got %d, want %d (%s)", w.Code, tc.want, w.Body.String())
+			}
+		})
+	}
+	if fake.openDirCalls != 0 {
+		t.Errorf("bridge.OpenFolder called %d times, want 0", fake.openDirCalls)
+	}
+}
+
+// source_dir picks one of the project's mounted folders instead of its
+// workspace. It is a selector over the project's own records, not a path: a
+// directory that exists but is not mounted is a 404, so the endpoint stays
+// unable to open an arbitrary folder on the host.
+func TestNativeOpenFolderSourceDir(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	repoA := filepath.Join(tmp, "repo-a")
+	repoB := filepath.Join(tmp, "repo-b")
+	unmounted := filepath.Join(tmp, "somewhere-else")
+	for _, d := range []string{repoA, repoB, unmounted} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/session-groups",
+		strings.NewReader(`{"name":"multi","source_dirs":["`+jsonPath(repoA)+`","`+jsonPath(repoB)+`"]}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create group: %d (%s)", w.Code, w.Body.String())
+	}
+	var created map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	g, _ := created["group"].(map[string]any)
+	groupID, _ := g["id"].(string)
+	workspace, _ := g["working_dir"].(string)
+	if groupID == "" || workspace == "" {
+		t.Fatalf("fixture: id=%q workspace=%q", groupID, workspace)
+	}
+
+	for _, tc := range []struct {
+		name, body string
+		want       int
+		wantDir    string // "" when nothing must be opened
+	}{
+		// No source_dir still means the workspace: the existing entry keeps
+		// working, the mounted folders are additions to it.
+		{"no source_dir opens the workspace", `{"group_id":"` + groupID + `"}`, http.StatusOK, workspace},
+		{"second mount", `{"group_id":"` + groupID + `","source_dir":"` + jsonPath(repoB) + `"}`, http.StatusOK, repoB},
+		// Matching normalises, and what opens is the registry's spelling — not
+		// the caller's, which is what keeps the caller's string out of the
+		// opener.
+		{"trailing separator still matches", `{"group_id":"` + groupID + `","source_dir":"` + jsonPath(repoA) + `/"}`, http.StatusOK, repoA},
+		{"an existing but unmounted dir", `{"group_id":"` + groupID + `","source_dir":"` + jsonPath(unmounted) + `"}`, http.StatusNotFound, ""},
+		{"the workspace is not a source dir", `{"group_id":"` + groupID + `","source_dir":"` + jsonPath(workspace) + `"}`, http.StatusNotFound, ""},
+		{"source_dir without a group", `{"source_dir":"` + jsonPath(repoA) + `"}`, http.StatusBadRequest, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := fake.openDirCalls
+			req := httptest.NewRequest(http.MethodPost, "/api/native/open-folder", strings.NewReader(tc.body))
+			w := httptest.NewRecorder()
+			serveLoopback(srv.mux, w, req)
+			if w.Code != tc.want {
+				t.Fatalf("got %d, want %d (%s)", w.Code, tc.want, w.Body.String())
+			}
+			if tc.wantDir == "" {
+				if fake.openDirCalls != before {
+					t.Errorf("bridge.OpenFolder called for a target it must not resolve: %q", fake.gotOpenDir)
+				}
+				return
+			}
+			if fake.openDirCalls != before+1 || fake.gotOpenDir != tc.wantDir {
+				t.Errorf("bridge.OpenFolder calls=%d dir=%q, want %d/%s", fake.openDirCalls, fake.gotOpenDir, before+1, tc.wantDir)
+			}
+		})
+	}
+}
+
+// jsonPath escapes a filesystem path for embedding in a JSON string literal —
+// Windows separators would otherwise read as escape sequences.
+func jsonPath(p string) string {
+	return strings.ReplaceAll(p, `\`, `\\`)
+}

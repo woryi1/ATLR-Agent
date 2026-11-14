@@ -1,0 +1,344 @@
+<script lang="ts">
+  import { onMount } from 'svelte'
+  import { showToast } from '../lib/stores'
+  import StatusTag from '../components/ui/StatusTag.svelte'
+  import * as api from '../lib/api'
+  import { t, tr } from '../lib/i18n'
+  import { confirmDialog } from '../lib/confirm'
+
+  interface TrashEntry {
+    id: string
+    original: string
+    trash_path: string
+    deleted_at: string
+    project: string
+    size: number
+    label?: string
+    deleted_by?: string
+    kind?: string
+    orphan: boolean
+  }
+
+  // embedded=true when mounted inside Settings' 数据管理 pane rather than as a
+  // full page: the sub-view header there already carries the "文件回收站"
+  // title, so this component's own big header would just repeat it, and its
+  // own flex/scroll wrapper would fight the pane's (which already scrolls
+  // internally — the modal's fixed height and comment on .pane say so).
+  let { embedded = false }: { embedded?: boolean } = $props()
+
+  let items       = $state<TrashEntry[]>([])
+  let loading     = $state(true)
+  let busyId      = $state<string | null>(null)
+  let totalSize   = $state(0)
+  let totalCount  = $state(0)
+  let orphanCount = $state(0)
+
+  onMount(async () => {
+    await reload()
+  })
+
+  async function reload() {
+    loading = true
+    try {
+      const data = await api.listTrash() as any
+      // server returns { files: [...], total_count, total_size }
+      items = data.files ?? data ?? []
+      totalCount = data.total_count ?? items.length
+      totalSize  = data.total_size  ?? items.reduce((s: number, e: TrashEntry) => s + (e.size ?? 0), 0)
+      orphanCount = data.orphan_count ?? items.filter((e: TrashEntry) => e.orphan).length
+    } catch (e: any) {
+      showToast(`Failed to load trash: ${e.message}`, 'error')
+    } finally {
+      loading = false
+    }
+  }
+
+  async function handleRestore(id: string) {
+    busyId = id
+    try {
+      let res = await api.restoreTrash(id)
+      if (!res.ok && res.conflict) {
+        // Something already sits at the original path. Offer the lossless
+        // resolution: move the current file into the trash, then restore.
+        const entry = items.find(i => i.id === id)
+        const name = entry ? entry.original : ''
+        if (!(await confirmDialog(tr('files.confirm_restore_conflict').replace('{name}', name)))) return
+        res = await api.restoreTrash(id, 'backup')
+      }
+      if (res.ok) {
+        items = items.filter(i => i.id !== id)
+        totalCount = Math.max(0, totalCount - 1)
+        showToast(tr('files.toast_restored'), 'success')
+        // The backed-up current file is now itself a new entry — refresh.
+        if (res.backedUpExisting) await reload()
+      }
+    } catch (e: any) {
+      showToast(`Restore failed: ${e.message}`, 'error')
+    } finally {
+      busyId = null
+    }
+  }
+
+  function provenance(f: TrashEntry): string {
+    if (!f.deleted_by) return ''
+    const kind = f.kind === 'overwrite' ? tr('files.kind_overwrite')
+      : f.kind === 'delete' ? tr('files.kind_delete') : ''
+    return kind ? `${kind} · ${f.deleted_by}` : f.deleted_by
+  }
+
+  async function handleDelete(id: string) {
+    const entry = items.find(i => i.id === id)
+    // Permanent delete — confirm first (the bulk actions already do), and name
+    // the file so the user knows exactly what they're discarding.
+    if (!(await confirmDialog(`${tr('files.confirm_delete_one')}${entry ? `\n\n${basename(entry.original)}` : ''}`))) return
+    busyId = id
+    try {
+      await api.deleteTrashItem(id)
+      if (entry) totalSize = Math.max(0, totalSize - (entry.size ?? 0))
+      items = items.filter(i => i.id !== id)
+      totalCount = Math.max(0, totalCount - 1)
+      showToast(tr('files.toast_deleted'), 'success')
+    } catch (e: any) {
+      showToast(`Delete failed: ${e.message}`, 'error')
+    } finally {
+      busyId = null
+    }
+  }
+
+  async function handleEmptyAll() {
+    if (!(await confirmDialog(tr('files.confirm_empty_all').replace('{n}', String(totalCount))))) return
+    try {
+      await api.emptyTrash({ mode: 'all' })
+      items = []
+      totalCount = 0
+      totalSize  = 0
+      orphanCount = 0
+      showToast(tr('files.toast_emptied'), 'success')
+    } catch (e: any) {
+      showToast(`Empty failed: ${e.message}`, 'error')
+    }
+  }
+
+  async function handleEmptyOld() {
+    try {
+      await api.emptyTrash({ mode: 'old' })
+      showToast(tr('files.toast_old_cleared'), 'success')
+      await reload()
+    } catch (e: any) {
+      showToast(`Failed: ${e.message}`, 'error')
+    }
+  }
+
+  async function handleCleanOrphans() {
+    try {
+      await api.emptyTrash({ mode: 'orphans' })
+      showToast(tr('files.toast_orphans_cleared'), 'success')
+      await reload()
+    } catch (e: any) {
+      showToast(`Failed: ${e.message}`, 'error')
+    }
+  }
+
+  function fmtSize(bytes: number): string {
+    if (bytes < 1024)        return `${bytes} B`
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
+  }
+
+  function fmtAge(iso: string): string {
+    try {
+      const ms = Date.now() - new Date(iso).getTime()
+      const days = Math.floor(ms / 86400000)
+      if (days === 0) return tr('files.age_today')
+      if (days === 1) return tr('files.age_yesterday')
+      return tr('files.age_days_ago').replace('{n}', String(days))
+    } catch { return iso }
+  }
+
+  function basename(path: string): string {
+    return path.split('/').pop() ?? path
+  }
+
+  function iconFor(name: string): string {
+    const ext = name.split('.').pop()?.toLowerCase() ?? ''
+    if (['ts', 'tsx', 'js', 'jsx', 'go', 'py', 'rb', 'rs'].includes(ext)) return 'ant-design:code-outlined'
+    if (['md', 'txt', 'log'].includes(ext))  return 'ant-design:file-text-outlined'
+    if (['png', 'jpg', 'gif', 'svg'].includes(ext)) return 'ant-design:file-image-outlined'
+    if (['zip', 'tar', 'gz'].includes(ext))  return 'ant-design:file-zip-outlined'
+    return 'ant-design:file-outlined'
+  }
+
+  function isOld(iso: string): boolean {
+    try {
+      const ms = Date.now() - new Date(iso).getTime()
+      return ms > 7 * 86400000
+    } catch { return false }
+  }
+</script>
+
+<div class="page" class:embedded>
+  <div class="inner" class:embedded>
+    {#if !embedded}
+    <div class="page-header">
+      <h2>{$t('files.title')}</h2>
+      <p>{$t('files.subtitle')}</p>
+    </div>
+    {/if}
+
+    <!-- Stats + actions -->
+    <div class="stats-bar">
+      <span class="stats-text">
+        {$t(totalCount === 1 ? 'files.count_file' : 'files.count_files').replace('{n}', String(totalCount))}, {fmtSize(totalSize)}{#if orphanCount > 0} · {$t(orphanCount === 1 ? 'files.count_orphan' : 'files.count_orphans').replace('{n}', String(orphanCount))}{/if}
+      </span>
+      <div class="bar-actions">
+        <button class="btn-outline" onclick={reload} disabled={loading}>
+          <iconify-icon icon="ant-design:reload-outlined" width="13"></iconify-icon>
+          {loading ? $t('common.loading') : $t('files.refresh')}
+        </button>
+        <button class="btn-outline" onclick={handleEmptyOld}>
+          <iconify-icon icon="ant-design:clock-circle-outlined" width="13"></iconify-icon>
+          {$t('files.empty_7d')}
+        </button>
+        <button class="btn-outline" onclick={handleCleanOrphans} disabled={orphanCount === 0} title={$t('files.clean_orphans_tip')}>
+          <iconify-icon icon="ant-design:disconnect-outlined" width="13"></iconify-icon>
+          {$t('files.clean_orphans')}
+        </button>
+        <button class="btn-danger-ghost" onclick={handleEmptyAll} disabled={items.length === 0}>
+          <iconify-icon icon="ant-design:delete-outlined" width="13"></iconify-icon>
+          {$t('files.empty_all')}
+        </button>
+      </div>
+    </div>
+
+    {#if loading}
+      <div class="empty-state">{$t('common.loading')}</div>
+    {:else if items.length === 0}
+      <div class="empty-state">
+        <iconify-icon icon="ant-design:delete-outlined" width="32" style="color:var(--text-quaternary)"></iconify-icon>
+        <span>{$t('files.empty')}</span>
+      </div>
+    {:else}
+      <div class="file-list">
+        {#each items as f (f.id)}
+          <div class="file-card">
+            <span class="file-icon">
+              <iconify-icon icon={iconFor(basename(f.original))} width="17"></iconify-icon>
+            </span>
+            <div class="file-info">
+              <div class="file-name-row">
+                <span class="file-name" class:mono={!f.label}>{f.label || basename(f.original)}</span>
+                {#if f.orphan}
+                  <StatusTag status="error">{$t('files.orphan')}</StatusTag>
+                {:else if isOld(f.deleted_at)}
+                  <StatusTag status="warning">{$t('files.old')}</StatusTag>
+                {/if}
+              </div>
+              <span class="file-path mono">{f.original}</span>
+              <div class="file-meta">
+                <iconify-icon icon="ant-design:folder-outlined" width="12"></iconify-icon>
+                <span>{fmtSize(f.size)}</span>
+                <span class="sep"></span>
+                <span>{fmtAge(f.deleted_at)}</span>
+                {#if provenance(f)}
+                  <span class="sep"></span>
+                  <span class="mono">{provenance(f)}</span>
+                {/if}
+              </div>
+            </div>
+            <div class="file-actions">
+              <button
+                class="btn-outline"
+                disabled={busyId === f.id}
+                onclick={() => handleRestore(f.id)}
+              >
+                <iconify-icon icon="ant-design:undo-outlined" width="14"></iconify-icon>
+                {busyId === f.id ? '…' : $t('files.restore')}
+              </button>
+              <button
+                class="icon-btn del"
+                title={$t('files.delete_perm')}
+                disabled={busyId === f.id}
+                onclick={() => handleDelete(f.id)}
+              >
+                <iconify-icon icon="ant-design:delete-outlined" width="14"></iconify-icon>
+              </button>
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </div>
+</div>
+
+<style>
+.page { flex: 1; overflow-y: auto; min-height: 0; background: var(--bg-layout); }
+/* Embedded in Settings: let the modal's own pane do the scrolling (it already
+   does, for every other category) instead of nesting a second scroll context,
+   and drop the background/margins that made sense as a full page but not as
+   one section of a settings pane. */
+.page.embedded { flex: none; overflow: visible; background: none; }
+.inner { max-width: 1000px; margin: 0 auto; padding: 26px 28px 40px; display: flex; flex-direction: column; gap: 20px; }
+.inner.embedded { max-width: none; margin: 0; padding: 0; }
+.page-header { display: flex; flex-direction: column; }
+h2 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -0.01em; color: var(--text-heading); }
+p { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); max-width: 60ch; }
+.stats-bar {
+  background: var(--bg-container); border: 1px solid var(--border); border-radius: var(--radius-card); box-shadow: var(--card-shadow);
+  padding: 14px 20px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+}
+/* Embedded in Settings' narrower pane, the count/size line and four action
+   buttons no longer fit one row — rather than squeezing the text into a sliver
+   that wraps word-by-word, stack them. */
+.page.embedded .stats-bar { flex-direction: column; align-items: stretch; }
+.stats-text { font-size: 13px; color: var(--text-tertiary); flex: 1; min-width: 0; }
+.page.embedded .stats-text { flex: none; width: 100%; }
+.bar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.btn-outline {
+  height: 30px; padding: 0 12px; border: 1px solid var(--border); background: var(--bg-container); border-radius: 8px;
+  display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 500; color: var(--text);
+  cursor: pointer; font-family: inherit;
+}
+.btn-outline:hover:not(:disabled) { background: var(--hover-neutral); border-color: var(--text-quaternary); }
+.btn-outline:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-danger-ghost {
+  height: 30px; padding: 0 12px; border: 1px solid var(--border-secondary); background: var(--bg-container); border-radius: 8px;
+  display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 500; color: var(--text-secondary);
+  cursor: pointer; font-family: inherit;
+}
+.btn-danger-ghost:hover:not(:disabled) { background: var(--error-bg); border-color: var(--error-border); color: var(--error); }
+.btn-danger-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
+.empty-state {
+  padding: 60px; display: flex; flex-direction: column; align-items: center; gap: 12px;
+  color: var(--text-tertiary); font-size: 14px;
+}
+.file-list { display: flex; flex-direction: column; gap: 12px; }
+.file-card {
+  background: var(--bg-container); border: 1px solid var(--border); border-radius: var(--radius-card); box-shadow: var(--card-shadow);
+  padding: 16px 24px; display: flex; align-items: center; gap: 16px;
+}
+.file-icon {
+  width: 36px; height: 36px; flex: 0 0 36px; border-radius: 10px;
+  background: var(--bg-layout); color: var(--text-tertiary);
+  display: flex; align-items: center; justify-content: center;
+}
+.file-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.file-name-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.file-name { font-size: 15px; font-weight: 600; color: var(--text-heading); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-path { font-size: 12px; color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-tertiary); padding-top: 1px; min-width: 0; }
+/* The provenance path (session id / cwd) is the one open-ended-length piece in
+   this row — without its own shrink+ellipsis it forces the row to overflow
+   rather than wrap, especially once this view sits inside Settings' narrower
+   pane rather than a full page. */
+.file-meta .mono { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sep { width: 3px; height: 3px; border-radius: 9999px; background: var(--text-quaternary); }
+.file-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.icon-btn {
+  width: 28px; height: 28px; border: none; background: transparent; border-radius: 7px;
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+  color: var(--text-secondary);
+}
+.icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.icon-btn.del:hover:not(:disabled) { background: var(--error-bg); color: var(--error); }
+.mono { font-family: var(--font-mono); }
+</style>

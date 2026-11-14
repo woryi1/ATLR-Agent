@@ -1,0 +1,1980 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/agentprofile"
+	"github.com/open-octo/octo-agent/internal/config"
+	"github.com/open-octo/octo-agent/internal/datahome"
+	"github.com/open-octo/octo-agent/internal/executil"
+	"github.com/open-octo/octo-agent/internal/permission"
+	"github.com/open-octo/octo-agent/internal/tools"
+)
+
+// ─── Request/Response types ─────────────────────────────────────────────────
+
+type createChatRequest struct {
+	Message string `json:"message"`
+	Model   string `json:"model,omitempty"`
+	Name    string `json:"name,omitempty"`
+}
+
+type createChatResponse struct {
+	SessionID string `json:"session_id"`
+	Reply     string `json:"reply"`
+}
+
+type turnRequest struct {
+	Message string `json:"message"`
+}
+
+// sessionItem is the shape the Web UI expects for each session in listings
+// and after creation. It is a superset of the raw agent.Session fields.
+type sessionItem struct {
+	ID                  string    `json:"id"`
+	Name                string    `json:"name"`
+	Title               string    `json:"title"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
+	Model               string    `json:"model"`
+	ModelID             string    `json:"model_id,omitempty"`
+	Status              string    `json:"status"`
+	Source              string    `json:"source"`
+	AgentProfile        string    `json:"agent_profile"`
+	Pinned              bool      `json:"pinned"`
+	TotalTasks          int       `json:"total_tasks"`
+	TurnCount           int       `json:"turn_count"`
+	WorkingDir          string    `json:"working_dir,omitempty"`
+	PermissionMode      string    `json:"permission_mode,omitempty"`
+	ReasoningEffort     string    `json:"reasoning_effort,omitempty"`
+	ShowReasoning       *bool     `json:"show_reasoning,omitempty"`
+	ContextUsage        int       `json:"context_usage,omitempty"`
+	PendingQuestion     bool      `json:"pending_question,omitempty"`
+	PendingConfirmation bool      `json:"pending_confirmation,omitempty"`
+	BranchedFrom        string    `json:"branched_from,omitempty"`
+}
+
+type sessionDetail struct {
+	ID        string          `json:"id"`
+	CreatedAt time.Time       `json:"created_at"`
+	Model     string          `json:"model"`
+	Messages  []agent.Message `json:"messages"`
+}
+
+// sessionListResponse matches the Ruby frontend's expected list envelope.
+type sessionListResponse struct {
+	Sessions  []sessionItem `json:"sessions"`
+	HasMore   bool          `json:"has_more"`
+	CronCount int           `json:"cron_count"`
+}
+
+// sessionCreateRequest matches POST /api/sessions bodies from the Web UI.
+type sessionCreateRequest struct {
+	Name         string `json:"name"`
+	AgentProfile string `json:"agent_profile"`
+	Source       string `json:"source"`
+	Model        string `json:"model,omitempty"`
+	// GroupID files the session under an existing group at creation time —
+	// the sidebar's per-group "+" button. For a project this is the ordered
+	// path that lets applyDefaultWorkspaceDir see the membership and skip
+	// seeding, so the session runs in the project directory with no leftover
+	// own dir to strand later.
+	GroupID string `json:"group_id,omitempty"`
+}
+
+// globalReasoningEffort returns the configured default level with "off"
+// normalised to "" (the stored form). A config read error is "unset" — the
+// session then starts off, which is what an unreadable config would resolve to
+// on its next turn anyway.
+func globalReasoningEffort() string {
+	cfg, err := config.Load()
+	if err != nil {
+		return ""
+	}
+	return normalizeReasoningEffort(cfg.ReasoningEffort)
+}
+
+// toSessionItem builds a frontend-friendly session descriptor.
+func (srv *Server) toSessionItem(s *agent.Session, source, agentProfile string) sessionItem {
+	// ContentUpdatedAt (set by Save only when the message count actually
+	// changes — see its doc comment) is preferred over the file's raw mtime:
+	// the same file also absorbs binding/lease bookkeeping writes (a turn's
+	// post-completion release, the idle-steer check that runs even with
+	// nothing queued) that land moments after the reply the sidebar's unread
+	// dot is comparing against, which used to make that comparison chase a
+	// timestamp that had nothing to do with new content. Sessions predating
+	// this field fall back to the file mtime until their next real save.
+	updated := s.CreatedAt
+	if !s.ContentUpdatedAt.IsZero() {
+		updated = s.ContentUpdatedAt
+	} else if p, err := s.SavePath(); err == nil {
+		if st, err := os.Stat(p); err == nil {
+			updated = st.ModTime()
+		}
+	}
+	// DisplayTitle collapses the "*Octo Agent" placeholder onto the first
+	// message snippet; Title alone would surface the raw placeholder for an
+	// IM session whose async title generation hasn't landed yet (the WS brief
+	// list already uses DisplayTitle — ws_handlers.go).
+	name := s.DisplayTitle()
+	title := s.Title
+	// A title generated mid-turn is broadcast immediately but adopted (and
+	// persisted) only at turn end; surface it in list responses meanwhile so
+	// a client refetch in between doesn't regress the sidebar to the
+	// placeholder. One storage: this overlays the same pendingTitles record
+	// the turn adopts from — it never writes anything itself.
+	if pt := srv.peekPendingTitle(s.ID); pt != "" && agent.IsAutoNamePlaceholder(s.Title) {
+		name, title = pt, pt
+	}
+	_, pm, re, sr, ctxUsage := srv.sessionStatusFields(s)
+	return sessionItem{
+		ID:                  s.ID,
+		Name:                name,
+		Title:               title,
+		CreatedAt:           s.CreatedAt,
+		UpdatedAt:           updated,
+		Model:               s.Model,
+		ModelID:             s.ModelConfig,
+		Status:              srv.sessionStatus(s.ID),
+		Source:              source,
+		AgentProfile:        agentProfile,
+		Pinned:              false,
+		TotalTasks:          0,
+		TurnCount:           s.TurnCount(),
+		WorkingDir:          srv.sessionCwd(s),
+		PermissionMode:      pm,
+		ReasoningEffort:     re,
+		ShowReasoning:       sr,
+		ContextUsage:        ctxUsage,
+		PendingQuestion:     srv.hasPendingQuestion(s.ID),
+		PendingConfirmation: srv.hasPendingConfirmation(s.ID),
+		BranchedFrom:        s.BranchedFrom,
+	}
+}
+
+// handleGetSessionConfirmation serves GET /api/sessions/{id}/confirmation: the
+// outstanding permission confirmation for a session, if any. request_confirmation
+// is only broadcast to a session's subscribers, but the mobile feed subscribes to
+// no session, so it reads the pending ask over REST to render ApprovalDetail.
+// Answering still goes over ws.answerConfirmation with the returned id. Returns
+// {pending:false} when there is none.
+func (srv *Server) handleGetSessionConfirmation(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	srv.pendingPromptMu.Lock()
+	ev, ok := srv.pendingConfirms[id]
+	srv.pendingPromptMu.Unlock()
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{"pending": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pending":   true,
+		"id":        ev.ConfID,
+		"message":   ev.Message,
+		"kind":      ev.Kind,
+		"tool_name": ev.ToolName,
+		"command":   ev.Command,
+		"diff":      ev.Diff,
+		"input":     ev.Input,
+	})
+}
+
+// entryForSession returns the model-config entry that actually backs sess's
+// turns — the same resolution senderForSession uses (sess.ModelConfig when
+// set and still configured, else the default entry) — or the default entry
+// when sess is nil (no specific session in scope, e.g. the onboarding
+// response). Before this existed, every reasoning_effort/show_reasoning
+// status read and every "toggle it for this session" write resolved from
+// cfg.DefaultEntry() unconditionally: a session actually running a
+// non-default model (turns themselves were never affected — senderForSession
+// already resolved the right entry for those) still saw the WRONG value in
+// its own status bar, and toggling it via that session's Composer visibly
+// flipped the icon — since the read and the write both used the same wrong
+// entry — while never touching the entry that session's real turns read.
+func entryForSession(cfg config.Config, sess *agent.Session) config.ModelEntry {
+	if sess != nil && sess.ModelConfig != "" {
+		if e, ok := cfg.EntryByModel(sess.ModelConfig); ok {
+			return e
+		}
+	}
+	return cfg.DefaultEntry()
+}
+
+// contextWindowForSession keeps cold-session UI reads bound to the same
+// endpoint/model pair as live turns. A bare model name is insufficient when
+// multiple endpoints expose it with different deployed limits.
+func contextWindowForSession(cfg config.Config, sess *agent.Session) int {
+	entry := entryForSession(cfg, sess)
+	model := entry.Model
+	if sess != nil && sess.Model != "" {
+		model = sess.Model
+	}
+	if entry.Model == model {
+		if window := entry.EffectiveContextWindow(); window > 0 {
+			return window
+		}
+	}
+	return agent.ContextWindow(model)
+}
+
+// sessionStatusFields returns the server-level session metadata (permission
+// mode, reasoning effort, show reasoning, current context usage) plus the
+// DEFAULT working dir. PR5: reasoning effort and show_reasoning are global
+// (Config.ReasoningEffort / Config.ShowReasoning) — per-entry overrides are
+// deleted. Working dir is per-session regardless: callers with a session in
+// hand override the returned value via sessionCwd / sessionCwdByID; the
+// default here is the fallback for sessions with none.
+func (srv *Server) sessionStatusFields(sess *agent.Session) (workingDir, permissionMode, reasoningEffort string, showReasoning *bool, contextUsage int) {
+	workingDir = srv.cwd
+	if sess != nil && sess.PermissionMode != "" {
+		permissionMode = sess.PermissionMode
+	} else {
+		permissionMode = string(resolvePermissionMode())
+	}
+	cfg, cfgErr := config.Load()
+	if cfgErr == nil {
+		reasoningEffort = cfg.ReasoningEffort
+		// The session's own level wins — it is what the user last set on THIS
+		// conversation, and reopening it must not silently adopt the project's
+		// newer value. A session predating the field has none, so it resolves
+		// against its project's saved level, then the global default: that keeps
+		// a project-wide setting visible on sessions created before it existed.
+		if sess != nil {
+			if own := normalizeReasoningEffort(sess.ReasoningEffort); own != "" {
+				reasoningEffort = own
+			} else if p := projectForSession(sess.ID); p != nil && p.ReasoningEffort != "" {
+				reasoningEffort = p.ReasoningEffort
+			}
+		}
+		if reasoningEffort == "" {
+			// Wire sentinel: "" is the stored form of off, but session_update
+			// consumers guard on non-empty strings (ChatView) — send "off".
+			reasoningEffort = "off"
+		}
+		eff := cfg.EffectiveShowReasoning(nil)
+		showReasoning = &eff
+	}
+	// Report the session's persisted context usage (its real last-turn token
+	// count) so the list — and thus a page refresh — carries a correct value
+	// instead of 0. The live WS path still refines the active session per turn.
+	if sess != nil && sess.LastContextTokens > 0 {
+		window := agent.ContextWindow(sess.Model)
+		if cfgErr == nil {
+			window = contextWindowForSession(cfg, sess)
+		}
+		if window > 0 {
+			contextUsage = sess.LastContextTokens * 100 / window
+			if contextUsage > 100 {
+				contextUsage = 100
+			}
+		}
+	}
+	return workingDir, permissionMode, reasoningEffort, showReasoning, contextUsage
+}
+
+type toolInfo struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+type skillInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Source      string `json:"source"`
+	Enabled     bool   `json:"enabled"`
+}
+
+// validateWorkingDir expands and checks a user-supplied working directory,
+// returning the canonical absolute path. Shared by the per-session override
+// (PATCH …/working_dir) and the project directory (POST/PATCH
+// …/session-groups) so both reject the same paths with the same wording. The
+// returned error is already user-facing — hand it straight to writeError.
+func validateWorkingDir(raw string) (string, error) {
+	dir := expandDir(raw)
+	info, err := os.Stat(dir)
+	switch {
+	case os.IsNotExist(err):
+		return "", fmt.Errorf("working_dir does not exist: %s (create it first)", dir)
+	case os.IsPermission(err):
+		return "", fmt.Errorf("working_dir is not accessible: %s (permission denied)", dir)
+	case err != nil:
+		// Neither IsNotExist nor IsPermission — e.g. a path component that
+		// exists but isn't a directory (ENOTDIR). Report the reason without
+		// the raw "stat <path>:" prefix, which just repeats dir.
+		return "", fmt.Errorf("invalid working_dir: %s (%v)", dir, unwrapPathError(err))
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("working_dir is not a directory")
+	}
+	return dir, nil
+}
+
+// applyDefaultWorkspaceDir gives a dirless non-project session a throwaway
+// workspace of its own — <workspace>/tasks/<sessionID> — created here, the
+// first time the session needs one. It used to seed the shared workspace ROOT
+// onto every such session, which meant every task on the machine ran in one
+// directory and two tasks writing the same filename overwrote each other. A
+// failure is logged and otherwise a no-op: the session keeps no directory of
+// its own and resolveSessionDir falls back to the workspace root as before.
+//
+// A session created inside a project gets NO seeded dir: the project's
+// workspace already governs where its tools run, and a seeded value would only
+// surface later as a stale leftover.
+func (s *Server) applyDefaultWorkspaceDir(sess *agent.Session) {
+	if sess.WorkingDir != "" {
+		return
+	}
+	if p := projectForSession(sess.ID); p != nil {
+		return
+	}
+	dir, err := s.taskWorkspaceFor(sess.ID)
+	if err != nil {
+		slog.Warn("task workspace: mkdir failed, session falls back to the workspace root", "err", err)
+		return
+	}
+	if dir == "" {
+		return // no workspace resolves at all
+	}
+	if err := sess.SetWorkingDir(dir); err != nil {
+		slog.Warn("task workspace: could not set session working dir", "err", err)
+	}
+}
+
+// ─── POST /api/chat ─────────────────────────────────────────────────────────
+
+func (s *Server) handleCreateChat(w http.ResponseWriter, r *http.Request) {
+	if err := s.ensureSender(); err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+
+	var req createChatRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if strings.TrimSpace(req.Message) == "" {
+		writeError(w, http.StatusBadRequest, "message is required")
+		return
+	}
+
+	model := s.model
+	if req.Model != "" {
+		model = req.Model
+	}
+	sess := agent.NewSession(model, s.system)
+	s.applyDefaultWorkspaceDir(sess)
+	_ = sess.SetPermissionMode(string(resolvePermissionMode()))
+	sess.Bind(agent.EntryWeb, false)
+	if req.Name != "" {
+		_ = sess.SetTitle(req.Name)
+	}
+
+	mu := s.sessionTurnLock(sess.ID)
+	mu.Lock()
+	defer func() {
+		mu.Unlock()
+		s.releaseSessionBinding(sess.ID, agent.EntryWeb)
+	}()
+
+	reply, err := s.runTurn(r.Context(), sess, req.Message)
+	if errors.Is(err, errDraining) {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if err := sess.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save session: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, createChatResponse{
+		SessionID: sess.ID,
+		Reply:     reply,
+	})
+}
+
+// ─── POST /api/chat/:id/turn ────────────────────────────────────────────────
+
+func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
+	if err := s.ensureSender(); err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+
+	var req turnRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if strings.TrimSpace(req.Message) == "" {
+		writeError(w, http.StatusBadRequest, "message is required")
+		return
+	}
+
+	sess, err := agent.LoadSession(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	if ok, prevEntry, berr := s.acquireSessionBinding(id, agent.EntryWeb, false); !ok {
+		writeError(w, http.StatusConflict, berr.Error())
+		return
+	} else if prevEntry != "" {
+		s.wsSessionTakenOver(id, prevEntry, agent.EntryWeb)
+	}
+
+	mu := s.sessionTurnLock(id)
+	mu.Lock()
+	defer func() {
+		mu.Unlock()
+		s.releaseSessionBinding(id, agent.EntryWeb)
+	}()
+
+	// A WS turn runs in a goroutine after releasing this mutex, guarded only by
+	// turnRunning. Without this check a REST turn would acquire the (free) mutex
+	// and run concurrently with that WS turn — both Save() the same session file,
+	// clobbering history. Honour turnRunning like the WS path does. (deferred
+	// unlock + binding release handle cleanup on this early return.)
+	if s.turnRunning[id] {
+		writeError(w, http.StatusConflict, "a turn is already running for this session")
+		return
+	}
+
+	sess, err = agent.LoadSession(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	reply, err := s.runTurn(r.Context(), sess, req.Message)
+	if errors.Is(err, errDraining) {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if err := sess.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save session: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"reply": reply})
+}
+
+// ─── GET /api/sessions ──────────────────────────────────────────────────────
+
+func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	sessions, err := agent.ListSessions(50)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	out := make([]sessionItem, 0, len(sessions))
+	cronCount := 0
+	for _, sess := range sessions {
+		source := sess.Source
+		if source == "" {
+			source = "manual"
+		}
+		item := s.toSessionItem(sess, source, sess.EffectiveAgentID())
+		out = append(out, item)
+		if item.Source == "cron" {
+			cronCount++
+		}
+	}
+	writeJSON(w, http.StatusOK, sessionListResponse{
+		Sessions:  out,
+		HasMore:   false,
+		CronCount: cronCount,
+	})
+}
+
+// ─── POST /api/sessions ─────────────────────────────────────────────────────
+
+func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
+	var req sessionCreateRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+
+	model := s.model
+	modelConfig := ""
+	if req.Model != "" {
+		model = req.Model
+		// The web modal sends a config entry id; the session binds to that
+		// entry so its turns run on the entry's sender. A non-matching value
+		// stays a raw model string on the default sender. The binding stores
+		// the id AS RECEIVED: collapsing a composite "<endpoint>::<model>" id
+		// to the bare model name (as this once did) loses the endpoint half,
+		// so a later EntryByModel re-resolution could land on a DIFFERENT
+		// endpoint exposing the same model name.
+		if cfg, err := config.Load(); err == nil {
+			if e, ok := cfg.EntryByModel(req.Model); ok {
+				modelConfig = req.Model
+				if e.Model != "" {
+					model = e.Model
+				}
+			}
+		}
+	}
+	if model == "" {
+		// Fall back to the user's configured default model.
+		if cfg, err := config.Load(); err == nil && cfg.DefaultEntry().Model != "" {
+			model = cfg.DefaultEntry().Model
+		}
+	}
+	if model == "" {
+		writeError(w, http.StatusBadRequest, "no default model configured")
+		return
+	}
+
+	agentProfile := req.AgentProfile
+	if agentProfile == "" {
+		agentProfile = agentprofile.DefaultID
+	}
+	if err := s.validateSessionAgentID(agentProfile); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	source := req.Source
+	if source == "" {
+		source = "manual"
+	}
+
+	sess := agent.NewSession(model, "")
+	// Group membership must land BEFORE applyDefaultWorkspaceDir: its guard
+	// asks "is this session in a project?", and a session created via the
+	// sidebar's per-group button is in one from the start. Registering the
+	// yet-unsaved ID is safe — the registry stores bare IDs, and if the Save
+	// below fails the stale entry is harmless by design (the frontend
+	// cross-references the live session list).
+	if req.GroupID != "" {
+		if err := addSessionToGroup(req.GroupID, sess.ID); err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+	}
+	s.applyDefaultWorkspaceDir(sess)
+	sess.Source = source
+	sess.ModelConfig = modelConfig
+	sess.AgentID = agentProfile
+	_ = sess.SetPermissionMode(string(resolvePermissionMode()))
+	// A new session starts on its project's saved level, falling back to the
+	// global default and then off. Group membership already landed above, so
+	// the project is known here; a session that belongs to no project uses the
+	// global value exactly as before.
+	sess.ReasoningEffort = normalizeReasoningEffort(initialReasoningEffort(projectReasoningEffort(req.GroupID), globalReasoningEffort()))
+	sess.Bind(agent.EntryWeb, false)
+	if req.Name != "" {
+		sess.Title = req.Name
+	}
+	if err := sess.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save session: %v", err))
+		return
+	}
+
+	// Broadcast globally so other clients (desktop, other tabs) see the new
+	// session in their sidebar immediately — mirrors branch/cron, which also
+	// emit session_created.
+	s.wsHub.broadcast("", wsEventSessionCreated{Type: "session_created", SessionID: sess.ID})
+
+	writeJSON(w, http.StatusOK, map[string]any{"session": s.toSessionItem(sess, source, agentProfile)})
+}
+
+// ─── GET /api/sessions/:id/messages ─────────────────────────────────────────
+
+func (s *Server) handleGetSessionMessages(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+
+	sess, err := agent.LoadSession(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	// Resolve once, up front: the frontend needs this to decide whether a
+	// reconstructed `thinking` event should be allowed to end a tool-call
+	// group (see the "show_reasoning" field on the response below).
+	_, _, _, showReasoning, _ := s.sessionStatusFields(sess)
+	effShowReasoning := showReasoning == nil || *showReasoning
+
+	// While a turn is in flight its progress is saved to disk incrementally,
+	// and the WS replay buffer delivers those same rounds to (re)subscribing
+	// tabs. Serve only the messages that predate the turn so the two sources
+	// never overlap — without this cap a mid-turn refresh would render every
+	// tool card twice.
+	msgs := sess.Messages
+	s.liveStateMu.RLock()
+	if ls, ok := s.liveStates[id]; ok && ls.historyWatermark > 0 && ls.historyWatermark < len(msgs) {
+		msgs = msgs[:ls.historyWatermark]
+	}
+	s.liveStateMu.RUnlock()
+
+	// The Web UI expects an event stream that mirrors the live WS traffic.
+	// We translate the persisted message list into user/assistant events and
+	// reconstruct tool_call / tool_result pairs from tool_use / tool_result
+	// blocks so the history replay is visually complete.
+	events := make([]map[string]any, 0, len(msgs)*2)
+	for i, m := range msgs {
+		switch m.Role {
+		case agent.RoleUser:
+			// Emit tool_result events for any tool_result blocks before the
+			// user message (they carry the actual output).
+			hasToolResult := false
+			for _, b := range m.Blocks {
+				if b.Type == "tool_result" {
+					hasToolResult = true
+					// Persisted results may carry model-facing
+					// <system-reminder> spans appended by the tool-result
+					// hook (memory save-nudge) — strip them for display,
+					// matching the live EventToolDone path.
+					ev := map[string]any{
+						"type":    "tool_result",
+						"result":  agent.StripRemindersForDisplay(b.Result),
+						"tool_id": b.ToolUseID,
+					}
+					if b.UI != nil {
+						ev["ui_payload"] = b.UI
+					}
+					// The bookkeeping message's timestamp approximates when the
+					// tool finished; pairs with the tool_call created_at so a
+					// reloaded transcript can show real durations. Omitted for
+					// pre-CreatedAt session files.
+					if !m.CreatedAt.IsZero() {
+						ev["created_at"] = m.CreatedAt.UnixMilli()
+					}
+					events = append(events, ev)
+				}
+			}
+			// Use the message's own CreatedAt when available.  Older session
+			// files don't have per-message timestamps, so fall back to the
+			// array index as a unique cursor (not sess.CreatedAt — that
+			// collides with the Web UI's dedup logic and drops everything
+			// after the first user message).
+			//
+			// UnixMilli, not Unix: the live history_user_message broadcast in
+			// doAgentTurn sends this message's CreatedAt in milliseconds, and
+			// the Web UI dedups live-vs-history rounds by exact created_at
+			// equality — mismatched units would render the same user message
+			// twice when a history fetch races the live event.
+			createdAt := m.CreatedAt.UnixMilli()
+			if m.CreatedAt.IsZero() {
+				createdAt = int64(i + 1)
+			}
+			// A multipart user message (image attachments) carries its text
+			// in blocks rather than Content, and its images as blocks whose
+			// persisted file maps to an /api/uploads/ thumbnail URL. Blocks
+			// of a tool_result message are tool bookkeeping, not user input.
+			text := m.Content
+			var images []string
+			if !hasToolResult {
+				for _, b := range m.Blocks {
+					switch b.Type {
+					case "text":
+						if text == "" {
+							text = b.Text
+						}
+					case "image":
+						if b.ImagePath != "" {
+							images = append(images, "/api/uploads/"+filepath.Base(b.ImagePath))
+						}
+					}
+				}
+			}
+			// <system-reminder> spans (background-process completion notes,
+			// recalled memories) are model-facing context persisted inside
+			// user turns — strip them so replay matches the TUI, which never
+			// shows them.
+			text = strings.TrimSpace(agent.StripSystemReminders(text))
+			// Document attachments persist only as "[Attached file: <abspath>]"
+			// notes in the text (no image block). Strip them and re-derive the
+			// chip refs so a reloaded transcript shows the same chips the live
+			// turn did (docChipRefs is the shared source for both).
+			var docRefs []string
+			text, docRefs = docChipRefs(text)
+			images = append(images, docRefs...)
+			// Only emit history_user_message if there is user-visible content
+			// (tool_result-only messages are bookkeeping, not user-visible).
+			if text != "" || len(images) > 0 {
+				ev := map[string]any{
+					"type":          "history_user_message",
+					"content":       text,
+					"created_at":    createdAt,
+					"message_index": i, // position in the persisted Messages array — may differ from the rendered index (tool_result-only messages are skipped)
+				}
+				if len(images) > 0 {
+					ev["images"] = images
+				}
+				events = append(events, ev)
+			}
+		case agent.RoleAssistant:
+			// Reasoning trace: Anthropic returns a standalone "thinking" block;
+			// OpenAI-protocol models stash it on the first tool_use block.
+			thinking := ""
+			hasToolUse := false
+			for _, b := range m.Blocks {
+				if b.Type == "tool_use" {
+					hasToolUse = true
+				}
+				if thinking == "" {
+					if b.Type == "thinking" && b.Thinking != "" {
+						thinking = b.Thinking
+					} else if b.Type == "tool_use" && b.Reasoning != "" {
+						thinking = b.Reasoning
+					}
+				}
+			}
+			if hasToolUse {
+				// Intermediate (tool) round — replay in block order so it mirrors
+				// the live stream's think → act sequence: the reasoning (and any
+				// answer text) come BEFORE the tool calls. Each non-tool segment
+				// is a group boundary, so tools separated by thinking/text don't
+				// collapse into one card. Emitted as a standalone "thinking"
+				// segment rather than inline, since this round has no answer bubble.
+				if thinking != "" {
+					events = append(events, map[string]any{"type": "thinking", "text": thinking})
+				}
+				var txt strings.Builder
+				for _, b := range m.Blocks {
+					if b.Type == "text" {
+						txt.WriteString(b.Text)
+					}
+				}
+				if txt.Len() > 0 {
+					ev := map[string]any{
+						"type":     "assistant_message",
+						"content":  txt.String(),
+						"thinking": "",
+					}
+					if !m.CreatedAt.IsZero() {
+						ev["created_at"] = m.CreatedAt.UnixMilli()
+					}
+					events = append(events, ev)
+				}
+				for _, b := range m.Blocks {
+					if b.Type == "tool_use" {
+						ev := map[string]any{
+							"type":    "tool_call",
+							"name":    b.Name,
+							"args":    b.Input,
+							"tool_id": b.ID,
+						}
+						// The assistant round's timestamp approximates when the
+						// tool started; omit it for older sessions whose messages
+						// predate per-message CreatedAt rather than sending the
+						// index fallback (a bogus 1970 timestamp).
+						if !m.CreatedAt.IsZero() {
+							ev["created_at"] = m.CreatedAt.UnixMilli()
+						}
+						events = append(events, ev)
+					}
+				}
+			} else {
+				// Final answer turn: keep the reasoning inline on the answer
+				// bubble, mirroring the live assistant_message.
+				//
+				// message_index rides along only on this branch: a reply that
+				// closes a turn is a valid branch point, an intermediate
+				// (tool_use) round is not — the web UI shows the Branch action
+				// exactly where the index is present.
+				ev := map[string]any{
+					"type":          "assistant_message",
+					"content":       m.Content,
+					"thinking":      thinking,
+					"message_index": i,
+				}
+				// Without this the Web UI stamps the replayed bubble with the
+				// reload time, so an answer from this morning reads as "now"
+				// after every refresh. Omitted for pre-CreatedAt session files
+				// (the UI then falls back to the reload time, as before).
+				if !m.CreatedAt.IsZero() {
+					ev["created_at"] = m.CreatedAt.UnixMilli()
+				}
+				events = append(events, ev)
+			}
+		}
+	}
+
+	writeJSONGzip(w, r, http.StatusOK, map[string]any{
+		"has_more":       false,
+		"events":         events,
+		"show_reasoning": effShowReasoning,
+	})
+}
+
+// ─── GET /api/sessions/:id ──────────────────────────────────────────────────
+
+func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+
+	sess, err := agent.LoadSession(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, sessionDetail{
+		ID:        sess.ID,
+		CreatedAt: sess.CreatedAt,
+		Model:     sess.Model,
+		Messages:  sess.Messages,
+	})
+}
+
+// ─── DELETE /api/sessions/:id ───────────────────────────────────────────────
+
+func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+	// Cancel any in-flight turn first — including one parked in
+	// ask_user_question, which (now that it has no timeout to fall back on)
+	// would otherwise leak forever and, if answered via a stale modal,
+	// resave the very file this handler is about to delete.
+	s.interruptSession(id)
+	// The throwaway workspace goes with its session — read the dir before the
+	// transcript that records it is deleted.
+	var taskDir string
+	if sess, lerr := agent.LoadSession(id); lerr == nil {
+		taskDir = sess.WorkingDir
+	}
+	if err := agent.DeleteSession(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.forgetTurnLock(id)
+	s.removeAgentEvents(id)                 // and its persisted agent-event trails
+	tools.CloseSessionBackgroundManager(id) // reap the session's background daemons
+	tools.CloseSessionSubAgentManager(id)   // and its sub-agents
+	tools.CloseSessionWorkflowManager(id)   // and its background workflows
+	tools.CloseSessionReadTracker(id)       // and its read-before-write tracker
+	tools.CloseSessionTaskStore(id)         // and its task/plan checklist
+	tools.CloseSessionReplaySecrets(id)     // and any cached replay secrets
+	// After the teardown above: a background daemon still writing into the
+	// directory while it moves would race the rename.
+	s.stashTaskWorkspace(taskDir)
+	s.wsHub.broadcast("", wsEventSessionDeleted{Type: "session_deleted", SessionID: id})
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": []string{id}})
+}
+
+// ─── POST /api/sessions/delete (batch) ──────────────────────────────────────
+
+type deleteSessionsRequest struct {
+	IDs []string `json:"ids"`
+}
+
+// deleteSessionsByID deletes sessions and tears down everything scoped to them,
+// returning what went and what refused. Shared by the batch endpoint and by
+// deleting a project, which takes its sessions with it — the teardown list is
+// long enough that a second copy of it would drift.
+func (s *Server) deleteSessionsByID(ids []string) (deleted []string, failed map[string]string) {
+	deleted = make([]string, 0, len(ids))
+	failed = map[string]string{}
+	for _, id := range ids {
+		s.interruptSession(id)
+		// See handleDeleteSession: capture the dir before the transcript goes.
+		var taskDir string
+		if sess, lerr := agent.LoadSession(id); lerr == nil {
+			taskDir = sess.WorkingDir
+		}
+		if err := agent.DeleteSession(id); err != nil {
+			failed[id] = err.Error()
+			continue
+		}
+		s.forgetTurnLock(id)
+		s.removeAgentEvents(id)                 // and its persisted agent-event trails
+		tools.CloseSessionBackgroundManager(id) // reap the session's background daemons
+		tools.CloseSessionSubAgentManager(id)   // and its sub-agents
+		tools.CloseSessionWorkflowManager(id)   // and its background workflows
+		tools.CloseSessionReadTracker(id)       // and its read-before-write tracker
+		tools.CloseSessionTaskStore(id)         // and its task/plan checklist
+		tools.CloseSessionReplaySecrets(id)     // and any cached replay secrets
+		// After the teardown above — see handleDeleteSession.
+		s.stashTaskWorkspace(taskDir)
+		s.wsHub.broadcast("", wsEventSessionDeleted{Type: "session_deleted", SessionID: id})
+		deleted = append(deleted, id)
+	}
+	return deleted, failed
+}
+
+func (s *Server) handleDeleteSessions(w http.ResponseWriter, r *http.Request) {
+	var req deleteSessionsRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if len(req.IDs) == 0 {
+		writeError(w, http.StatusBadRequest, "ids is required")
+		return
+	}
+
+	deleted, failed := s.deleteSessionsByID(req.IDs)
+
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted, "failed": failed})
+}
+
+// ─── POST /api/sessions/{id}/branch ────────────────────────────────────────
+
+// lastBranchableIndex returns the index of the session's final message when it
+// closes a turn, so a `complete` event can tell the browser which live
+// assistant bubble is a valid branch point without a history re-fetch. Returns
+// -1 when the transcript doesn't end on a settled assistant reply (interrupted
+// mid tool round, or a turn that produced no reply at all).
+func lastBranchableIndex(sess *agent.Session) int {
+	n := len(sess.Messages)
+	if n == 0 || !agent.IsSettledAssistantMessage(sess.Messages[n-1]) {
+		return -1
+	}
+	return n - 1
+}
+
+type branchSessionRequest struct {
+	MessageIndex int `json:"message_index"`
+}
+
+// handleBranchSession creates a new session branched from the source session's
+// history up to (but not including) message_index — an exclusive count, so
+// message_index == len(Messages) copies the whole transcript. The source
+// session is untouched. Returns the new session so the client can navigate
+// to it.
+func (s *Server) handleBranchSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+	var req branchSessionRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	src, err := agent.LoadSession(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if req.MessageIndex < 0 || req.MessageIndex > len(src.Messages) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("message_index out of range: %d (have %d messages)", req.MessageIndex, len(src.Messages)))
+		return
+	}
+	// The copied prefix has to end on a settled turn: cutting after an
+	// assistant tool_use, or mid-way through a tool exchange, would leave that
+	// tool_use with no answering result (issue #1899). An empty prefix is fine.
+	if req.MessageIndex > 0 && !agent.IsSettledAssistantMessage(src.Messages[req.MessageIndex-1]) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("message_index %d does not name a turn boundary; history can only branch after a completed assistant reply", req.MessageIndex))
+		return
+	}
+	branch := agent.BranchFrom(src, req.MessageIndex)
+	// A fork of a project session belongs to the same project. This is not
+	// cosmetic: a session created inside a project deliberately carries no
+	// WorkingDir of its own (applyDefaultWorkspaceDir skips it, so the project's
+	// directory can't leave a stale value behind), so a branch left unfiled
+	// resolves its dir from the server default and runs somewhere else, reading
+	// the global memory tier instead of the project's. Filed before Save for the
+	// same reason handleCreateChat does it: membership decides what the session
+	// is, and a stale entry from a failed Save is harmless (the frontend
+	// cross-references the live session list).
+	if p := projectForSession(src.ID); p != nil {
+		if err := addSessionToGroup(p.ID, branch.ID); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("file branch under project: %v", err))
+			return
+		}
+	}
+
+	if err := branch.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.wsHub.broadcast("", wsEventSessionCreated{Type: "session_created", SessionID: branch.ID})
+	writeJSON(w, http.StatusOK, map[string]any{"session": s.toSessionItem(branch, "web", branch.EffectiveAgentID())})
+}
+
+// ─── POST /api/sessions/{id}/edit_message ──────────────────────────────────
+
+type editMessageRequest struct {
+	// A pointer so a missing index is a 400, not a silent 0: truncating at 0
+	// wipes the whole transcript.
+	MessageIndex *int   `json:"message_index"`
+	NewContent   string `json:"new_content"`
+	// OriginalContent is the text the browser showed in the bubble being
+	// edited. When set, the edit is refused unless it matches the message at
+	// MessageIndex: the browser's indices can drift from disk (a mid-turn
+	// compaction shifts every later message), and a stale index would
+	// otherwise truncate history at the wrong place.
+	OriginalContent *string `json:"original_content,omitempty"`
+}
+
+// displayedUserText is the text a plain user message renders as in the web
+// transcript (the same derivation the history endpoint uses), so it can be
+// compared against what the browser showed.
+func displayedUserText(m agent.Message) string {
+	text := m.Content
+	if text == "" {
+		for _, b := range m.Blocks {
+			if b.Type == "text" {
+				text = b.Text
+				break
+			}
+		}
+	}
+	return normalizeDisplayedText(text)
+}
+
+// turnClosedAfter reports whether a finished turn follows msgs[idx]: some
+// later message is a settled assistant reply. False means msgs[idx] belongs to
+// the turn still in flight (its prompt, or a steer injected into it).
+func turnClosedAfter(msgs []agent.Message, idx int) bool {
+	for _, m := range msgs[idx+1:] {
+		if agent.IsSettledAssistantMessage(m) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeDisplayedText strips model-facing reminder spans and attachment
+// notes. Idempotent, so it is applied to the browser's copy too: a live steer
+// bubble keeps its attachment notes in the text, while a replayed one doesn't.
+func normalizeDisplayedText(text string) string {
+	text, _ = docChipRefs(strings.TrimSpace(agent.StripSystemReminders(text)))
+	return strings.TrimSpace(text)
+}
+
+// handleEditMessage replaces the user message at message_index and regenerates
+// from that point: any in-flight turn is interrupted and waited out, history is
+// truncated to just before the message, and a fresh turn runs with new_content
+// plus the original message's image attachments. This mirrors handleWSRetry's
+// rollback-and-rerun pattern — the edited prompt re-enters history through the
+// normal turn flow, so it is persisted (and broadcast with a correct
+// message_index) exactly once. The old rewrite-in-place-then-caller-resends
+// contract double-appended the prompt and, because history then ended on a
+// user message, tripped the crash-recovery reminder on the resend.
+func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+	var req editMessageRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if req.MessageIndex == nil {
+		writeError(w, http.StatusBadRequest, "message_index is required")
+		return
+	}
+	idx := *req.MessageIndex
+	if idx < 0 {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("message_index out of range: %d", idx))
+		return
+	}
+	if strings.TrimSpace(req.NewContent) == "" {
+		writeError(w, http.StatusBadRequest, "new_content must be non-empty")
+		return
+	}
+
+	// Editing mid-stream is the supported "change my mind while it's replying"
+	// flow, but only for the turn in flight: an older message would cut every
+	// finished turn after it, tool side effects and all, with one click while
+	// the user was likely just fixing a typo. Stop first for that.
+	mu := s.sessionTurnLock(id)
+	mu.Lock()
+	running := s.turnRunning[id]
+	mu.Unlock()
+	if running {
+		if cur, err := agent.LoadSession(id); err == nil && idx < len(cur.Messages) {
+			if turnClosedAfter(cur.Messages, idx) {
+				writeError(w, http.StatusConflict, "only the message being answered can be edited while a reply is running; stop it first")
+				return
+			}
+			// Same content check as below, done before the interrupt so a
+			// stale edit doesn't cost the running turn.
+			if req.OriginalContent != nil && normalizeDisplayedText(*req.OriginalContent) != displayedUserText(cur.Messages[idx]) {
+				writeError(w, http.StatusConflict, "the conversation changed since this message was shown; reload and edit again")
+				return
+			}
+		}
+	}
+
+	// Interrupt any in-flight turn, then wait for it to fully wind down —
+	// turnRunning clears only after the turn's final save — so the truncate
+	// below cannot race the dying turn's own persistence.
+	s.interruptSession(id)
+	deadline := time.Now().Add(10 * time.Second)
+	mu.Lock()
+	for s.turnRunning[id] {
+		mu.Unlock()
+		if time.Now().After(deadline) {
+			writeError(w, http.StatusConflict, "interrupted turn is still winding down; retry the edit")
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+	}
+
+	// The rerun is a Web turn like any other and must own the binding while it
+	// writes the transcript: unbound, the next message sent mid-turn binds the
+	// session by rewriting the file from its own snapshot, dropping the rounds
+	// this turn appended since. Taken only now, after the interrupted turn's
+	// wind-down released its own.
+	if ok, _, berr := s.acquireSessionBinding(id, agent.EntryWeb, false); !ok {
+		mu.Unlock()
+		writeError(w, http.StatusConflict, berr.Error())
+		return
+	}
+	started := false
+	defer func() {
+		if !started {
+			s.releaseSessionBinding(id, agent.EntryWeb)
+		}
+	}()
+
+	// Load AFTER the wind-down so the interrupted turn's final save (or its
+	// first-round rollback) is what we see.
+	sess, err := agent.LoadSession(id)
+	if err != nil {
+		mu.Unlock()
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if idx > len(sess.Messages) {
+		mu.Unlock()
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("message_index out of range: %d (have %d messages)", idx, len(sess.Messages)))
+		return
+	}
+	// message_index == len(Messages) is legal: a first-round send failure
+	// rolls the still-unanswered prompt back out of history, so there is
+	// nothing left to strip — the rerun below simply recreates it.
+	var blocks []agent.ContentBlock
+	if idx < len(sess.Messages) {
+		target := sess.Messages[idx]
+		// Same invariant as branching: tool results ride on user-role messages,
+		// so a bare Role check would still let an edit truncate between an
+		// assistant tool_use and its tool_result (issue #1899).
+		if !agent.IsPlainUserMessage(target) {
+			mu.Unlock()
+			writeError(w, http.StatusBadRequest, "message_index does not name a plain user message")
+			return
+		}
+		if req.OriginalContent != nil && normalizeDisplayedText(*req.OriginalContent) != displayedUserText(target) {
+			mu.Unlock()
+			writeError(w, http.StatusConflict, "the conversation changed since this message was shown; reload and edit again")
+			return
+		}
+		// Keep the original image attachments (rehydrated by LoadSession) so
+		// the regenerated turn re-sends them with the edited text — the same
+		// rehydration handleWSRetry does.
+		for _, b := range target.Blocks {
+			if b.Type == "image" {
+				blocks = append(blocks, b)
+			}
+		}
+		sess.TruncateTo(idx)
+		if err := sess.Save(); err != nil {
+			mu.Unlock()
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	s.broadcastRollback(id)
+
+	s.turnRunning[id] = true
+	started = true
+	mu.Unlock()
+
+	go func() {
+		// Hold the drain gate past the binding release's session write, as
+		// handleWSUserMessage does.
+		if s.drain.begin() == nil {
+			defer s.drain.end()
+		}
+		defer func() {
+			// Release before clearing turnRunning, so the flag only flips once
+			// the release's session write is done.
+			s.releaseSessionBinding(id, agent.EntryWeb)
+			mu.Lock()
+			s.turnRunning[id] = false
+			mu.Unlock()
+		}()
+		s.runAgentTurnLoop(sess, req.NewContent, blocks, imageRefsFromBlocks(blocks))
+	}()
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// ─── GET /api/tools ─────────────────────────────────────────────────────────
+
+func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
+	defs := tools.DefaultTools()
+	out := make([]toolInfo, 0, len(defs))
+	for _, d := range defs {
+		out = append(out, toolInfo{
+			Name:        d.Name,
+			Description: d.Description,
+			Parameters:  d.Parameters,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// ─── GET /api/skills ────────────────────────────────────────────────────────
+
+func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
+	// The registry is a startup-time snapshot. Skills added, edited, or
+	// removed on disk (rather than through this API) would otherwise stay
+	// invisible — or worse, deleted ones would linger in the panel — until
+	// the server restarts. Re-scan before listing; Reload only reads each
+	// skill dir's SKILL.md frontmatter, so it's cheap enough per request.
+	s.skillReg.Reload()
+	// Refresh the manifest for sessions built after this point, same as the
+	// toggle/delete handlers do.
+	s.setSkillsManifest(tools.SkillsManifest(s.skillReg))
+	list := s.skillReg.All()
+	out := make([]skillInfo, 0, len(list))
+	for _, sk := range list {
+		out = append(out, skillInfo{
+			Name:        sk.Name,
+			Description: sk.Description,
+			Source:      sk.Source,
+			Enabled:     s.skillReg.IsEnabled(sk.Name),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"skills": out})
+}
+
+// ─── GET /api/workflows ───────────────────────────────────────────────────────
+
+// handleListWorkflows lists every registered named workflow (embedded defaults +
+// user + project) for the web discovery panel. Read-only; the registry is
+// scanned fresh per request so newly-dropped files show up without a restart.
+func (s *Server) handleListWorkflows(w http.ResponseWriter, r *http.Request) {
+	_ = r
+	writeJSON(w, http.StatusOK, map[string]any{"workflows": tools.ListNamedWorkflows()})
+}
+
+// ─── GET /api/health ────────────────────────────────────────────────────────
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	_ = r
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// ─── Turn execution ─────────────────────────────────────────────────────────
+
+// runTurn executes one user message against a session. It builds the agent,
+// runs the tool loop if enabled, and returns the assistant's text reply.
+func (s *Server) runTurn(ctx context.Context, sess *agent.Session, userInput string) (string, error) {
+	if err := s.drain.begin(); err != nil {
+		return "", err
+	}
+	defer s.drain.end()
+
+	ctx = context.WithValue(ctx, ctxKeySessionID{}, sess.ID)
+	ctx = tools.WithSessionID(ctx, sess.ID) // tools-layer per-session state (replay secrets)
+	a := s.buildAgent(sess)
+	// A REST/script client, whatever entry the session is bound to: the
+	// interface note has nothing to promise it about rendering.
+	a.HookMeta.Transport = agent.EntryAPI
+
+	if !s.cfg.Tools {
+		// Run (not Turn) so this path shares the loop's interrupt contract
+		// (input kept, capped with a note) and Stop-hook firing with the WS
+		// transport's no-tools turns.
+		reply, err := a.Run(ctx, userInput, nil, nil)
+		sess.SyncFrom(a.History)
+		if err != nil {
+			// Callers only Save on success; persist what the turn left behind
+			// (an interrupt keeps the input + note) like the WS path does.
+			_ = sess.Save()
+			return "", err
+		}
+		return reply.Content, nil
+	}
+
+	// Tool-enabled path: wire the per-turn tool environment (gate + ctx-scoped
+	// sub-agent manager + task store) bound to this turn's agent.
+	ctx, executor, _, cleanup, err := s.prepareToolTurn(ctx, a, sess)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+
+	reply, err := a.Run(ctx, userInput, tools.DefaultToolsForCtx(ctx, a.Model, a.ContextWindow()), executor)
+	// Sync even on failure: an interrupt keeps the input + note, and rounds
+	// completed before a mid-turn error are billed work — the WS path
+	// persists both, so this transport must too (callers only Save on
+	// success, hence the explicit Save on the error path).
+	sess.SyncFrom(a.History)
+	if err != nil {
+		_ = sess.Save()
+		return "", err
+	}
+	return reply.Content, nil
+}
+
+func permissionConfigPath() string {
+	path, err := datahome.Path("permissions.yml")
+	if err != nil {
+		return ""
+	}
+	return path
+}
+
+// resolvePermissionMode reads the persisted config and returns the configured
+// permission mode (or ModeInteractive as the default). This lets the server
+// pick up mode changes written by the setup panel / onboard skill without
+// restarting.
+func resolvePermissionMode() permission.Mode {
+	return permission.ResolveDefaultMode()
+}
+
+// ─── POST /api/file-action ────────────────────────────────────────────────
+
+// fileActionRequest is sent when the user clicks a file:// link in chat.
+type fileActionRequest struct {
+	Path   string `json:"path"`
+	Action string `json:"action"` // "open" or "download"
+}
+
+// handleFileAction handles file:// links from the chat UI.
+// When action is "open" and the server is running on localhost,
+// it attempts to open the file with the OS default handler.
+// When action is "download", it streams the file contents back.
+// The path is always resolved under the server's working directory (s.cwd);
+// absolute paths or paths that escape cwd are rejected.
+func (s *Server) handleFileAction(w http.ResponseWriter, r *http.Request) {
+	var req fileActionRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if req.Path == "" {
+		writeError(w, http.StatusBadRequest, "path is required")
+		return
+	}
+
+	abs, ok := resolveUnderCWD(s.curCwd(), req.Path)
+	if !ok {
+		writeError(w, http.StatusForbidden, "path is outside the working directory")
+		return
+	}
+
+	switch req.Action {
+	case "open":
+		// Only allow opening files on localhost for security.
+		host := r.Host
+		if idx := strings.LastIndex(host, ":"); idx != -1 {
+			host = host[:idx]
+		}
+		if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+			writeError(w, http.StatusForbidden, "open action only allowed on localhost")
+			return
+		}
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin":
+			cmd = exec.Command("open", abs)
+		case "windows":
+			// start is a cmd.exe builtin, not an executable — route through
+			// cmd /c. The empty "" is start's window-title argument so a
+			// quoted path containing spaces isn't mistaken for the title.
+			cmd = exec.Command("cmd", "/c", "start", "", abs)
+			executil.SetNoWindow(cmd)
+		default:
+			cmd = exec.Command("xdg-open", abs)
+		}
+		if err := cmd.Start(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "opened"})
+
+	case "download":
+		f, err := os.Open(abs)
+		if err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if info.IsDir() {
+			writeError(w, http.StatusBadRequest, "cannot download a directory")
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+filepath.Base(abs)+"\"")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
+		http.ServeContent(w, r, filepath.Base(abs), info.ModTime(), f)
+
+	default:
+		writeError(w, http.StatusBadRequest, "unknown action")
+	}
+}
+
+// ─── PATCH /api/sessions/{id} ───────────────────────────────────────────────
+
+// updateSessionRequest carries the user-editable session fields. Only the
+// title (the sidebar "name") is editable today.
+type updateSessionRequest struct {
+	Name string `json:"name"`
+}
+
+// handleUpdateSession renames a session — the sidebar's rename action.
+func (s *Server) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+	var req updateSessionRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+
+	sess, err := agent.LoadSession(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err := sess.SetTitle(name); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("set title: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"session": s.toSessionItem(sess, "manual", sess.EffectiveAgentID())})
+}
+
+// ─── PATCH /api/sessions/{id}/model ─────────────────────────────────────────
+
+type updateSessionModelRequest struct {
+	ModelID string `json:"model_id"`
+}
+
+// handleUpdateSessionModel switches THIS session's model: model_id naming a
+// config entry binds the session to it (provider, endpoint, key — the whole
+// entry, applied from the next turn via the per-entry sender cache); other
+// values are treated as a raw model string on the session, staying on the
+// default sender. The global default model is not touched — that's
+// POST /api/config/models/{id}/default.
+func (s *Server) handleUpdateSessionModel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+
+	var req updateSessionModelRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if req.ModelID == "" {
+		writeError(w, http.StatusBadRequest, "model_id is required")
+		return
+	}
+
+	sess, err := agent.LoadSession(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	if ok, _, berr := s.acquireSessionBinding(id, agent.EntryWeb, false); !ok {
+		writeError(w, http.StatusConflict, berr.Error())
+		return
+	}
+	defer s.releaseSessionBinding(id, agent.EntryWeb)
+
+	// Reload after acquiring the binding in case another process saved.
+	sess, err = agent.LoadSession(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	cfg, _ := config.Load()
+	var model string
+	if entry, ok := cfg.EntryByModel(req.ModelID); ok {
+		model = entry.Model
+		// Bind with the id AS RECEIVED — a composite "<endpoint>::<model>"
+		// id must survive verbatim, or re-resolving the bare model name
+		// later could land on a different endpoint exposing the same model.
+		err = sess.SetModelConfig(req.ModelID, entry.Model)
+	} else if req.ModelID == "default" {
+		// Legacy id for "the default entry". Unbind so the session follows
+		// whatever the default is at turn time.
+		model = cfg.DefaultEntry().Model
+		if model == "" {
+			writeError(w, http.StatusBadRequest, "no default model configured")
+			return
+		}
+		err = sess.SetModelConfig("", model)
+	} else {
+		// Raw model string: keep the default sender, change only the model.
+		model = req.ModelID
+		err = sess.SetModelConfig("", model)
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save session: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"model":    model,
+		"model_id": req.ModelID,
+	})
+}
+
+// ─── PATCH /api/sessions/{id}/reasoning_effort ──────────────────────────────
+
+type updateSessionReasoningEffortRequest struct {
+	ReasoningEffort string `json:"reasoning_effort"`
+}
+
+// handleUpdateSessionReasoningEffort records this session's own reasoning
+// intensity and, when the session belongs to a project, the project's saved
+// level — a NEW session born there starts on that value, which is what makes
+// the setting survive "open a new chat" and "restart the app" per project
+// instead of resetting to the global default. A session with no project still
+// updates the global config, exactly as before: that is its only persistence
+// home. Existing sessions keep the level they were left on (sessionStatusFields
+// prefers the session's own value over the project's).
+// Valid levels: "off", "low", "medium", "high", "xhigh", "max". Empty is normalised to "off".
+func (s *Server) handleUpdateSessionReasoningEffort(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+
+	var req updateSessionReasoningEffortRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+
+	level := strings.ToLower(strings.TrimSpace(req.ReasoningEffort))
+	if level == "" {
+		level = "off"
+	}
+	if level != "off" && level != "low" && level != "medium" && level != "high" && level != "xhigh" && level != "max" {
+		writeError(w, http.StatusBadRequest, "reasoning_effort must be off, low, medium, high, xhigh, or max")
+		return
+	}
+	stored := normalizeReasoningEffort(level)
+
+	if _, err := agent.LoadSession(id); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if ok, _, berr := s.acquireSessionBinding(id, agent.EntryWeb, false); !ok {
+		writeError(w, http.StatusConflict, berr.Error())
+		return
+	}
+	defer s.releaseSessionBinding(id, agent.EntryWeb)
+
+	// Reload after acquiring the binding in case another process saved.
+	sess, err := agent.LoadSession(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err := sess.SetReasoningEffort(stored); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save session: %v", err))
+		return
+	}
+
+	// Where the value is remembered beyond this transcript. A project is the
+	// per-project store the user asked for; an ungrouped session has only the
+	// global default.
+	project := projectForSession(id)
+	if project != nil {
+		if err := setProjectReasoningEffort(project.ID, stored); err != nil {
+			slog.Error("save project reasoning_effort", "group", project.ID, "err", err)
+		}
+	} else {
+		cfg, _ := config.Load()
+		// "off" is only ever a wire/UI sentinel — the persisted and forwarded
+		// representation of "no reasoning effort" is "" everywhere else in the
+		// codebase (CLI, TUI, provider layer). Storing "off" verbatim used to
+		// reach provider requests as a literal, invalid reasoning_effort value.
+		cfg.ReasoningEffort = stored
+		// Reasoning off has nothing to show a trace of; keep show_reasoning from
+		// staying on in a way that looks toggled on but does nothing.
+		if level == "off" {
+			off := false
+			cfg.ShowReasoning = &off
+		}
+		if err := cfg.Save(); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("save config: %v", err))
+			return
+		}
+
+		// The default sender embeds reasoning_effort; rebuild it so existing
+		// unbound sessions pick up the new effort on their next turn. Per-entry
+		// senders are rebuilt lazily via invalidateSenderCache.
+		s.invalidateSenderCache()
+		if err := s.reloadDefaultSender(); err != nil {
+			slog.Error("reload default sender after reasoning_effort change", "err", err)
+		}
+	}
+
+	// Push each session's own effective reasoning_effort — resolved against
+	// ITS OWN model entry, not the one that just changed — so a toggle for
+	// this session's model doesn't paint every other open tab's status bar
+	// with this session's value.
+	if s.wsHub != nil {
+		sessions, _ := agent.ListSessions(50)
+		for _, sess := range sessions {
+			_, pm, re, sr, _ := s.sessionStatusFields(sess)
+			s.wsHub.broadcast(sess.ID, map[string]any{
+				"type":             "session_update",
+				"session_id":       sess.ID,
+				"working_dir":      s.sessionCwd(sess),
+				"permission_mode":  pm,
+				"reasoning_effort": re,
+				"show_reasoning":   sr,
+			})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":               true,
+		"reasoning_effort": level,
+	})
+}
+
+// ─── PATCH /api/sessions/{id}/permission_mode ───────────────────────────────
+
+type updateSessionPermissionModeRequest struct {
+	PermissionMode string `json:"permission_mode"`
+}
+
+// handleUpdateSessionPermissionMode updates THIS session's own permission
+// mode — the Web equivalent of the TUI's shift+tab cycle. Valid values:
+// "interactive", "auto", "strict". Per-session: it never touches the global
+// default (~/.octo/config.yml, edited instead via Settings → default model),
+// so it only affects this session, not other sessions and not what a
+// brand-new session inherits. The per-turn permission engine reads
+// sess.PermissionMode (see prepareToolTurn/runChannelTurns), so the change
+// takes effect on this session's next turn without a sender rebuild.
+func (s *Server) handleUpdateSessionPermissionMode(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+
+	var req updateSessionPermissionModeRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+
+	mode := strings.ToLower(req.PermissionMode)
+	switch mode {
+	case string(permission.ModeInteractive), string(permission.ModeAutoApprove), string(permission.ModeStrict):
+	default:
+		writeError(w, http.StatusBadRequest, "permission_mode must be interactive, auto, or strict")
+		return
+	}
+
+	if _, err := agent.LoadSession(id); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if ok, _, berr := s.acquireSessionBinding(id, agent.EntryWeb, false); !ok {
+		writeError(w, http.StatusConflict, berr.Error())
+		return
+	}
+	defer s.releaseSessionBinding(id, agent.EntryWeb)
+
+	// Reload after acquiring the binding in case another process saved.
+	sess, err := agent.LoadSession(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err := sess.SetPermissionMode(mode); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save session: %v", err))
+		return
+	}
+
+	// Push the new mode so this session's composer pill refreshes without
+	// waiting for the next turn's session_update. Only this session — it's
+	// the only one whose own mode changed.
+	if s.wsHub != nil {
+		s.wsHub.broadcast(id, map[string]any{
+			"type":            "session_update",
+			"session_id":      id,
+			"permission_mode": mode,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":              true,
+		"permission_mode": mode,
+	})
+}
+
+// ─── PATCH /api/sessions/{id}/show_reasoning ────────────────────────────────
+
+type updateSessionShowReasoningRequest struct {
+	ShowReasoning bool `json:"show_reasoning"`
+}
+
+// handleUpdateSessionShowReasoning updates whether reasoning traces are shown
+// for the model THIS session actually runs on (see entryForSession) — not
+// always the default entry. Before this, the toggle always wrote to
+// cfg.DefaultEntry(): for a session pinned to a non-default model, the
+// Composer's eye icon still visibly flipped (the status read came from the
+// same wrong entry the write used), but the session's real turns — gated by
+// senderForSession's correct per-entry resolution — never actually changed,
+// so reasoning kept showing (or hiding) no matter how many times it was
+// toggled.
+func (s *Server) handleUpdateSessionShowReasoning(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+
+	var req updateSessionShowReasoningRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+
+	// Verify the session exists (PR5: reasoning is global; no per-session
+	// entry to load).
+	if _, err := agent.LoadSession(id); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	cfg, _ := config.Load()
+	// PR5: reasoning/show_reasoning is global — update the global config
+	// field, not a per-session entry (those fields are deleted).
+	cfg.ShowReasoning = &req.ShowReasoning
+	if err := cfg.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save config: %v", err))
+		return
+	}
+
+	// The default sender embeds show_reasoning; rebuild it so existing
+	// unbound sessions pick up the new value on their next turn. Per-entry
+	// senders are rebuilt lazily via invalidateSenderCache.
+	s.invalidateSenderCache()
+	if err := s.reloadDefaultSender(); err != nil {
+		slog.Error("reload default sender after show_reasoning change", "err", err)
+	}
+
+	// Push each session's own effective show_reasoning — resolved against ITS
+	// OWN model entry, not the one that just changed — so a toggle for this
+	// session's model doesn't paint every other open tab's status bar with
+	// this session's value.
+	if s.wsHub != nil {
+		sessions, _ := agent.ListSessions(50)
+		for _, sess := range sessions {
+			_, pm, re, sr, _ := s.sessionStatusFields(sess)
+			s.wsHub.broadcast(sess.ID, map[string]any{
+				"type":             "session_update",
+				"session_id":       sess.ID,
+				"working_dir":      s.sessionCwd(sess),
+				"permission_mode":  pm,
+				"reasoning_effort": re,
+				"show_reasoning":   sr,
+			})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":             true,
+		"show_reasoning": req.ShowReasoning,
+	})
+}
+
+// ─── PATCH /api/sessions/{id}/working_dir ───────────────────────────────────
+
+// handleUpdateSessionWorkingDir sets THIS session's working directory: the cwd
+// its tools run in, the root its project hooks/skills resolve against, and the
+// path shown in its env context, applied from the next turn. It is per-session
+// — other sessions (and the server default for new ones) are untouched — so
+// retargeting one session can't silently move another's tools. The dir must
+// exist; a leading ~ expands to the home directory and relative paths resolve
+// against the server's launch dir.
+func (s *Server) handleUpdateSessionWorkingDir(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+	// A session's working directory is no longer its own to set. It comes from
+	// the project the session is filed under; a loose task runs in the server's
+	// configured workspace.
+	//
+	// Letting a task choose a directory promised something it could not deliver:
+	// its tools ran there, but its memory did not follow, because project memory
+	// is scoped by project membership and a task belongs to none (see
+	// Server.sessionMemDir). The user was left with a session pointed at their
+	// repo that remembered nothing about it. Making the directory a property of
+	// the project — the thing that DOES scope memory — is what removes the split
+	// rather than papering over it.
+	//
+	// Kept as an explaining 409 rather than an unregistered route so a direct
+	// API caller or an older client learns what to do instead of getting a 404.
+	if p := projectForSession(id); p != nil {
+		writeError(w, http.StatusConflict, fmt.Sprintf("project %q sets the working directory for every session in it — change it on the project instead", p.Name))
+		return
+	}
+	writeError(w, http.StatusConflict, "a session's working directory comes from its project; file this session under a project for that directory (creating one if needed) to change where its tools run")
+}
+
+// ─── PATCH /api/sessions/{id}/agent_profile ─────────────────────────────────
+
+type updateSessionAgentProfileRequest struct {
+	AgentProfile string `json:"agent_profile"`
+}
+
+// handleUpdateSessionAgentProfile rebinds THIS session's agent profile —
+// allowed only while the session still has zero turns (nothing has been sent
+// to it yet), since a running turn may already have applied the old profile's
+// system prompt/tool allowlist. Once a turn has run, agent_profile is fixed
+// for the life of the session, same as every other backend surface (there is
+// no way to un-apply a prompt/tools a turn already saw).
+func (s *Server) handleUpdateSessionAgentProfile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing session id")
+		return
+	}
+
+	var req updateSessionAgentProfileRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	agentProfile := req.AgentProfile
+	if agentProfile == "" {
+		agentProfile = agentprofile.DefaultID
+	}
+	if err := s.validateSessionAgentID(agentProfile); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if _, err := agent.LoadSession(id); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if ok, _, berr := s.acquireSessionBinding(id, agent.EntryWeb, false); !ok {
+		writeError(w, http.StatusConflict, berr.Error())
+		return
+	}
+	defer s.releaseSessionBinding(id, agent.EntryWeb)
+
+	// Reload after acquiring the binding in case another process saved.
+	sess, err := agent.LoadSession(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if len(sess.Messages) > 0 {
+		writeError(w, http.StatusConflict, "agent_profile can only be changed before the session's first turn")
+		return
+	}
+	if err := sess.SetAgentID(agentProfile); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save session: %v", err))
+		return
+	}
+
+	if s.wsHub != nil {
+		s.wsHub.broadcast(id, map[string]any{
+			"type":          "session_update",
+			"session_id":    id,
+			"agent_profile": agentProfile,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"agent_profile": agentProfile,
+	})
+}
+
+// unwrapPathError strips the "stat <path>:" wrapper os.Stat adds so the
+// error message doesn't repeat the path the caller already reports.
+func unwrapPathError(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err
+	}
+	return err
+}
+
+// expandDir resolves a user-entered path to an absolute one: a leading ~ (or
+// ~/…) becomes the home directory, and relative paths are taken against the
+// server process's launch dir. On any failure it returns the input unchanged
+// and lets the caller's os.Stat surface the error.
+func expandDir(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			p = filepath.Join(home, strings.TrimPrefix(p, "~"))
+		}
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
+}

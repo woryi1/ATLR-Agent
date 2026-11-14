@@ -1,0 +1,417 @@
+package server
+
+import "encoding/json"
+
+// ─── Client → Server messages (inbound) ─────────────────────────────────────
+
+// wsInMessage is the base envelope for every client-sent message.
+type wsInMessage struct {
+	Type string `json:"type"`
+}
+
+type wsMsgListSessions struct{}
+
+type wsMsgSubscribe struct {
+	SessionID string `json:"session_id"`
+}
+
+type wsMsgUnsubscribe struct {
+	SessionID string `json:"session_id"`
+}
+
+type wsMsgUserMessage struct {
+	SessionID string          `json:"session_id"`
+	Content   json.RawMessage `json:"content"` // string or array (multipart)
+	Files     []wsUserFile    `json:"files,omitempty"`
+	// Force allows the web UI to take over a session bound to another entry.
+	// The server still refuses if the other entry holds an active turn lease.
+	Force bool `json:"force,omitempty"`
+	// Queue asks for the message to run as its own follow-up turn after the one
+	// in flight finishes, instead of steering it. Web counterpart of the TUI's
+	// Ctrl+Q; ignored when no turn is running (the message just starts one).
+	Queue bool `json:"queue,omitempty"`
+}
+
+type wsUserFile struct {
+	Name string `json:"name"`
+	// DataURL carries an image attachment inline (base64 data URL).
+	DataURL string `json:"data_url,omitempty"`
+	// Path references a document already uploaded via POST /api/upload
+	// (an /api/uploads/<name> URL).
+	Path string `json:"path,omitempty"`
+	// LocalPath is a real absolute path on this machine — from the desktop
+	// native file dialog or the localhost web in-app file picker. No upload:
+	// the agent reads it in place. Honored only when the peer is loopback (the
+	// browser and agent share a filesystem); a remote client can't set it, so
+	// it can't make the agent read arbitrary server files.
+	LocalPath string `json:"local_path,omitempty"`
+	MimeType  string `json:"mime_type,omitempty"`
+}
+
+type wsMsgInterrupt struct {
+	SessionID string `json:"session_id"`
+}
+
+type wsMsgConfirmation struct {
+	// The frontend answers with `id` (app.js showConfirmModal); `conf_id`
+	// is accepted as a fallback for anything speaking the older shape.
+	ConfID       string `json:"id"`
+	LegacyConfID string `json:"conf_id"`
+	Result       string `json:"result"`
+}
+
+// wsMsgAskAnswer is one question's answer. The client never sends the chosen
+// option's preview — the server copies it out of the request it still holds,
+// so a large preview never travels back over the socket.
+type wsMsgAskAnswer struct {
+	Choices []string `json:"choices,omitempty"`
+	Custom  string   `json:"custom,omitempty"`
+	Notes   string   `json:"notes,omitempty"`
+}
+
+// wsMsgUserQuestionAnswer closes a whole question set in one frame: the
+// browser accumulates per-question drafts locally and submits once.
+// Outcome is "submitted", "clarify", or "rejected".
+type wsMsgUserQuestionAnswer struct {
+	QuestionID string           `json:"question_id"`
+	Outcome    string           `json:"outcome,omitempty"`
+	Answers    []wsMsgAskAnswer `json:"answers,omitempty"`
+}
+
+type wsMsgRetry struct {
+	SessionID string `json:"session_id"`
+}
+
+type wsMsgRollback struct {
+	SessionID string `json:"session_id"`
+}
+
+type wsMsgRunTask struct {
+	SessionID string `json:"session_id"`
+}
+
+// wsMsgRetractSteer retracts a mid-turn steer message the user queued but the
+// running turn hasn't consumed yet (the web equivalent of the TUI's ↑ recall).
+// Text is the match key — it mirrors Inbox.Remove's by-value semantics; PendingID
+// is opaque to the server and echoed back so the originating tab can identify
+// which ghost bubble to drop.
+type wsMsgRetractSteer struct {
+	SessionID string `json:"session_id"`
+	PendingID string `json:"pending_id"`
+	Text      string `json:"text"`
+}
+
+type wsMsgUpdateSettings struct {
+	Key   string `json:"key"`
+	Value any    `json:"value"`
+}
+
+// ─── Server → Client events (outbound) ────────────────────────────────────
+
+// wsOutEvent is the base envelope for every server-sent event.
+type wsOutEvent struct {
+	Type string `json:"type"`
+}
+
+type wsEventHistoryUserMessage struct {
+	Type      string   `json:"type"`
+	Content   string   `json:"content"`
+	CreatedAt int64    `json:"created_at,omitempty"`
+	Images    []string `json:"images,omitempty"`
+}
+
+type wsEventAssistantMessage struct {
+	Type    string   `json:"type"`
+	Content string   `json:"content"`
+	Files   []string `json:"files,omitempty"`
+}
+
+type wsEventToolCall struct {
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Args    any    `json:"args"`
+	Summary string `json:"summary,omitempty"`
+}
+
+type wsEventToolResult struct {
+	Type      string `json:"type"`
+	Result    string `json:"result"`
+	UIPayload any    `json:"ui_payload,omitempty"`
+}
+
+type wsEventToolError struct {
+	Type  string `json:"type"`
+	Error string `json:"error"`
+}
+
+type wsEventToolStdout struct {
+	Type  string   `json:"type"`
+	Lines []string `json:"lines"`
+}
+
+type wsEventOutput struct {
+	Type    string `json:"type"`
+	Content string `json:"content"`
+}
+
+type wsEventProgress struct {
+	Type         string  `json:"type"`
+	Message      string  `json:"message,omitempty"`
+	ProgressType string  `json:"progress_type,omitempty"`
+	Phase        string  `json:"phase"` // "active" | "done"
+	Status       string  `json:"status,omitempty"`
+	StartedAt    int64   `json:"started_at,omitempty"` // unix ms
+	Elapsed      float64 `json:"elapsed,omitempty"`
+}
+
+type wsEventComplete struct {
+	Type                 string  `json:"type"`
+	Iterations           int     `json:"iterations"`
+	Duration             float64 `json:"duration,omitempty"`
+	CacheStats           any     `json:"cache_stats,omitempty"`
+	AwaitingUserFeedback bool    `json:"awaiting_user_feedback,omitempty"`
+}
+
+type wsEventSessionUpdate struct {
+	Type            string  `json:"type"`
+	Status          string  `json:"status,omitempty"`
+	Tasks           int     `json:"tasks,omitempty"`
+	Latency         float64 `json:"latency,omitempty"`
+	ContextUsage    int     `json:"context_usage,omitempty"` // 0–100 context window %
+	WorkingDir      string  `json:"working_dir,omitempty"`
+	PermissionMode  string  `json:"permission_mode,omitempty"`
+	ReasoningEffort string  `json:"reasoning_effort,omitempty"`
+}
+
+type wsEventTodoUpdate struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+	Todos     any    `json:"todos"`
+}
+
+type wsEventSessionDeleted struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+}
+
+type wsEventSessionCreated struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+}
+
+// wsEventSessionGroupsChanged is broadcast globally after every session-group
+// registry write (group create/rename/delete/reorder, membership moves, pins,
+// project directory/notes edits). It deliberately carries no payload: clients
+// refetch GET /api/session-groups, so there is no second copy of the registry
+// shape to keep in sync.
+type wsEventSessionGroupsChanged struct {
+	Type string `json:"type"`
+}
+
+type wsEventRequestFeedback struct {
+	Type string `json:"type"`
+	// SessionID is required: the ws-dispatcher drops any event whose session_id
+	// doesn't match the active session, so without it a request_feedback event
+	// would always be discarded — the same session-less footgun #613 fixed for
+	// request_confirmation.
+	SessionID string   `json:"session_id"`
+	Question  string   `json:"question"`
+	Context   string   `json:"context,omitempty"`
+	Options   []string `json:"options,omitempty"`
+}
+
+type wsEventRequestConfirmation struct {
+	Type string `json:"type"`
+	// SessionID and the `id` tag match what the dispatcher actually reads
+	// (ev.session_id filter, ev.id answer key) — the old conf_id-only,
+	// session-less shape made the dispatcher drop the event, so the modal
+	// never appeared and every web permission ask timed out to deny.
+	SessionID string `json:"session_id"`
+	ConfID    string `json:"id"`
+	Message   string `json:"message"`
+	Kind      string `json:"kind"` // "yes_no" | "yes_no_always" | "ok"
+
+	// Detail fields for #1105: the modal used to show only Message ("Allow
+	// terminal?") with no indication of what's actually being approved. At
+	// most one of these is set, chosen by tool kind in permissionAskFrom.
+	ToolName string `json:"tool_name,omitempty"`
+	Command  string `json:"command,omitempty"` // terminal: the full command
+	Diff     string `json:"diff,omitempty"`    // edit_file: removed/added preview (tools.EditUIDiff)
+	Input    string `json:"input,omitempty"`   // other tools: sorted "key: value" lines
+}
+
+// wsEventConfirmationComplete tells all connected clients that a permission
+// confirmation has been answered (by any client). It lets secondary tabs close
+// the modal so the user isn't asked again for the same action.
+type wsEventConfirmationComplete struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+	ConfID    string `json:"id"`
+	Result    string `json:"result"`
+}
+
+// wsAskOption is one choice inside a wsAskQuestion. Label and description
+// stay separate so the browser can render the label prominently with its
+// description beneath; preview drives the two-column layout.
+type wsAskOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+	Preview     string `json:"preview,omitempty"`
+}
+
+// wsAskQuestion is one question of an ask_user_question set.
+type wsAskQuestion struct {
+	Question    string        `json:"question"`
+	Header      string        `json:"header"`
+	MultiSelect bool          `json:"multi_select"`
+	Options     []wsAskOption `json:"options,omitempty"`
+}
+
+type wsEventRequestUserQuestion struct {
+	Type string `json:"type"`
+	// SessionID is required by the dispatcher's session filter — without
+	// it the browser drops the event and the question modal never shows.
+	SessionID  string          `json:"session_id"`
+	QuestionID string          `json:"question_id"`
+	Questions  []wsAskQuestion `json:"questions"`
+	// Secret marks a masked-input question (replay secret collection): the
+	// browser renders a password field, and the answer is only ever returned
+	// to the runtime caller — it must not be echoed into the chat.
+	Secret bool `json:"secret,omitempty"`
+}
+
+// wsEventDismissUserQuestion tells the browser to close the question modal
+// that was opened by request_user_question. Sent when the question times out
+// or the agent context is cancelled before the user answers.
+type wsEventDismissUserQuestion struct {
+	Type       string `json:"type"`
+	SessionID  string `json:"session_id"`
+	QuestionID string `json:"question_id"`
+}
+
+// wsEventDismissConfirmation tells the browser to close the confirmation modal
+// that was opened by request_confirmation. Sent when the agent context is
+// cancelled (interrupt, timeout, session delete) before the user answers —
+// without it, the modal hangs forever on tabs that haven't answered yet.
+type wsEventDismissConfirmation struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+	ConfID    string `json:"id"`
+}
+
+// wsEventSessionActivity is a lightweight cross-session signal broadcast
+// globally (wsHub.broadcast("", ev)) rather than to a session's subscribers.
+// request_user_question / session_update / complete only reach tabs
+// currently subscribed to that exact session, so a tab looking at session B
+// never learns session A got a question or finished its turn. This event
+// carries no payload beyond "what happened, to which session" — the sidebar
+// badge and desktop-notification logic key off Kind, and don't need the full
+// question text or turn stats that already went out on the per-session path.
+type wsEventSessionActivity struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+	Kind      string `json:"kind"` // "question_pending" | "question_resolved" | "confirm_pending" | "confirm_resolved" | "turn_started" | "turn_ended" | "turn_complete"
+}
+
+type wsEventBackgroundTaskUpdate struct {
+	Type      string             `json:"type"`
+	SessionID string             `json:"session_id"`
+	Running   int                `json:"running"`
+	Tasks     []wsBackgroundTask `json:"tasks"`
+}
+
+type wsBackgroundTask struct {
+	HandleID string `json:"handle_id"`
+	Command  string `json:"command"`
+	Elapsed  int    `json:"elapsed"`
+}
+
+type wsEventBackgroundTaskNotice struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+	Command   string `json:"command"`
+	HandleID  string `json:"handle_id"`
+	Status    string `json:"status"`
+}
+
+type wsEventSubAgentNotice struct {
+	Type        string `json:"type"`
+	SessionID   string `json:"session_id"`
+	AgentID     string `json:"agent_id"`
+	Description string `json:"description"`
+	Kind        string `json:"kind"`
+	Status      string `json:"status"`
+}
+
+// wsEventLoopTickNotice announces that an in-session loop wakeup fired and
+// started a fresh turn. The web UI renders it as an inline "Loop tick"
+// scrollback notice, mirroring the TUI line — the loop prompt itself is
+// suppressed (wrapped as a <system-reminder> in formatLoopTick) so it no longer
+// duplicates as a user-message bubble on every tick.
+type wsEventLoopTickNotice struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+}
+
+// wsEventGoalNotice is the goal's scrollback line, mirroring the TUI's "●
+// Goal …" notices. Three kinds:
+//
+//	command  — the /goal reply, verbatim in Text.
+//	status   — a transition into complete / blocked / budget_limited /
+//	           usage_limited, worded in Text. Built server-side so it shares
+//	           agent's formatters with the TUI lines it mirrors; see
+//	           noticeGoalTransition for which changes qualify.
+//	start,
+//	continue — a continuation turn is beginning. No Text: the wording is fixed
+//	           and the frontend owns it, as it does for the loop tick.
+type wsEventGoalNotice struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+	Kind      string `json:"kind"`
+	Text      string `json:"text,omitempty"`
+	Level     string `json:"level,omitempty"`
+}
+
+type wsEventUserMessageQueueStatus struct {
+	Type    string `json:"type"`
+	Pending int    `json:"pending"`
+}
+
+type wsEventNextMessageSuggestion struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type wsEventDiff struct {
+	Type      string `json:"type"`
+	OldSize   int    `json:"old_size"`
+	NewSize   int    `json:"new_size"`
+	Diff      string `json:"diff"`
+	Truncated bool   `json:"truncated,omitempty"`
+}
+
+type wsEventFilePreview struct {
+	Type      string `json:"type"`
+	Path      string `json:"path"`
+	Operation string `json:"operation"`
+	IsNewFile bool   `json:"is_new_file,omitempty"`
+}
+
+type wsEventShellPreview struct {
+	Type    string `json:"type"`
+	Command string `json:"command"`
+}
+
+// wsInPromoteSyncTerminal is sent by the browser when the user clicks the
+// "Background" button on a running terminal tool card.
+type wsInPromoteSyncTerminal struct {
+	SessionID string `json:"session_id"`
+}
+
+// wsInKillBackground is sent by the browser when the user kills a process from
+// the background-process popover. HandleID is the BackgroundManager id shown
+// in background_tasks_update (e.g. "bg_1").
+type wsInKillBackground struct {
+	SessionID string `json:"session_id"`
+	HandleID  string `json:"handle_id"`
+}

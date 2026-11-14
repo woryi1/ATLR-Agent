@@ -1,0 +1,109 @@
+package tools
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/memory"
+)
+
+// WriteFileTool writes (or overwrites) a file with the given content. Parent
+// directories are created with mkdir -p semantics. File permissions default
+// to 0644.
+type WriteFileTool struct{}
+
+func (WriteFileTool) Definition() agent.ToolDefinition {
+	return agent.ToolDefinition{
+		Name: "write_file",
+		Description: "Write (or overwrite) a file. Parent directories are created " +
+			"automatically. Use edit_file for partial edits — write_file replaces " +
+			"the whole file. Absolute paths are preferred.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{
+					"type":        "string",
+					"description": "File path (absolute preferred).",
+				},
+				"content": map[string]any{
+					"type":        "string",
+					"description": "Full file content to write. Empty string is allowed.",
+				},
+			},
+			"required": []string{"path", "content"},
+		},
+	}
+}
+
+func (WriteFileTool) Execute(ctx context.Context, _ string, input map[string]any) (agent.ToolResult, error) {
+	path, err := requiredPath("write_file", input)
+	if err != nil {
+		return agent.ToolResult{Text: ""}, err
+	}
+	content, ok := input["content"].(string)
+	if !ok {
+		// Distinguish "not provided" from "empty string". JSON null → not a string.
+		return agent.ToolResult{Text: ""}, fmt.Errorf("write_file: content is required (string)")
+	}
+	abs, err := resolvePathIn(WorkingDir(ctx), path)
+	if err != nil {
+		return agent.ToolResult{Text: ""}, err
+	}
+
+	// Refuse only credentials the write would newly introduce. Overwriting a
+	// file that already holds the same secret (e.g. rewriting config.yml to add
+	// a field while preserving its api_key) carries nothing new and is allowed.
+	prior, _ := os.ReadFile(abs)
+	if secret := newSecretsIntroduced(string(prior), content); secret != "" {
+		return agent.ToolResult{Text: ""}, fmt.Errorf("write_file: refusing to write content that contains a %s. "+
+			"If this is genuinely intended (e.g. a test fixture), remove the live-credential "+
+			"shape or create the file outside the agent.", secret)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return agent.ToolResult{Text: ""}, fmt.Errorf("write_file: mkdir parent: %w", err)
+	}
+	// Stage the version being overwritten into the trash so a clobber that
+	// destroys uncommitted work is recoverable (no-op for a new file).
+	undoID := backupBeforeOverwrite(ctx, abs, "write_file")
+	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+		return agent.ToolResult{Text: ""}, fmt.Errorf("write_file: write %q: %w", path, err)
+	}
+
+	lineCount := strings.Count(content, "\n")
+	if len(content) > 0 && !strings.HasSuffix(content, "\n") {
+		lineCount++
+	}
+
+	const previewLines = 30
+	lines := strings.Split(content, "\n")
+	preview := content
+	previewTruncated := false
+	if len(lines) > previewLines {
+		preview = strings.Join(lines[:previewLines], "\n")
+		previewTruncated = true
+	}
+
+	ui := map[string]any{
+		"type":              "write",
+		"path":              abs,
+		"size_bytes":        len(content),
+		"line_count":        lineCount,
+		"preview":           preview,
+		"preview_truncated": previewTruncated,
+	}
+	// When an existing file was staged into the trash, surface its id so the UI
+	// can offer a one-click undo of the overwrite.
+	if undoID != "" {
+		ui["undo_id"] = undoID
+	}
+	if memory.IsMemoryPath(abs) {
+		memCount := memory.CountMemories(content)
+		return agent.ToolResult{Text: fmt.Sprintf("Saved %d %s to %s", memCount, pluralize(memCount, "memory", "memories"), filepath.Base(abs)), UI: ui}, nil
+	}
+	return agent.ToolResult{Text: fmt.Sprintf("Wrote %d bytes (%d lines) to %s", len(content), lineCount, abs), UI: ui}, nil
+}

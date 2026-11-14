@@ -1,0 +1,231 @@
+---
+title: 轻应用
+description: 把 Agent 生成的 HTML 页面保存为可复用的轻应用，随时打开，零 token 消耗。
+---
+
+import { Badge } from '@astrojs/starlight/components';
+
+<Badge text="New" variant="tip" /><br /><br />
+
+当你让 Agent 生成一个 HTML 页面——比如数据对账工具、格式转换器、日报模板——如果这个任务是**可重复**的，
+Agent 会主动提醒你把它保存为一个**轻应用**。保存后，你可以随时在 Web 界面里打开使用，不需要再消耗 LLM token。
+
+## 它是什么
+
+轻应用是 Agent 用纯前端技术（HTML + CSS + JS）写的页面，存储在本机 `~/.octo/light-apps/`
+目录下：
+
+```
+~/.octo/light-apps/<slug>/
+├── manifest.json   # 元数据：名称、描述、图标、创建时间
+├── index.html      # 页面本体
+└── …               # 可选：页面用相对路径引用的脚本、样式、图片、字体、模型、音视频
+```
+
+每个轻应用都是 octo 在 `/_apps/<slug>/` 下提供的普通网页：`localStorage` 跨访问持久（每个应用的数据
+和其他应用、和 octo 自己的设置互相隔开），下载和全屏可用，同目录文件用相对路径直接加载。它不需要后端。
+
+不管你怎么访问 octo，轻应用都能用：本机浏览器、桌面端，或者从别的设备经隧道（ngrok、cloudflared）
+或你自己的域名访问。从别的设备访问时照常用访问密钥登录，轻应用随之可用。手机 App 里在**配置 → 轻应用**。
+
+### 公开分享一个应用
+
+在「轻应用」页面，每张卡片上有一个「公开链接」开关。打开后，任何拿到链接的人都能不用访问密钥打开这个应用，
+包括应用目录下的所有文件，所以只对本来就打算给人看的应用这么做。打开后卡片上会显示链接，可以复制。
+在 `localhost` 上这个链接指向你自己的机器，要等 octo 能经隧道或域名访问时才能分享给别人。关掉开关，链接立即失效。
+
+轻应用和展示它的 octo 界面拥有同样的权限。只保留你自己让 Agent 做的应用。
+
+### 展示定时任务采集的数据
+
+随时间不断累积的数据，比如每小时查一次的价格、新发的帖子、每天的指标，Agent 会放进一个**具名数据库**：
+`~/.octo/databases/<name>.db` 这个 SQLite 文件，用 `sqlite` 工具写入。[定时任务](/docs/zh/guides/cron-tasks/)
+按计划往里追加数据，轻应用读出来画成表格或图表。两边只靠库名对接：定时任务不关心谁来展示它的数据，
+轻应用改名、重做也不会动到数据。
+
+可以一句话提出来，比如「每小时把 X 的价格记进数据库，再做一个轻应用画成折线图」，Agent 会把库、定时任务和
+轻应用一起建好。对话里预览的页面就已经显示真实数据，保存成轻应用后照样能显示。
+
+轻应用也可以改数据，比如标记已读、删掉一条脏数据。公开的轻应用只能读，而且只能读它 `manifest.json` 里
+`databases` 列出的库。
+
+你自己在应用里录入的记录，比如记账、待办、笔记，也是同样的道理：Agent 会把它们放进具名数据库，而不是浏览器的
+`localStorage`。`localStorage` 按访问地址分开存，桌面端、`localhost` 上的浏览器、经隧道访问的手机各看到一份
+不同的数据，Agent 也读不到。`localStorage` 只留给只跟当前这个界面有关的东西，比如上次打开的标签页、填了一半的表单。
+
+## 适用场景
+
+✅ **适合做成轻应用的任务**：
+- 重复性工具：数据对账、格式转换、CSV 合并
+- 模板生成器：日报模板、周报模板、清单生成
+- 输入→输出逻辑固定的任务：校验器、计算器、格式化工具
+- 需要离线可用的工具
+- 展示定时任务采集进具名数据库的数据（见上文）
+
+❌ **不适合做成轻应用**：
+- 一次性的分析或调研
+- 必须依赖 LLM 推理的任务
+- 每次使用都要跑服务端逻辑的工作流（用 [Skills](/docs/zh/guides/use-skills/) 或 [Workflows](/docs/zh/guides/workflows/) 代替）
+
+## 如何创建
+
+Agent 会自动判断一个 HTML 页面是否适合保存为轻应用。流程如下：
+
+1. 你在对话中让 Agent 生成一个 HTML 工具页面
+2. Agent 生成并预览后，如果判断任务可重复，会主动问：「保存为轻应用？以后随时在轻应用面板打开，不消耗 token。」
+3. 你确认后，Agent 用 `write_file` 直接把文件写入 `~/.octo/light-apps/<slug>/`
+4. slug 由小写字母、数字和连字符组成，从应用名称自动推导
+
+你也**不需要手动操作文件系统**——Agent 会自动完成一切。
+
+## 管理与使用
+
+在 Web 界面的导航栏点击「轻应用」，你会看到一个卡片网格，列出所有已保存的轻应用：
+
+- **打开**：在侧边栏的 Artifacts 面板中以 preview 模式渲染，可以直接交互使用
+- **编辑**：跳转到 Agent 对话，告诉 Agent 当前内容和修改需求，让它帮你更新
+- **删除**：确认后删除该轻应用
+
+Agent 生成的 HTML artifact 也可以在 Artifacts 面板中一键「保存到轻应用」。
+
+## 挂进界面
+
+轻应用默认住在「轻应用」页面，从 Artifacts 面板里打开。如果你做了一个天天都要用的——
+画板、计算器、看板——给它的 `manifest.json` 加一个 `mount` 字段，它就能在界面里有个固定位置。
+
+```json
+{
+  "slug": "sketch",
+  "name": "画板",
+  "description": "随手画图的画布",
+  "icon": "🎨",
+  "mount": "view"
+}
+```
+
+| `mount` | 出现在哪 |
+| --- | --- |
+| *不写* | 只在「轻应用」页面出现——默认行为，也是所有现有应用的行为。 |
+| `"view"` | 左侧导航多一项，点进去整页渲染。 |
+
+`"view"` 是唯一的取值。右侧面板属于会话——会话的制品和它的 diff——而应用不是会话的一部分；
+还写着面板槽位的应用会和其他应用一样落在「轻应用」页面上。
+
+最方便的做法是在「轻应用」页面，打开应用卡片上的「显示在左侧导航」开关，入口会立刻出现或消失。
+也可以自己手写这个字段，或者在对话里让 Agent 改。Agent 不会主动加：一个应用值不值得在你的界面里占个固定位置，
+这是你的判断，不是它的。
+
+### 一个完整的例子
+
+一个占一整页的画板。两个文件，不需要构建：
+
+```json
+// ~/.octo/light-apps/sketch/manifest.json
+{
+  "slug": "sketch",
+  "name": "画板",
+  "description": "随手画图的画布",
+  "icon": "🎨",
+  "created_at": "2026-09-20T00:00:00Z",
+  "mount": "view"
+}
+```
+
+```html
+<!-- ~/.octo/light-apps/sketch/index.html -->
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light; --bg: #fff; --fg: #1d1d1f; --line: #0001; }
+  :root[data-theme="dark"] { color-scheme: dark; --bg: #16181c; --fg: #e8e8ea; --line: #fff2; }
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column;
+         background: var(--bg); color: var(--fg); font: 13px system-ui, sans-serif; }
+  .bar { display: flex; gap: 10px; align-items: center; padding: 8px 12px;
+         border-bottom: 1px solid var(--line); }
+  canvas { flex: 1; touch-action: none; cursor: crosshair; }
+  button { font: inherit; color: inherit; background: none; cursor: pointer;
+           border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; }
+</style>
+
+<div class="bar">
+  <input id="colour" type="color" value="#0e7490">
+  <input id="size" type="range" min="1" max="24" value="3">
+  <button id="clear">Clear</button>
+  <button id="save">Save PNG</button>
+</div>
+<canvas id="c"></canvas>
+
+<script>
+  // The host passes the resolved theme on the URL, so the app can match the UI.
+  const theme = new URLSearchParams(location.search).get('theme')
+  if (theme === 'dark') document.documentElement.dataset.theme = 'dark'
+
+  const c = document.getElementById('c')
+  const ctx = c.getContext('2d')
+  let drawing = false
+
+  // Resizing clears the bitmap, so the strokes are re-drawn from the copy the
+  // canvas held before the resize.
+  function fit() {
+    const snap = document.createElement('canvas')
+    snap.width = c.width; snap.height = c.height
+    if (c.width) snap.getContext('2d').drawImage(c, 0, 0)
+    c.width = c.clientWidth * devicePixelRatio
+    c.height = c.clientHeight * devicePixelRatio
+    ctx.scale(devicePixelRatio, devicePixelRatio)
+    ctx.lineCap = ctx.lineJoin = 'round'
+    if (snap.width) ctx.drawImage(snap, 0, 0, snap.width / devicePixelRatio, snap.height / devicePixelRatio)
+  }
+  addEventListener('resize', fit)
+  fit()
+
+  c.addEventListener('pointerdown', e => {
+    drawing = true
+    c.setPointerCapture(e.pointerId)
+    ctx.beginPath()
+    ctx.moveTo(e.offsetX, e.offsetY)
+  })
+  c.addEventListener('pointermove', e => {
+    if (!drawing) return
+    ctx.strokeStyle = document.getElementById('colour').value
+    ctx.lineWidth = document.getElementById('size').value
+    ctx.lineTo(e.offsetX, e.offsetY)
+    ctx.stroke()
+  })
+  c.addEventListener('pointerup', () => {
+    drawing = false
+  })
+
+  document.getElementById('clear').onclick = () => {
+    ctx.clearRect(0, 0, c.width, c.height)
+  }
+
+  // The plain <a download> idiom: the host turns it into a browser download or
+  // the OS save dialog in the desktop app.
+  document.getElementById('save').onclick = () => {
+    const a = document.createElement('a')
+    a.download = 'sketch.png'
+    a.href = c.toDataURL('image/png')
+    a.click()
+  }
+</script>
+```
+
+刷新 Web UI，**画板**就出现在左侧导航里，图标就是 manifest 里那个 emoji。
+
+## 技术约束
+
+Agent 在生成轻应用时遵守以下规则：
+
+- 页面需要的文件放在应用目录里，用相对路径引用，不以 `/` 开头
+- 只有确实需要成熟的库时才从 CDN 引入，并固定版本号——那个站点访问不了时应用会整个空白
+- 页面里不调用 octo 自己的 API
+- 文件处理用 `FileReader` + `<input type="file">`
+- 导出文件（生成的图片、转换后的文件等）用标准的 `<a download>` 写法，宿主负责落盘：浏览器里走正常下载，桌面端弹出系统保存对话框
+- 页面尺寸跟着框走，不要写死像素高：同一个应用会出现在 ~420px 宽的侧栏、整屏的挂载页，以及（作为启动页 hero 时）可能只有 ~300px 高的框里。用 flex 纵向布局让主区域撑满高度（保留一个 `min-height`），并在 `@media (max-height: …)` 下收起次要区块——主元素写死像素高，在任何比你想的更矮的框里都会被裁掉
+- octo 加载页面时会带上 `?theme=dark` 或 `?theme=light`（用户在 Web UI 选的主题，未必等于系统主题）。要读它并据此配色，且在页面绘制之前就应用；切换主题时整个 frame 会重新加载，所以只在加载时读一次就够
+- 图标用 emoji 或内联 SVG
+- 遵循 `artifact-design` skill 的布局与配色规范
+
+这些约束 Agent 都清楚——你只需要告诉它要做什么，它会自动处理技术细节。

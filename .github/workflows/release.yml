@@ -1,0 +1,442 @@
+name: Release
+
+# Cut a release by pushing a SemVer tag:
+#   git tag v0.5.0 && git push origin v0.5.0
+# goreleaser then builds every target and publishes the GitHub Release. It runs
+# on a macOS runner because the darwin target needs CGO for the computer-use
+# substrate — see the header of .goreleaser.yaml.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # required to create the GitHub Release + upload assets
+
+jobs:
+  goreleaser:
+    name: goreleaser
+    # macOS, not ubuntu: the darwin build needs CGO (see .goreleaser.yaml's
+    # darwin override). The Linux and Windows targets are CGO_ENABLED=0 pure Go,
+    # so they cross-compile from here unchanged.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # full history + tags so goreleaser can build the changelog
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+          cache: true
+
+      # The CLI go:embeds the web UI from internal/server/webdist, which is
+      # gitignored — build it from source so every goreleaser target embeds
+      # the real assets.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: '~> v2'
+          # -p 1 serializes builds: the per-target rg-embed hook writes a single
+          # shared binaries/rg file, so parallel targets would clobber it.
+          args: release --clean -p 1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Build the double-click Windows installers (octo-setup.exe for x64,
+  # octo-setup-arm64.exe for Windows-on-ARM) from the binaries goreleaser just
+  # published, and attach them to the same release. Kept separate from
+  # goreleaser because Inno Setup is a Windows-only toolchain. The desktop shell
+  # is pure-Go (WebView2, no CGO), so the arm64 leg cross-compiles on the x64
+  # runner — GOARCH drives the target for the desktop build and the embedded
+  # ripgrep. The MVP installer is unsigned — see dev-docs/windows-onboarding-design.md.
+  windows-installer:
+    name: windows installer (${{ matrix.arch }})
+    needs: goreleaser
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, uvarch: x86_64,  archallowed: x64compatible, out: octo-setup }
+          - { arch: arm64, uvarch: aarch64, archallowed: arm64,         out: octo-setup-arm64 }
+    steps:
+      - uses: actions/checkout@v7 # for packaging/windows/octo.iss + LICENSE.txt
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+          cache-dependency-path: cmd/octo-desktop/go.sum
+
+      # The desktop GUI built below go:embeds the web UI (gitignored) — build
+      # it from source first.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Stage the released binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          gh release download "${{ github.ref_name }}" --pattern "octo_${version}_windows_${{ matrix.arch }}.zip" --dir dl
+          Expand-Archive -Path "dl\octo_${version}_windows_${{ matrix.arch }}.zip" -DestinationPath dl\extract -Force
+          $exe = Get-ChildItem -Path dl\extract -Recurse -Filter octo.exe | Select-Object -First 1
+          Copy-Item $exe.FullName staging\octo.exe
+          Copy-Item LICENSE.txt staging\LICENSE.txt
+          "version=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Bundle ripgrep so the desktop app's grep tool has an `rg` to shell out
+      # to (mirrors `make build`; the app can't rely on the user's PATH).
+      # -Arch is the target GOARCH so the arm64 build embeds arm64 rg.
+      - name: Embed ripgrep
+        shell: pwsh
+        run: pwsh scripts/embed-rg-windows.ps1 -Arch ${{ matrix.arch }}
+
+      # Build the desktop GUI (nested module; embeds the web UI built above).
+      # -H windowsgui so no console window flashes behind the app.
+      # -tags embedrg go:embeds the rg fetched above. Pure-Go (WebView2, no
+      # CGO), so arm64 cross-compiles cleanly from the x64 runner via GOARCH.
+      # The .syso embeds the icon and manifest into the .exe; it must be
+      # generated in the package directory before go build picks it up.
+      - name: Generate Windows icon resource
+        shell: pwsh
+        working-directory: cmd/octo-desktop
+        run: go run ./build/windows/generate-syso ${{ matrix.arch }} build/windows/icon.ico build/windows/wails.exe.manifest
+
+      - name: Build desktop app
+        shell: pwsh
+        working-directory: cmd/octo-desktop
+        env:
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+        # Inject Version/Commit alongside -H windowsgui so the in-app update
+        # check recognizes a real release build — without them
+        # internal/upgrade.Eligible sees an empty Commit and the app reports
+        # "up to date" forever. $env:version is set by the staging step above.
+        run: |
+          $commit = git rev-parse --short HEAD
+          $pkg = "github.com/open-octo/octo-agent/internal/version"
+          go build -tags embedrg -ldflags "-H windowsgui -X $pkg.Version=$env:version -X $pkg.Commit=$commit" -o ..\..\staging\octo-desktop.exe .
+
+      # Fetches uv.exe from its upstream GitHub release so the installer can
+      # bundle it — see octo.iss's [Files] section. Native PowerShell rather
+      # than `make bundle-tools-windows` (which does the same fetch and is
+      # kept for local/macOS/Linux dev use — see the Makefile):
+      # windows-latest runners aren't guaranteed to have GNU Make, and this
+      # avoids adding a `choco install make` dependency to the release
+      # pipeline just for one curl+unzip call. The version here must be kept
+      # in sync with UV_VERSION in the Makefile.
+      - name: Fetch bundled uv
+        shell: pwsh
+        run: |
+          $uvVersion = "0.11.26"
+          New-Item -ItemType Directory -Force -Path dl\uv | Out-Null
+
+          Invoke-WebRequest -Uri "https://github.com/astral-sh/uv/releases/download/$uvVersion/uv-${{ matrix.uvarch }}-pc-windows-msvc.zip" -OutFile dl\uv.zip
+          Expand-Archive -Path dl\uv.zip -DestinationPath dl\uv -Force
+          Copy-Item dl\uv\uv.exe staging\uv.exe
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y # not preinstalled on the runner image
+
+      - name: Compile installer
+        shell: pwsh
+        # ArchAllowed/OutputName pin the installer to the target CPU and give
+        # each arch a distinct output name (see octo.iss).
+        run: |
+          # Source paths in the .iss resolve relative to the script's own dir,
+          # so SourceDir / OutputDir must be absolute.
+          $staging = Join-Path $PWD 'staging'
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            "/DAppVersion=$env:version" "/DSourceDir=$staging" `
+            "/DArchAllowed=${{ matrix.archallowed }}" "/DOutputName=${{ matrix.out }}" `
+            "/O$staging" packaging\windows\octo.iss
+
+      # Installers are shipped unsigned — see SECURITY.md "Code signing policy".
+      # The bare .exe is what the desktop app's in-place updater downloads and
+      # swaps over itself (the exe is self-contained: web UI + ripgrep are
+      # go:embed'd, so replacing it alone is a complete upgrade). Its name must
+      # stay in sync with the desktop shell's asset matcher (cmd/octo-desktop).
+      - name: Attach installer + updater exe to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          Copy-Item staging\octo-desktop.exe "staging\octo-desktop-windows-${{ matrix.arch }}.exe"
+          gh release upload "${{ github.ref_name }}" staging\${{ matrix.out }}.exe "staging\octo-desktop-windows-${{ matrix.arch }}.exe" --clobber
+
+  # Build the double-click macOS installer (octo-setup.pkg) from the universal
+  # (amd64+arm64) binary goreleaser just published, and attach it to the same
+  # release. One .pkg covers both Intel and Apple Silicon. Unsigned for now —
+  # see the README "Install" section for the Gatekeeper bypass this implies.
+  macos-installer:
+    name: macos installer
+    needs: goreleaser
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7 # for packaging/macos/ + LICENSE.txt
+
+      - uses: actions/setup-go@v7 # build.sh builds the desktop app from source
+        with:
+          go-version: '1.25'
+          cache-dependency-path: cmd/octo-desktop/go.sum
+
+      # The desktop app built by build.sh go:embeds the web UI (gitignored) —
+      # build it from source first.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Stage the released binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p staging dl
+          gh release download "$GITHUB_REF_NAME" --pattern "octo_${version}_darwin_all.tar.gz" --dir dl
+          tar -xzf "dl/octo_${version}_darwin_all.tar.gz" -C dl octo
+          cp dl/octo staging/octo
+          cp LICENSE.txt staging/LICENSE.txt
+          echo "version=$version" >> "$GITHUB_ENV"
+
+      # Fetches uv (universal amd64+arm64 binary, lipo'd together) from its
+      # upstream GitHub release (pinned version in the Makefile) so build.sh
+      # can bundle it into the pkg payload — see
+      # packaging/macos/scripts/postinstall for where it lands at install
+      # time.
+      - name: Fetch bundled uv
+        run: make bundle-tools-macos
+
+      - name: Copy bundled tools into the installer staging dir
+        run: cp dist/bundled-tools/darwin-universal/uv staging/uv
+
+      - name: Build installer
+        env:
+          AppVersion: ${{ env.version }}
+          SourceDir: ${{ github.workspace }}/staging
+          OutDir: ${{ github.workspace }}/staging
+        run: packaging/macos/build.sh
+
+      # The .app zip is what the desktop app's in-place updater downloads and
+      # swaps over the installed bundle (build.sh leaves the universal, ad-hoc
+      # signed Octo.app at the repo root). ditto preserves the bundle's symlinks
+      # and permissions where plain zip would not. Its name must stay in sync
+      # with the desktop shell's asset matcher (cmd/octo-desktop).
+      - name: Attach installer + updater app zip to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ditto -c -k --keepParent Octo.app staging/Octo-darwin-universal.zip
+          gh release upload "$GITHUB_REF_NAME" staging/octo-setup.pkg staging/Octo-darwin-universal.zip --clobber
+
+  # Build the Linux desktop AppImages (Octo-x86_64.AppImage,
+  # Octo-aarch64.AppImage) and attach them. The AppImage is the GUI + bundled
+  # uv; GTK4/WebKitGTK 6.0 come from the host (the AppRun launcher preflights
+  # them). Linux CLI users keep using the tarball. Each arch builds natively on
+  # its own runner — the shell links GTK4/WebKitGTK via CGO, so amd64 uses
+  # ubuntu-latest and arm64 uses ubuntu-24.04-arm.
+  linux-appimage:
+    name: linux appimage (${{ matrix.arch }})
+    needs: goreleaser
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    arch: amd64, apparch: x86_64,  uvarch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64, apparch: aarch64, uvarch: aarch64 }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+          cache-dependency-path: cmd/octo-desktop/go.sum
+
+      # The AppImage build go:embeds the web UI (gitignored) — build it from
+      # source first.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install webview deps
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev libsoup-3.0-dev
+
+      # Stage the released linux CLI for this arch so package-desktop-linux.sh
+      # bundles it into the AppImage — the app seeds it to ~/.local/bin on first
+      # launch, so a terminal has `octo` like the mac/win installers provide.
+      - name: Stage the released CLI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dl
+          gh release download "$GITHUB_REF_NAME" --pattern "octo_${version}_linux_${{ matrix.arch }}.tar.gz" --dir dl
+          tar -xzf "dl/octo_${version}_linux_${{ matrix.arch }}.tar.gz" -C dl octo
+          echo "OCTO_CLI=$PWD/dl/octo" >> "$GITHUB_ENV"
+
+      - name: Fetch bundled uv
+        run: |
+          uvVersion=0.11.26
+          mkdir -p dl
+          curl -fsSL -o dl/uv.tar.gz "https://github.com/astral-sh/uv/releases/download/$uvVersion/uv-${{ matrix.uvarch }}-unknown-linux-gnu.tar.gz"
+          tar -xzf dl/uv.tar.gz -C dl
+          echo "UV_BINARY=$PWD/dl/uv-${{ matrix.uvarch }}-unknown-linux-gnu/uv" >> "$GITHUB_ENV"
+
+      - name: Build AppImage
+        # Pass the release version so the packaged binary carries clean release
+        # metadata (see the script) and the in-app update check works. The
+        # script names its output by host arch (Octo-x86_64 / Octo-aarch64).
+        run: bash scripts/package-desktop-linux.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Attach AppImage to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" Octo-${{ matrix.apparch }}.AppImage --clobber
+
+  # Build the Android app (octo-android.apk) and attach it, for users to
+  # download and install directly. It is the Capacitor shell around the web UI
+  # (mobile/), signed with the release key from the repo secrets: every
+  # release must carry the same signature, or Android refuses to install it
+  # over the previous one. The version comes from the tag (wire-native
+  # --version), so each release's versionCode is higher than the last.
+  android-apk:
+    name: android apk
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The app bundles the web UI (gitignored) — build it from source first.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            mobile/package-lock.json
+
+      # Capacitor 8's Android Gradle plugin needs JDK 21.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build signed APK
+        working-directory: mobile
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ] || [ -z "$ANDROID_KEY_ALIAS" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS secrets are not set"
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          version="${version%%-*}"   # a pre-release suffix is not a valid versionName input
+          npm ci
+          npm run bundle-web
+          npx cap add android
+          node scripts/wire-native.mjs --android --version "$version"
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          # apksigner lives in the SDK's build-tools, which is not on PATH.
+          export PATH="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1):$PATH"
+          # The release key is a PKCS12 store: one password for store and key.
+          npx cap build android \
+            --keystorepath "$RUNNER_TEMP/release.jks" \
+            --keystorepass "$ANDROID_KEYSTORE_PASSWORD" \
+            --keystorealias "$ANDROID_KEY_ALIAS" \
+            --keystorealiaspass "$ANDROID_KEYSTORE_PASSWORD" \
+            --androidreleasetype APK --signing-type apksigner
+          rm -f "$RUNNER_TEMP/release.jks"
+          cp android/app/build/outputs/apk/release/app-release-signed.apk "$RUNNER_TEMP/octo-android.apk"
+
+      - name: Attach APK to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/octo-android.apk" --clobber
+
+  # Publish desktop-checksums.txt covering the desktop artifacts the jobs above
+  # attached. goreleaser's checksums.txt only covers its own (CLI) assets; the
+  # desktop app's in-place updater fetches this sidecar to verify the artifact
+  # it downloads before swapping itself — and refuses to install an artifact
+  # the sidecar doesn't cover, so this job missing means in-place updates fall
+  # back to the download page for the whole release. One aggregate job (rather
+  # than each job appending) because concurrent uploads of the same asset would
+  # clobber each other.
+  #
+  # Ops note: re-running a packaging job re-uploads its artifact with new bytes
+  # — re-run this job afterwards too, or the stale digests will fail-close
+  # every in-place update against the release.
+  desktop-checksums:
+    name: desktop checksums
+    needs: [windows-installer, macos-installer, linux-appimage]
+    # Run as long as the swappable (mac/win) artifacts exist: the AppImage
+    # never in-place updates, so a failed linux leg must not take the sidecar
+    # — and with it every mac/win in-place update — down with it.
+    if: ${{ !cancelled() && needs.windows-installer.result == 'success' && needs.macos-installer.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checksum desktop release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p assets && cd assets
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern 'Octo-darwin-universal.zip' \
+            --pattern 'octo-desktop-windows-*.exe'
+          # AppImage sums are informational (no in-place update on Linux);
+          # don't fail the sidecar when the linux leg produced no assets.
+          gh release download "$GITHUB_REF_NAME" --pattern 'Octo-*.AppImage' \
+            || echo "AppImages absent; sums cover mac/win only"
+          sha256sum * > ../desktop-checksums.txt
+          cd ..
+          cat desktop-checksums.txt
+          gh release upload "$GITHUB_REF_NAME" desktop-checksums.txt --clobber

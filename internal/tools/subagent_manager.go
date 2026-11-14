@@ -1,0 +1,858 @@
+package tools
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/config"
+	"github.com/open-octo/octo-agent/internal/panics"
+)
+
+// maxSubAgentResultBytes caps how much result text is retained per async sub-agent.
+const maxSubAgentResultBytes = 1 << 20 // 1 MiB
+
+// maxSubAgentEvents caps how many tool-level events are retained per sub-agent.
+// Old events are dropped in FIFO order so late-joining panels see the most
+// recent tool trail without unbounded memory growth.
+const maxSubAgentEvents = 200
+
+// SubAgentNotification is delivered to the onExit hook when a sub-agent
+// finishes a task (spawn) or replies to a message (continue).
+type SubAgentNotification struct {
+	AgentID      string // e.g. "agent_1"
+	Description  string // human-readable label from sub_agent
+	Kind         string // "spawn_done" | "message_reply"
+	Result       string // final reply text
+	InputTokens  int
+	OutputTokens int
+	// StopReason carries why the sub-agent stopped: "end_turn"/"tool_use" (and
+	// other provider sentinels) for a normal completion, "max_turns"/"max_tokens"
+	// when a loop/output budget was exhausted, and empty when the run errored out.
+	// The parent uses this to decide whether to continue.
+	StopReason string
+}
+
+// SubAgentInfo is a snapshot of a sub-agent for listing.
+type SubAgentInfo struct {
+	ID          string
+	Description string
+	AgentType   string
+	Start       time.Time
+	Busy        bool
+	Events      []SubAgentEvent
+}
+
+// asyncSubAgent tracks one detached sub-agent launched via SubAgentManager.
+type asyncSubAgent struct {
+	id          string
+	description string
+	agentType   string
+	cancel      context.CancelFunc
+	start       time.Time
+
+	mu           sync.Mutex
+	busy         bool   // true while processing a Spawn or Continue
+	pending      string // queued message waiting to be sent
+	backingID    string // Spawner-side id (the resumable child's handle); set once Spawn returns. Continue/Send address the child by this, not by the manager's agent_N.
+	result       string // latest result (truncated to maxSubAgentResultBytes)
+	exited       bool   // true if the sub-agent context was cancelled / killed
+	exitErr      error
+	stopReason   string // "max_turns" when the loop budget was exhausted
+	inputTokens  int
+	outputTokens int
+	events       []SubAgentEvent // retained tool-level events for late-joining clients
+}
+
+func (a *asyncSubAgent) recordEvent(ev SubAgentEvent) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.events) >= maxSubAgentEvents {
+		// Drop oldest event to bound memory; panels care most about recent tools.
+		copy(a.events, a.events[1:])
+		a.events = a.events[:len(a.events)-1]
+	}
+	a.events = append(a.events, ev)
+}
+
+func (a *asyncSubAgent) listEvents() []SubAgentEvent {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]SubAgentEvent, len(a.events))
+	copy(out, a.events)
+	return out
+}
+
+func (a *asyncSubAgent) setResult(result string, inputTokens, outputTokens int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.result = truncateSubAgentResult(result)
+	a.inputTokens = inputTokens
+	a.outputTokens = outputTokens
+}
+
+func (a *asyncSubAgent) setBusy(v bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.busy = v
+}
+
+func (a *asyncSubAgent) setDone(err error, stopReason string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err != nil {
+		a.exited = true
+	}
+	a.exitErr = err
+	if stopReason != "" {
+		a.stopReason = stopReason
+	}
+	a.busy = false
+}
+
+func (a *asyncSubAgent) setExited(err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.exited = true
+	a.exitErr = err
+	a.busy = false
+}
+
+func (a *asyncSubAgent) readState() (result, status string, busy, exited bool, stopReason string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	result = a.result
+	busy = a.busy
+	exited = a.exited
+	stopReason = a.stopReason
+	if a.exited {
+		if a.exitErr != nil {
+			status = "exited: " + a.exitErr.Error()
+		} else {
+			status = "exited: 0"
+		}
+	} else if a.busy {
+		status = "running"
+	} else {
+		status = "idle"
+	}
+	return
+}
+
+func truncateSubAgentResult(s string) string {
+	if len(s) <= maxSubAgentResultBytes {
+		return s
+	}
+	return s[:maxSubAgentResultBytes] + "\n...[truncated]"
+}
+
+// defaultSubAgentMgr is the process-wide manager used by the built-in tools
+// when no manager is injected.
+var (
+	defaultSubAgentMgrMu sync.RWMutex
+	defaultSubAgentMgr   *SubAgentManager
+)
+
+// SetDefaultSubAgentManager registers the global manager used by AgentTool
+// when no local manager is set.
+func SetDefaultSubAgentManager(m *SubAgentManager) {
+	defaultSubAgentMgrMu.Lock()
+	defaultSubAgentMgr = m
+	defaultSubAgentMgrMu.Unlock()
+}
+
+// DefaultSubAgentManager returns the process-wide manager currently
+// registered, or nil if none.
+func DefaultSubAgentManager() *SubAgentManager {
+	defaultSubAgentMgrMu.RLock()
+	defer defaultSubAgentMgrMu.RUnlock()
+	return defaultSubAgentMgr
+}
+
+// subAgentManagerEnabled reports whether a SubAgentManager is registered,
+// which is required for the Agent tool.
+func subAgentManagerEnabled() bool {
+	defaultSubAgentMgrMu.RLock()
+	defer defaultSubAgentMgrMu.RUnlock()
+	return defaultSubAgentMgr != nil
+}
+
+// defaultMaxConcurrentSubAgents caps how many async sub-agents may run at
+// once, so a model that fires off a large fan-out in one round can't spawn an
+// unbounded number of concurrent agent loops (each making API calls).
+// New spawns past the cap are rejected with a clear error so the model waits
+// for some to finish; it does not bound resumed (Send/Continue) rounds, which
+// are limited by the live-child cap. tools.sub_agent_max_concurrency
+// overrides it.
+const defaultMaxConcurrentSubAgents = 16
+
+// maxConcurrentSubAgents resolves the configured sub-agent cap.
+func maxConcurrentSubAgents() int {
+	cfg, _ := config.LoadCached()
+	if n := cfg.Tools.SubAgentMaxConcurrency; n > 0 {
+		return n
+	}
+	return defaultMaxConcurrentSubAgents
+}
+
+// SubAgentManager owns the set of async sub-agents for a session.
+// Methods are safe for concurrent use.
+type SubAgentManager struct {
+	mu          sync.Mutex
+	agents      map[string]*asyncSubAgent
+	seq         int
+	spawner     Spawner
+	onExit      func(SubAgentNotification)
+	onEvent     func(SubAgentEvent)
+	synchronous bool
+	activeAsync int // running async spawns, for the concurrency cap
+	// maxConcurrent is the cap for both activeAsync and syncSem, read once at
+	// construction so the two gates always agree.
+	maxConcurrent int
+
+	// syncSem bounds how many synchronous (RunSync) sub-agents run at once. A
+	// single assistant turn can dispatch a whole batch of foreground sub_agent
+	// calls, and dispatchTools now runs them concurrently — without this a large
+	// fan-out would open an unbounded number of child agent loops (and provider
+	// connections) at once. Excess RunSync calls block here until a slot frees,
+	// mirroring the maxConcurrent guard the async Start path enforces by
+	// rejection. Buffered to maxConcurrent; nil-safe is not required
+	// since NewSubAgentManager always sets it.
+	syncSem chan struct{}
+}
+
+// NewSubAgentManager returns an empty manager.
+func NewSubAgentManager(spawner Spawner) *SubAgentManager {
+	limit := maxConcurrentSubAgents()
+	return &SubAgentManager{
+		agents:        map[string]*asyncSubAgent{},
+		spawner:       spawner,
+		maxConcurrent: limit,
+		syncSem:       make(chan struct{}, limit),
+	}
+}
+
+// Spawner returns the spawner backing this manager. Exposed so tools that
+// delegate to sub-agents (e.g. workflow) can resolve the spawner from the
+// ctx-scoped manager rather than relying on the process-global singleton.
+func (m *SubAgentManager) Spawner() Spawner {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.spawner
+}
+
+// SetSynchronous selects the sub_agent dispatch model. It is the only thing
+// that decides whether a child runs in the background or inline — the tool
+// does not offer the model that choice.
+//
+// The default (false) is the async path: Start returns immediately and the
+// reply arrives via onExit, which the transport re-injects as a follow-up
+// turn — the TUI enqueues into the agent Inbox, and the web/IM servers kick
+// an idle follow-up turn on completion (deliverModelNote /
+// runChannelIdleTurn). The parent turn ends as soon as the child is
+// dispatched, so the user can keep talking while it works.
+//
+// True is for a transport with no follow-up-turn channel — the CLI one-shot,
+// whose single turn is the whole process. A background completion would have
+// nowhere to land there, so sub_agent blocks the turn on RunSync and returns
+// the child's reply directly as the tool_result. The server marks its
+// process-global fallback manager synchronous too (enableSubAgentTools), but
+// every production server turn stamps a session-scoped manager into ctx and
+// resolveSubAgentManager prefers that one, so the fallback is a backstop
+// rather than a live path.
+//
+// Set once at startup, before any turn runs.
+func (m *SubAgentManager) SetSynchronous(v bool) {
+	m.mu.Lock()
+	m.synchronous = v
+	m.mu.Unlock()
+}
+
+// Synchronous reports whether the manager runs sub-agents inline (see
+// SetSynchronous).
+func (m *SubAgentManager) Synchronous() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.synchronous
+}
+
+// RunSync spawns a sub-agent and blocks until it completes, returning its
+// reply. Used by the synchronous sub_agent path; the spawner stamps the
+// sub-agent marker and keeps the child resumable for a later ContinueSync.
+// When an onEvent hook is registered the child's tool-level activity is
+// streamed the same way background sub-agents are, so live panels work for
+// both dispatch modes.
+func (m *SubAgentManager) RunSync(ctx context.Context, req SpawnRequest) (SpawnResult, error) {
+	if m.spawner == nil {
+		return SpawnResult{}, fmt.Errorf("subagent: no spawner configured")
+	}
+
+	// Bound concurrent foreground sub-agents (see syncSem): a batch dispatched
+	// in one turn runs concurrently, so cap how many child agent loops run at
+	// once. Blocks until a slot frees; a cancelled turn stops waiting.
+	select {
+	case m.syncSem <- struct{}{}:
+		defer func() { <-m.syncSem }()
+	case <-ctx.Done():
+		return SpawnResult{}, ctx.Err()
+	}
+
+	// Run the spawn on a background context so a user promotion can detach it
+	// from the turn context and let it keep running. Create the context first
+	// so the agent entry is never observed with a nil cancel func.
+	spawnCtx, cancel := context.WithCancel(context.Background())
+
+	// Allocate a real agent_N id up front. If the user promotes this sync run,
+	// the same id becomes the background handle; if it completes inline, the
+	// temporary entry is reaped.
+	m.mu.Lock()
+	m.seq++
+	id := fmt.Sprintf("agent_%d", m.seq)
+	a := &asyncSubAgent{
+		id:          id,
+		description: req.Description,
+		agentType:   req.AgentType,
+		cancel:      cancel,
+		start:       time.Now(),
+		busy:        true,
+	}
+	m.agents[id] = a
+	m.mu.Unlock()
+
+	sink := m.eventSink(id, req.Description, req.AgentType)
+	if sink != nil {
+		spawnCtx = WithSubAgentEventSink(spawnCtx, sink)
+		sink(SubAgentEvent{Kind: "started"})
+	}
+
+	type outcome struct {
+		res SpawnResult
+		err error
+	}
+	done := make(chan outcome, 1)
+
+	go func() {
+		var o outcome
+		// The select below blocks on `done` while holding a sync-concurrency
+		// slot, so the outcome has to be delivered even when the spawner
+		// panics: recovering without sending would turn a crash into a tool
+		// call that never returns and a slot that is never released.
+		defer func() {
+			if err := panics.Error(recover(), "sub-agent spawn", "agent_id", id); err != nil {
+				o = outcome{err: err}
+				a.setDone(err, "")
+			}
+			done <- o
+		}()
+		res, err := m.spawner.Spawn(spawnCtx, req)
+		if err == nil {
+			a.mu.Lock()
+			a.backingID = res.AgentID
+			a.mu.Unlock()
+			a.setResult(res.Reply, res.InputTokens, res.OutputTokens)
+		}
+		stopReason := ""
+		if err == nil {
+			stopReason = res.StopReason
+		}
+		a.setDone(err, stopReason)
+		o = outcome{res: res, err: err}
+	}()
+
+	select {
+	case o := <-done:
+		// Normal synchronous completion (or spawner error). Reap the temporary
+		// entry: the result has been returned inline.
+		if sink != nil {
+			sink(SubAgentEvent{Kind: "done"})
+		}
+		m.mu.Lock()
+		delete(m.agents, id)
+		m.mu.Unlock()
+		return o.res, o.err
+
+	case <-ctx.Done():
+		// Turn cancelled: stop the spawn and clean up.
+		cancel()
+		<-done
+		if sink != nil {
+			sink(SubAgentEvent{Kind: "done"})
+		}
+		m.mu.Lock()
+		delete(m.agents, id)
+		m.mu.Unlock()
+		return SpawnResult{}, ctx.Err()
+	}
+}
+
+// ContinueSync re-runs a still-alive sub-agent (addressed by its spawner-side
+// id) with a new message and blocks until it replies. The synchronous
+// counterpart of Send.
+func (m *SubAgentManager) ContinueSync(ctx context.Context, agentID, message string) (SpawnResult, error) {
+	if m.spawner == nil {
+		return SpawnResult{}, fmt.Errorf("subagent: no spawner configured")
+	}
+	return m.spawner.Continue(ctx, agentID, message)
+}
+
+// subAgentManagerCtxKey carries a per-turn SubAgentManager so the sub-agent
+// tools dispatch to it instead of the process-global defaultSubAgentMgr. A
+// request/response transport (server, IM) builds a fresh manager bound to the
+// turn's agent and stamps it here; the interactive CLI leaves it unset and
+// falls through to the global.
+type subAgentManagerCtxKeyType struct{}
+
+var subAgentManagerCtxKey = subAgentManagerCtxKeyType{}
+
+// WithSubAgentManager returns ctx carrying mgr for the sub-agent tools to find.
+func WithSubAgentManager(ctx context.Context, mgr *SubAgentManager) context.Context {
+	return context.WithValue(ctx, subAgentManagerCtxKey, mgr)
+}
+
+// subAgentManagerFromContext returns the ctx-scoped manager, or nil.
+func subAgentManagerFromContext(ctx context.Context) *SubAgentManager {
+	m, _ := ctx.Value(subAgentManagerCtxKey).(*SubAgentManager)
+	return m
+}
+
+// resolveSubAgentManager picks the manager a tool should dispatch to: the
+// ctx-scoped one (per-turn, server/IM) first, then a tool-local override, then
+// the process-global default (CLI). Returns nil when none is configured.
+func resolveSubAgentManager(ctx context.Context, local *SubAgentManager) *SubAgentManager {
+	if m := subAgentManagerFromContext(ctx); m != nil {
+		return m
+	}
+	if local != nil {
+		return local
+	}
+	return defaultSubAgentMgr
+}
+
+// SetOnExit registers a completion hook fired once per sub-agent when it
+// finishes processing. Pass nil to clear.
+func (m *SubAgentManager) SetOnExit(fn func(SubAgentNotification)) {
+	m.mu.Lock()
+	m.onExit = fn
+	m.mu.Unlock()
+}
+
+// SetOnEvent registers a runtime-event hook fired as a sub-agent works
+// (started + per-tool activity), for live display. Pass nil to clear. Distinct
+// from onExit, which fires once on completion.
+func (m *SubAgentManager) SetOnEvent(fn func(SubAgentEvent)) {
+	m.mu.Lock()
+	m.onEvent = fn
+	m.mu.Unlock()
+}
+
+// eventSink builds the per-agent sink stamped into the spawn context. The sink
+// always records events on the agent so late-joining subscribers can replay
+// the tool trail; it forwards them to the live onEvent hook when one is set.
+// Returns nil only when the agent no longer exists.
+func (m *SubAgentManager) eventSink(id, description, agentType string) func(SubAgentEvent) {
+	m.mu.Lock()
+	agent := m.agents[id]
+	onEvent := m.onEvent
+	m.mu.Unlock()
+	if agent == nil {
+		return nil
+	}
+	return func(ev SubAgentEvent) {
+		ev.AgentID = id
+		if ev.Description == "" {
+			ev.Description = description
+		}
+		if ev.AgentType == "" {
+			ev.AgentType = agentType
+		}
+		// Surface the agent's final disposition on "done" so live panels can
+		// distinguish a clean completion from an error or a user kill, and
+		// carry the (capped) final reply so panels can render the result
+		// without a follow-up fetch.
+		if ev.Kind == "done" {
+			result, status, _, _, stopReason := agent.readState()
+			if ev.Result == "" && result != "" {
+				ev.Result = ClipForEvent(result, SubAgentEventResultCap)
+			}
+			if stopReason != "" {
+				ev.StopReason = stopReason
+			} else if strings.HasPrefix(status, "exited: ") {
+				if status == "exited: context canceled" {
+					ev.StopReason = "killed"
+				} else {
+					ev.StopReason = "error"
+				}
+			}
+		}
+		agent.recordEvent(ev)
+		if onEvent != nil {
+			onEvent(ev)
+		}
+	}
+}
+
+// Start creates a new sub-agent and runs it asynchronously.
+// Returns the agent_id immediately; result arrives via onExit.
+func (m *SubAgentManager) Start(req SpawnRequest) (string, error) {
+	if m.spawner == nil {
+		return "", fmt.Errorf("subagent: no spawner configured")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	m.mu.Lock()
+	if m.activeAsync >= m.maxConcurrent {
+		n := m.activeAsync // read under the lock; don't touch m.activeAsync after Unlock
+		m.mu.Unlock()
+		cancel()
+		return "", fmt.Errorf("too many sub-agents running (%d/%d) — wait for some to finish (you'll be notified) before launching more", n, m.maxConcurrent)
+	}
+	m.activeAsync++
+	m.seq++
+	id := fmt.Sprintf("agent_%d", m.seq)
+	agent := &asyncSubAgent{
+		id:          id,
+		description: req.Description,
+		agentType:   req.AgentType,
+		cancel:      cancel,
+		start:       time.Now(),
+		busy:        true,
+	}
+	m.agents[id] = agent
+	m.mu.Unlock()
+
+	// Stream runtime events (started + per-tool) for live display and replay.
+	// The sink is always non-nil while the agent is tracked, so events are
+	// retained even when no live onEvent hook is set.
+	sink := m.eventSink(id, req.Description, req.AgentType)
+	if sink != nil {
+		ctx = WithSubAgentEventSink(ctx, sink)
+		sink(SubAgentEvent{Kind: "started"})
+	}
+
+	go func() {
+		settled := false
+		// Outermost, so it also covers the defers below — sink is
+		// caller-supplied and can panic in its own right.
+		defer func() { _ = panics.Error(recover(), "sub-agent cleanup", "agent_id", id) }()
+		defer func() {
+			m.mu.Lock()
+			m.activeAsync--
+			m.mu.Unlock()
+		}()
+		if sink != nil {
+			// Deferred (not inline after the hook) so a panic-free exit always
+			// clears the live-panel entry, even on spawn error.
+			defer sink(SubAgentEvent{Kind: "done"})
+		}
+		// Innermost, so it runs before the "done" event above: nothing else ever
+		// clears this agent's busy flag — the goal loop's idle check reads it —
+		// and the event carries the stop reason read off that same state, so the
+		// agent has to be settled before the panel is told it finished.
+		defer func() {
+			if err := panics.Error(recover(), "sub-agent spawn", "agent_id", id); err != nil && !settled {
+				agent.setDone(err, "")
+			}
+		}()
+		res, err := m.spawner.Spawn(ctx, req)
+		stopReason := ""
+		if err == nil {
+			agent.mu.Lock()
+			agent.backingID = res.AgentID // remember the resumable child so Send can reach it
+			agent.mu.Unlock()
+			agent.setResult(res.Reply, res.InputTokens, res.OutputTokens)
+			stopReason = res.StopReason
+		}
+		agent.setDone(err, stopReason)
+		settled = true
+
+		m.mu.Lock()
+		hook := m.onExit
+		m.mu.Unlock()
+		if hook != nil {
+			result, _, _, _, sr := agent.readState()
+			if err != nil {
+				result = err.Error()
+			}
+			agent.mu.Lock()
+			inTok := agent.inputTokens
+			outTok := agent.outputTokens
+			agent.mu.Unlock()
+			hook(SubAgentNotification{
+				AgentID:      id,
+				Description:  req.Description,
+				Kind:         "spawn_done",
+				Result:       result,
+				InputTokens:  inTok,
+				OutputTokens: outTok,
+				StopReason:   sr,
+			})
+		}
+	}()
+
+	return id, nil
+}
+
+// Send delivers a message to an existing sub-agent asynchronously.
+// Returns immediately; reply arrives via onExit.
+func (m *SubAgentManager) Send(agentID, message string) error {
+	m.mu.Lock()
+	agent := m.agents[agentID]
+	m.mu.Unlock()
+	if agent == nil {
+		return fmt.Errorf("subagent: no sub-agent %q", agentID)
+	}
+
+	agent.mu.Lock()
+	if agent.exited {
+		agent.mu.Unlock()
+		return fmt.Errorf("subagent: %s has exited", agentID)
+	}
+	if agent.busy {
+		if agent.pending != "" {
+			agent.mu.Unlock()
+			return fmt.Errorf("subagent: %s already has a pending message", agentID)
+		}
+		agent.pending = message
+		agent.mu.Unlock()
+		return nil // queued, will be sent when current processing done
+	}
+	agent.busy = true
+	agent.mu.Unlock()
+
+	go m.runContinue(agentID, message)
+	return nil
+}
+
+func (m *SubAgentManager) runContinue(agentID, message string) {
+	agent := m.agents[agentID]
+	if agent == nil {
+		return
+	}
+
+	settled := false
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Replace the agent's cancel so Kill targets the current operation. Call the
+	// previous cancel to release the context resources from the Spawn (or an
+	// earlier Continue round); each round owns exactly one live context at a time.
+	agent.mu.Lock()
+	oldCancel := agent.cancel
+	agent.cancel = cancel
+	backingID := agent.backingID
+	desc := agent.description
+	agentType := agent.agentType
+	agent.mu.Unlock()
+	if oldCancel != nil {
+		oldCancel()
+	}
+
+	// Stream runtime events for this round too, so the live panel re-shows the
+	// sub-agent as running while it handles the message. "done" is emitted
+	// explicitly before any pending-message handoff (not deferred) so it can't
+	// race the next round's "started".
+	sink := m.eventSink(agentID, desc, agentType)
+	if sink != nil {
+		ctx = WithSubAgentEventSink(ctx, sink)
+		sink(SubAgentEvent{Kind: "started"})
+	}
+
+	// Send marks the agent busy before launching this round, and setDone below
+	// is the only thing that ever clears it — so a panicking Continue would
+	// leave the agent permanently "working" to the UI and to the goal loop's
+	// idle check. The round's context and its live-panel entry are this
+	// goroutine's to release too; registered here rather than at the top of the
+	// function because both only exist from this point on.
+	defer func() {
+		err := panics.Error(recover(), "sub-agent continue", "agent_id", agentID)
+		if err == nil || settled {
+			return
+		}
+		cancel()
+		agent.setDone(err, "")
+		if sink != nil {
+			sink(SubAgentEvent{Kind: "done"})
+		}
+	}()
+
+	// Continue addresses the child by its Spawner-side id, not the manager's
+	// agent_N handle — the two id spaces are distinct.
+	res, err := m.spawner.Continue(ctx, backingID, message)
+
+	// Cancel this round's context as soon as Continue returns. This must happen
+	// before setDone marks the agent idle, otherwise a concurrent Read() can see
+	// idle before the context is cancelled (observed on Windows).
+	cancel()
+
+	stopReason := ""
+	if err == nil {
+		agent.setResult(res.Reply, res.InputTokens, res.OutputTokens)
+		stopReason = res.StopReason
+	}
+	agent.setDone(err, stopReason)
+	settled = true
+
+	m.mu.Lock()
+	hook := m.onExit
+	m.mu.Unlock()
+	if hook != nil {
+		result, _, _, _, sr := agent.readState()
+		if err != nil {
+			result = err.Error()
+		}
+		agent.mu.Lock()
+		inTok := agent.inputTokens
+		outTok := agent.outputTokens
+		agent.mu.Unlock()
+		hook(SubAgentNotification{
+			AgentID:      agentID,
+			Description:  agent.description,
+			Kind:         "message_reply",
+			Result:       result,
+			InputTokens:  inTok,
+			OutputTokens: outTok,
+			StopReason:   sr,
+		})
+	}
+	if sink != nil {
+		sink(SubAgentEvent{Kind: "done"})
+	}
+
+	// Process pending message, if any.
+	agent.mu.Lock()
+	pending := agent.pending
+	agent.pending = ""
+	if pending != "" && !agent.exited {
+		agent.busy = true
+		agent.mu.Unlock()
+		go m.runContinue(agentID, pending)
+		return
+	}
+	agent.mu.Unlock()
+}
+
+// Read returns the latest result and status for an agent.
+// found is false when id is unknown.
+func (m *SubAgentManager) Read(id string) (result, status string, found bool) {
+	m.mu.Lock()
+	agent := m.agents[id]
+	m.mu.Unlock()
+	if agent == nil {
+		return "", "", false
+	}
+	result, status, _, _, _ = agent.readState()
+	return result, status, true
+}
+
+// TrackedBackingIDs returns the spawner-side ids of the agents this manager
+// tracks. A caller listing the spawner's live children uses it to skip the
+// ones it already reports under their agent_N handle — the same child is
+// present in both places for an async spawn.
+func (m *SubAgentManager) TrackedBackingIDs() map[string]bool {
+	m.mu.Lock()
+	agents := make([]*asyncSubAgent, 0, len(m.agents))
+	for _, a := range m.agents {
+		agents = append(agents, a)
+	}
+	m.mu.Unlock()
+
+	out := make(map[string]bool, len(agents))
+	for _, a := range agents {
+		a.mu.Lock()
+		id := a.backingID
+		a.mu.Unlock()
+		if id != "" {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+// Kill terminates the sub-agent for id. Returns false when id is unknown.
+func (m *SubAgentManager) Kill(id string) bool {
+	m.mu.Lock()
+	agent := m.agents[id]
+	m.mu.Unlock()
+	if agent == nil {
+		return false
+	}
+	agent.setKilled()
+	agent.cancel()
+
+	// Emit a "done" event so the frontend receives the update immediately,
+	// even if the agent's goroutine has already exited (its deferred sink
+	// already fired, e.g. the agent completed before the kill call).
+	agent.mu.Lock()
+	desc := agent.description
+	at := agent.agentType
+	agent.mu.Unlock()
+	ev := SubAgentEvent{
+		AgentID:     id,
+		Description: desc,
+		AgentType:   at,
+		Kind:        "done",
+		StopReason:  "killed",
+	}
+	agent.recordEvent(ev)
+	m.mu.Lock()
+	onEvent := m.onEvent
+	m.mu.Unlock()
+	if onEvent != nil {
+		onEvent(ev)
+	}
+
+	return true
+}
+
+// setKilled marks the agent as exited due to a user kill, preserving the
+// "killed" stop reason so completion notices can distinguish cancellation
+// from a failure.
+func (a *asyncSubAgent) setKilled() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.exited = true
+	a.exitErr = context.Canceled
+	a.stopReason = "killed"
+	a.busy = false
+}
+
+// KillAll terminates every tracked sub-agent. Called on session shutdown.
+func (m *SubAgentManager) KillAll() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, agent := range m.agents {
+		agent.setKilled()
+		agent.cancel()
+	}
+}
+
+// ListRunning returns the agents that haven't exited yet, oldest first.
+func (m *SubAgentManager) ListRunning() []SubAgentInfo {
+	m.mu.Lock()
+	agents := make([]*asyncSubAgent, 0, len(m.agents))
+	for _, a := range m.agents {
+		agents = append(agents, a)
+	}
+	m.mu.Unlock()
+
+	var out []SubAgentInfo
+	for _, a := range agents {
+		_, _, busy, done, _ := a.readState()
+		if !done {
+			out = append(out, SubAgentInfo{
+				ID:          a.id,
+				Description: a.description,
+				AgentType:   a.agentType,
+				Start:       a.start,
+				Busy:        busy,
+				Events:      a.listEvents(),
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Start.Before(out[j].Start) })
+	return out
+}

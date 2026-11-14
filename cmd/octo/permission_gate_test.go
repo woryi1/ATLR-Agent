@@ -1,0 +1,163 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/audit"
+	"github.com/open-octo/octo-agent/internal/permission"
+)
+
+// newGate builds the CLI-wired shared gate over a scripted-stdin plain view, so
+// these tests exercise newCLIGate + the userPrompter→PermissionAsk adapter end
+// to end (the gate's pure policy logic is covered in internal/app/gate_test.go).
+func newGate(t *testing.T, mode permission.Mode, stdin string) (agent.PermissionGate, *bytes.Buffer) {
+	t.Helper()
+	eng, err := permission.New("", "/work", mode)
+	if err != nil {
+		t.Fatalf("permission.New: %v", err)
+	}
+	var out bytes.Buffer
+	view := newPlainView(newScannerLineReader(strings.NewReader(stdin), &out), &out, &out, verbosityNormal, false)
+	// No-op audit logger: test checks must not land in the real ~/.octo/audit.log.
+	return newCLIGate(eng, view, audit.NewAt("")), &out
+}
+
+func TestCLIGate_AllowPassesThrough(t *testing.T) {
+	g, out := newGate(t, permission.ModeInteractive, "")
+	ok, reason := g.Check(context.Background(), "terminal", map[string]any{"command": "ls"})
+	if !ok {
+		t.Errorf("ls should be allowed; reason=%q", reason)
+	}
+	if out.Len() != 0 {
+		t.Errorf("allow should not prompt; got output %q", out.String())
+	}
+}
+
+func TestCLIGate_DenyReturnsReason(t *testing.T) {
+	g, out := newGate(t, permission.ModeInteractive, "")
+	ok, reason := g.Check(context.Background(), "terminal", map[string]any{"command": "rm -rf /"})
+	if ok {
+		t.Error("rm -rf / must be denied")
+	}
+	if !strings.Contains(reason, "permission_denied") {
+		t.Errorf("expected structured denial reason, got %q", reason)
+	}
+	if out.Len() != 0 {
+		t.Errorf("deny should not prompt; got %q", out.String())
+	}
+}
+
+func TestCLIGate_AskPromptYes(t *testing.T) {
+	g, out := newGate(t, permission.ModeInteractive, "y\n")
+	ok, _ := g.Check(context.Background(), "terminal", map[string]any{"command": "sudo apt update"})
+	if !ok {
+		t.Error("answering 'y' should allow")
+	}
+	if !strings.Contains(out.String(), "allow?") {
+		t.Errorf("expected a prompt to be printed; got %q", out.String())
+	}
+}
+
+func TestCLIGate_AskPromptNoByDefault(t *testing.T) {
+	// Empty answer (just Enter) → deny.
+	g, _ := newGate(t, permission.ModeInteractive, "\n")
+	ok, reason := g.Check(context.Background(), "terminal", map[string]any{"command": "sudo apt update"})
+	if ok {
+		t.Error("empty answer should deny (capital N is the default)")
+	}
+	if !strings.Contains(reason, "declined") {
+		t.Errorf("reason should note the user declined, got %q", reason)
+	}
+}
+
+func TestCLIGate_AskPromptAlwaysRemembers(t *testing.T) {
+	// Answer "a" once; the engine should remember and a SECOND identical
+	// call should allow without prompting.
+	g, out := newGate(t, permission.ModeInteractive, "a\n")
+	input := map[string]any{"command": "sudo apt update"}
+
+	if ok, _ := g.Check(context.Background(), "terminal", input); !ok {
+		t.Fatal("answering 'a' should allow")
+	}
+	promptLenAfterFirst := out.Len()
+
+	// Second call: no new prompt, still allowed.
+	if ok, _ := g.Check(context.Background(), "terminal", input); !ok {
+		t.Error("remembered decision should allow on repeat")
+	}
+	if out.Len() != promptLenAfterFirst {
+		t.Errorf("second call should not prompt again; extra output %q",
+			out.String()[promptLenAfterFirst:])
+	}
+}
+
+func TestCLIGate_AutoApproveModeNeverPrompts(t *testing.T) {
+	// In auto-approve mode the engine collapses ask → allow, so a command
+	// that would normally prompt is allowed without reading stdin.
+	g, out := newGate(t, permission.ModeAutoApprove, "") // no stdin needed
+	ok, reason := g.Check(context.Background(), "terminal", map[string]any{"command": "sudo apt update"})
+	if !ok {
+		t.Errorf("auto mode must allow ask-class commands; reason=%q", reason)
+	}
+	if out.Len() != 0 {
+		t.Errorf("auto mode must not prompt; got %q", out.String())
+	}
+}
+
+func TestCLIGate_StrictModeDeniesAskWithoutPrompting(t *testing.T) {
+	// In strict mode the engine collapses ask → deny, so a command that would
+	// normally prompt is refused without touching stdin — even though a
+	// prompter IS wired (a TTY must not weaken the strict posture).
+	g, out := newGate(t, permission.ModeStrict, "y\n") // a prompt would read "y" and allow
+	ok, reason := g.Check(context.Background(), "terminal", map[string]any{"command": "sudo apt update"})
+	if ok {
+		t.Error("strict mode must deny ask-class commands")
+	}
+	if !strings.Contains(reason, "permission_denied") {
+		t.Errorf("expected structured denial reason, got %q", reason)
+	}
+	if out.Len() != 0 {
+		t.Errorf("strict mode must not prompt; got %q", out.String())
+	}
+	// Explicit allow rules still pass through.
+	if ok, reason := g.Check(context.Background(), "terminal", map[string]any{"command": "ls"}); !ok {
+		t.Errorf("strict mode must not block allow-listed commands; reason=%q", reason)
+	}
+}
+
+func TestCLIGate_UnwrapsToolCallToRealName(t *testing.T) {
+	// A Tool Search mcp_call must be evaluated against the wrapped tool, not
+	// the opaque "mcp_call" bridge: wrapping a dangerous terminal command must
+	// still be denied on the inner name.
+	g, _ := newGate(t, permission.ModeInteractive, "")
+	ok, reason := g.Check(context.Background(), "mcp_call", map[string]any{
+		"name":      "terminal",
+		"arguments": map[string]any{"command": "rm -rf /"},
+	})
+	if ok {
+		t.Error("mcp_call wrapping 'rm -rf /' must be denied via the unwrapped name")
+	}
+	if !strings.Contains(reason, "permission_denied") {
+		t.Errorf("expected denial reason, got %q", reason)
+	}
+}
+
+func TestResolvePermissionMode(t *testing.T) {
+	if resolvePermissionMode("interactive") != permission.ModeInteractive {
+		t.Error("interactive should map to ModeInteractive")
+	}
+	if resolvePermissionMode("auto") != permission.ModeAutoApprove {
+		t.Error("auto should map to ModeAutoApprove")
+	}
+	if resolvePermissionMode("strict") != permission.ModeStrict {
+		t.Error("strict should map to ModeStrict")
+	}
+	// Unknown values fall back to interactive.
+	if resolvePermissionMode("garbage") != permission.ModeInteractive {
+		t.Error("unknown should fall back to ModeInteractive")
+	}
+}

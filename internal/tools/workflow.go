@@ -1,0 +1,531 @@
+package tools
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/workflow"
+)
+
+// defaultWorkflowConcurrency caps how many agent() calls run at once inside one
+// workflow, so a parallel() over a large list can't fan out an unbounded number
+// of concurrent LLM turns.
+const defaultWorkflowConcurrency = 8
+
+// workflowForeground, when set, makes the workflow tool run scripts to
+// completion inside the tool call instead of detaching a background run. The
+// headless one-shot enables it: that mode exits when the turn ends (killing
+// still-running background work), so a detached run could never deliver its
+// result — the completion notification the background texts promise would
+// never arrive. Interactive transports (TUI, web, IM) leave it off.
+var workflowForeground atomic.Bool
+
+// SetWorkflowForeground toggles foreground (blocking) workflow execution for
+// this process. Set it before the tool definitions are built — the workflow
+// tool's description tells the model which mode it is in.
+func SetWorkflowForeground(v bool) { workflowForeground.Store(v) }
+
+// workflowJournalDir overrides the workflow runtime's journal directory
+// (~/.octo/workflow-journals by default, resolved by internal/workflow).
+// Empty (the zero value) leaves the runtime default in place — every real
+// entry point (CLI, server, IM) never sets this. Tests point it at a temp dir
+// so running the suite doesn't write into a developer's real journal
+// directory.
+var workflowJournalDir atomic.Value // string
+
+// SetWorkflowJournalDir overrides the workflow runtime's journal directory for
+// this process. Pass "" to restore the default.
+func SetWorkflowJournalDir(dir string) { workflowJournalDir.Store(dir) }
+
+// ActiveWorkflowJournalDir returns the dir set by SetWorkflowJournalDir, or ""
+// (the runtime default) if never set.
+func ActiveWorkflowJournalDir() string {
+	v, _ := workflowJournalDir.Load().(string)
+	return v
+}
+
+// WorkflowTool runs a Ruby (mruby) orchestration script in an embedded wasm
+// interpreter. The script drives sub-agents through the agent() / parallel() /
+// pipeline() primitives; each agent() call delegates to the same Spawner that
+// backs sub_agent. The tool is advertised only when a Spawner is registered.
+//
+// Like sub_agent, it refuses to run inside a sub-agent — workflow agents are
+// themselves marked as sub-agents, so a child can't recursively launch another
+// workflow.
+type WorkflowTool struct{}
+
+func (WorkflowTool) Definition() agent.ToolDefinition {
+	// The execution contract differs by transport: interactive transports run
+	// workflows detached (with a completion notification), the headless
+	// one-shot runs them inline. Tell the model which one it gets.
+	mode := "Runs in the BACKGROUND: this call returns a run id immediately, and the system " +
+		"automatically notifies you with the result when the run finishes — do NOT poll " +
+		"workflow_status while it runs. (A long multi-agent run won't block you or the " +
+		"user while it executes.)"
+	if workflowForeground.Load() {
+		mode = "Runs in the FOREGROUND: this call blocks until the script completes and " +
+			"returns the final result directly — no run id to track, nothing to poll, " +
+			"no notification to wait for."
+	}
+	return agent.ToolDefinition{
+		Name: "workflow",
+		Description: "Run a Ruby orchestration script for deterministic multi-agent work — " +
+			"either inline via `script`, or a saved workflow by `name` (see the name parameter). " +
+			"Use when a task decomposes into many sub-agent calls with explicit control flow " +
+			"(fan-out, pipelines, loops, conditionals) that you want executed reliably rather " +
+			"than improvised across turns.\n\n" +
+			mode + "\n\n" +
+			"The script runs in a sandboxed, IO-free mruby interpreter: Array/Hash/String/" +
+			"Integer/Regexp logic and JSON.parse/JSON.generate are available (Regexp includes " +
+			"literal /.../ patterns, =~, and String#match/scan/gsub/sub — the engine is RE2, so " +
+			"backreferences and lookaround inside the pattern are NOT supported, though \\1/\\k<name> " +
+			"in a gsub/sub replacement string are. Two RE2 gotchas: to make . cross newlines use the " +
+			"/m suffix, NOT an inline (?m) (inline (?m) means multiline, not dot-all, here); the /x " +
+			"extended/whitespace mode is unavailable; use \\z, not \\Z). There is NO File, Dir, " +
+			"Time, Process, or shell backticks (`cmd`) — referencing any of them raises a Ruby " +
+			"error before the script produces any result. The ONLY way to touch the filesystem, " +
+			"run a shell/git/gh command, or get the current date is through agent(prompt, opts) " +
+			"below, which delegates to a real sub-agent with real tools. To persist a report or " +
+			"state file, tell an agent() call to write it (it has write_file) — never call " +
+			"File.write yourself. To get STRUCTURED data out of a sub-agent, pass " +
+			"agent(prompt, schema: ...) and JSON.parse its reply — do NOT regex-scrape fields out " +
+			"of a plain-prose agent() reply when you can have it returned as validated JSON. " +
+			"Primitives:\n" +
+			"- `agent(prompt, opts = {}) -> String`: run one sub-agent to completion, return " +
+			"its reply. Inside parallel/pipeline it runs concurrently with siblings. " +
+			"Optional opts: `model:` (override the model for this call — pass \"lite\" for the " +
+			"session's lite model on mechanical stages; falls back to the parent's model when " +
+			"the session has none), `tools:` (Array restricting the child's tools), " +
+			"`read_only: true` (strip write_file/edit_file), `schema:` (a JSON Schema as a " +
+			"JSON **string** — the call then returns the sub-agent's reply as JSON text matching it), " +
+			"`isolation: \"worktree\"` (run the sub-agent in a fresh git worktree so its file changes " +
+			"don't touch the main checkout — useful for parallel agents that write files; changes are " +
+			"left on a branch named in the reply).\n" +
+			"- `parallel(items) { |it| ... } -> Array`: run the block for every item " +
+			"concurrently; returns results in input order.\n" +
+			"- `pipeline(items, stage1, stage2, ...) -> Array`: run each item through all " +
+			"stages; items flow independently (no barrier between stages). Stages are lambdas.\n" +
+			"- `log(msg)`: surface a progress line.\n" +
+			"- `phase(title)`: mark the start of a named stage; groups the progress " +
+			"stream into steps (cosmetic, does not affect scheduling).\n" +
+			"- `budget_remaining -> Integer`: remaining output-token budget.\n" +
+			"- `args -> Hash/Array/scalar`: the input value passed as this tool's `args` " +
+			"parameter, parsed from JSON into native Ruby (nil when none). Use it to " +
+			"parameterize a reusable script, e.g. `target = args[\"target\"]`.\n" +
+			"- `JSON.parse(str)` / `JSON.generate(obj)` are available: decode a " +
+			"schema-constrained agent() reply, or encode structured data back into a prompt.\n\n" +
+			"The script's final expression is the run's result. Example:\n" +
+			"```ruby\n" +
+			"findings = parallel(%w[auth db cache]) { |area| agent(\"Audit the #{area} module for bugs\") }\n" +
+			"\"Reviewed #{findings.size} modules:\\n\" + findings.join(\"\\n---\\n\")\n" +
+			"```",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"script": map[string]any{
+					"type":        "string",
+					"description": "The Ruby workflow script. Its last expression is the run's result. Use agent()/parallel()/pipeline()/log() to orchestrate sub-agents. Provide exactly one of script or name.",
+				},
+				"name": map[string]any{
+					"type":        "string",
+					"description": savedWorkflowsParamDesc(),
+				},
+				"description": map[string]any{
+					"type":        "string",
+					"description": "Short human-readable label for this workflow (3-7 words). Shown in the status list and progress UI.",
+				},
+				"args": map[string]any{
+					"type":        "object",
+					"description": "Input value for the script, readable as the `args` primitive (parsed to native Ruby). Use to parameterize a reusable workflow instead of hardcoding values into the script.",
+				},
+				"resume_from": map[string]any{
+					"type": "string",
+					"description": "Run id of a prior workflow run to resume from " +
+						"(format: wf-YYYYMMDD-HHMMSS-xxxxxxxx, shown as \"[workflow run: ...]\" " +
+						"in a previous result). Completed agent() calls are replayed instantly " +
+						"without re-running. The script must be identical to the original run.",
+				},
+			},
+		},
+	}
+}
+
+// instrumentWorkflowAgent wires one agent()/skill() call into the owning
+// run's structured event stream: it emits "agent_started", stamps a sub-agent
+// event sink into ctx that translates the child's tool/text activity (see
+// Spawner.runChild) onto the corresponding agent_* workflow kinds, and returns
+// a done func that emits "agent_done" with the capped reply or the error.
+// Outside a managed run (no emitter in ctx) it is a no-op. seq is the run's
+// shared agent counter; safe for concurrent agent() calls under parallel().
+func instrumentWorkflowAgent(ctx context.Context, seq *int32, label string) (context.Context, func(reply string, err error)) {
+	emit := workflowEmitFrom(ctx)
+	if emit == nil {
+		return ctx, func(string, error) {}
+	}
+	agentID := fmt.Sprintf("a%d", atomic.AddInt32(seq, 1))
+	emit(WorkflowEvent{Kind: "agent_started", AgentID: agentID, AgentLabel: label})
+	ctx = WithSubAgentEventSink(ctx, func(se SubAgentEvent) {
+		switch se.Kind {
+		case "tool":
+			emit(WorkflowEvent{Kind: "agent_tool", AgentID: agentID, ToolID: se.ToolID, ToolName: se.ToolName, ToolInput: se.ToolInput})
+		case "tool_done":
+			emit(WorkflowEvent{Kind: "agent_tool_done", AgentID: agentID, ToolID: se.ToolID, ToolName: se.ToolName, ToolOutput: se.ToolOutput})
+		case "tool_error":
+			emit(WorkflowEvent{Kind: "agent_tool_error", AgentID: agentID, ToolID: se.ToolID, ToolName: se.ToolName, ToolOutput: se.ToolOutput})
+		case "text":
+			emit(WorkflowEvent{Kind: "agent_text", AgentID: agentID, Text: se.Text})
+		}
+	})
+	return ctx, func(reply string, err error) {
+		ev := WorkflowEvent{Kind: "agent_done", AgentID: agentID, AgentLabel: label}
+		if err != nil {
+			ev.Error = err.Error()
+		} else {
+			ev.Reply = ClipForEvent(reply, SubAgentEventResultCap)
+		}
+		emit(ev)
+	}
+}
+
+// savedWorkflowsParamDesc builds the `name` parameter description, listing the
+// saved workflows currently in the registry (~/.octo/workflows) so the model
+// knows what it can run by name.
+func savedWorkflowsParamDesc() string {
+	var b strings.Builder
+	b.WriteString("Run a saved workflow by name (from ~/.octo/workflows). " +
+		"Provide exactly one of script or name; args are passed in either way.")
+	saved := listWorkflows()
+	if len(saved) == 0 {
+		b.WriteString(" (No saved workflows found yet — author one with workflow_save.)")
+		return b.String()
+	}
+	b.WriteString(" Available:")
+	for _, w := range saved {
+		line := "\n- " + w.name
+		if w.description != "" {
+			line += " — " + w.description
+		}
+		if req := requiredParamNames(w.params); len(req) > 0 {
+			line += " (requires: " + strings.Join(req, ", ") + ")"
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+// requiredParamNames returns the names of params marked required, in
+// declaration order.
+func requiredParamNames(params []workflowParam) []string {
+	var out []string
+	for _, p := range params {
+		if p.required {
+			out = append(out, p.name)
+		}
+	}
+	return out
+}
+
+// ensureRequiredWorkflowParams checks a saved workflow's declared `# @param
+// name required ...` inputs against the tool's `args` input. Any that are
+// missing produce an error listing them — the model then decides whether to
+// re-invoke with `args` filled in (it already knows the values) or surface an
+// `ask_user_question` to the caller (it genuinely doesn't know). The old
+// behaviour auto-prompted via the ctx Asker, which stole that decision from the
+// model and caused repeat prompts when the model had already asked the user.
+func ensureRequiredWorkflowParams(workflowName string, params []workflowParam, args map[string]any) error {
+	var missing []string
+	for _, p := range params {
+		if !p.required {
+			continue
+		}
+		if v, ok := args[p.name]; ok && v != nil && v != "" {
+			continue
+		}
+		missing = append(missing, p.name)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("workflow %q is missing required arg(s): %s — pass them in `args`",
+		workflowName, strings.Join(missing, ", "))
+}
+
+// Execute runs the workflow: detached with a run handle in background mode,
+// or to completion with the result returned inline in foreground mode.
+func (WorkflowTool) Execute(ctx context.Context, _ string, input map[string]any) (agent.ToolResult, error) {
+	if IsSubAgent(ctx) {
+		return agent.ToolResult{}, fmt.Errorf("workflow: a sub-agent cannot run a workflow")
+	}
+
+	script := strings.TrimSpace(stringArg(input, "script"))
+	name := strings.TrimSpace(stringArg(input, "name"))
+	description := strings.TrimSpace(stringArg(input, "description"))
+	switch {
+	case script != "" && name != "":
+		return agent.ToolResult{}, fmt.Errorf("workflow: provide exactly one of script or name, not both")
+	case script == "" && name == "":
+		return agent.ToolResult{}, fmt.Errorf("workflow: provide a script, or a name of a saved workflow")
+	case name != "":
+		w, ok := lookupWorkflow(name)
+		if !ok {
+			return agent.ToolResult{}, fmt.Errorf("workflow: no saved workflow named %q (looked in ~/.octo/workflows)", name)
+		}
+		script = w.script
+		if description == "" {
+			description = w.description
+		}
+		if len(w.params) > 0 {
+			argsMap, _ := input["args"].(map[string]any)
+			if err := ensureRequiredWorkflowParams(name, w.params, argsMap); err != nil {
+				return agent.ToolResult{}, err
+			}
+		}
+	}
+
+	// Prefer the ctx-scoped SubAgentManager (server/IM per-turn/per-session) so a
+	// workflow spawned by one session doesn't accidentally use another session's
+	// global Spawner under concurrency. Fall back to the process-global Spawner
+	// for CLI/TUI paths that never stamp a ctx manager.
+	var spawner Spawner
+	if mgr := resolveSubAgentManager(ctx, nil); mgr != nil {
+		spawner = mgr.Spawner()
+	}
+	if spawner == nil {
+		spawner = ActiveSpawner()
+	}
+	if spawner == nil {
+		return agent.ToolResult{}, fmt.Errorf("workflow: sub-agent dispatch is not configured for this session")
+	}
+
+	// agent() delegates to the same Spawner that backs sub_agent. The Spawner
+	// marks children as sub-agents, so a workflow agent can't recurse. Each
+	// call is instrumented onto the run's structured event stream (agent_*
+	// kinds) so panels can show its tool trail and reply, not just log lines.
+	var agentSeq int32
+	af := func(c context.Context, prompt string, opts workflow.AgentOptions) workflow.AgentResult {
+		c, done := instrumentWorkflowAgent(c, &agentSeq, firstLine(prompt))
+		res, err := spawner.Spawn(c, SpawnRequest{
+			Description: firstLine(prompt),
+			Prompt:      prompt,
+			Model:       opts.Model,
+			Tools:       opts.Tools,
+			ReadOnly:    opts.ReadOnly,
+			Schema:      opts.Schema,
+			Isolation:   opts.Isolation,
+		})
+		if err != nil {
+			done("", err)
+			return workflow.AgentResult{Err: err}
+		}
+		done(res.Reply, nil)
+		return workflow.AgentResult{
+			Reply:        res.Reply,
+			InputTokens:  res.InputTokens,
+			OutputTokens: res.OutputTokens,
+		}
+	}
+
+	// skill() runs a SKILL.md skill as a sub-agent via the same spawner;
+	// recording() replays a browser recording deterministically. Both arrive
+	// through this one channel — see dispatchWorkflowSkill for the routing.
+	sf := func(c context.Context, name, paramsJSON, schema string) workflow.AgentResult {
+		c, done := instrumentWorkflowAgent(c, &agentSeq, "skill: "+name)
+		r := dispatchWorkflowSkill(c, spawner, name, paramsJSON, schema)
+		done(r.Reply, r.Err)
+		return r
+	}
+
+	argsJSON, err := encodeWorkflowArgs(input["args"])
+	if err != nil {
+		return agent.ToolResult{}, fmt.Errorf("workflow: args must be a JSON value: %w", err)
+	}
+
+	mgr := resolveWorkflowManager(ctx)
+	req := WorkflowRunRequest{
+		Description:   description,
+		Script:        script,
+		Args:          argsJSON,
+		Agent:         af,
+		Skill:         sf,
+		MaxConcurrent: defaultWorkflowConcurrency,
+		ResumeFrom:    stringArg(input, "resume_from"),
+		Foreground:    workflowForeground.Load(),
+		// Carried into Start's detached context so the script's own
+		// agent()/skill() calls (and anything nested they do, like
+		// workflow_save) still resolve against this turn's directory instead
+		// of falling back to the server's own launch directory once the run
+		// is no longer tied to this request's ctx.
+		WorkingDir:        WorkingDirOrCWD(ctx),
+		UpstreamSessionID: agent.UpstreamSessionIDFrom(ctx),
+	}
+
+	runID, err := mgr.Start(req)
+	if err != nil {
+		return agent.ToolResult{}, fmt.Errorf("workflow: %w", err)
+	}
+
+	// Foreground (one-shot) mode: run to completion inside this call and hand
+	// the result back directly. Going through the manager keeps the run visible
+	// to progress hooks and workflow_status, and enforces the concurrency cap.
+	if req.Foreground {
+		snap, werr := mgr.Wait(ctx, runID)
+		if werr != nil {
+			return agent.ToolResult{}, fmt.Errorf("workflow: run interrupted: %w", werr)
+		}
+		return agent.ToolResult{Text: formatRunDetail(snap), UI: workflowResultUI(runID)}, nil
+	}
+
+	return agent.ToolResult{Text: fmt.Sprintf(
+		"Workflow started in the background as %s.\n"+
+			"<system-reminder>This run executes in the background. DO NOT poll workflow_status "+
+			"while it runs — the system will automatically notify you when it finishes, carrying "+
+			"the result. While it runs, you may continue with other independent tasks. If you have "+
+			"no other task to do, report the launch to the user and stop — do not spin in a "+
+			"polling loop. (workflow_status(%q) exists for on-demand progress checks, e.g. when "+
+			"the user asks.)</system-reminder>", runID, runID),
+		UI: workflowResultUI(runID)}, nil
+}
+
+// workflowResultUI is the structured payload on a workflow tool result that
+// lets the web transcript's tool card claim the run's event trail (see
+// dev-docs/agent-run-panel-design.md). It persists with the session on the
+// tool_result block and never reaches the model.
+func workflowResultUI(runID string) map[string]any {
+	return map[string]any{"run_id": runID}
+}
+
+// encodeWorkflowArgs serializes the tool's `args` input to the JSON string the
+// workflow runtime serves to the script's args primitive. A nil/absent value
+// yields "" (the script's args returns nil).
+func encodeWorkflowArgs(v any) (string, error) {
+	if v == nil {
+		return "", nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// WorkflowStatusTool reports on background workflow runs: a list with no
+// argument, or one run's full status + result when given a run id.
+type WorkflowStatusTool struct{}
+
+func (WorkflowStatusTool) Definition() agent.ToolDefinition {
+	return agent.ToolDefinition{
+		Name: "workflow_status",
+		Description: "Check background workflow runs started with the workflow tool. " +
+			"With no run_id: list this session's runs and their status (running/done/error). " +
+			"With a run_id: the full result (or error + how to fix/resume) plus the captured log. " +
+			"Use this for ON-DEMAND checks (e.g. the user asks how a run is going) or to collect " +
+			"a result after the completion notification — do NOT call it in a polling loop; the " +
+			"system pushes a notification when a run finishes. Repeated still-running reads of " +
+			"the same run are detected as polling and trigger a hard STOP reminder.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"run_id": map[string]any{
+					"type":        "string",
+					"description": "A run id from the workflow tool (e.g. \"wf_1\"). Omit to list all runs.",
+				},
+			},
+		},
+	}
+}
+
+// workflowPollStopText is the hard stop appended once a no-progress polling
+// streak crosses workflowPollStopThreshold. The agent loop exempts
+// workflow_status from its duplicate-tool-call detector (it is a legitimate
+// observation tool), so this guard is what breaks a polling loop — mirroring
+// terminal_output's empty-snapshot guard.
+const workflowPollStopText = "\n\n[STOP: repeated workflow_status polling detected. " +
+	"Do not poll again. The system will push a notification with the result " +
+	"when a run finishes.]"
+
+func (WorkflowStatusTool) Execute(ctx context.Context, _ string, input map[string]any) (agent.ToolResult, error) {
+	mgr := resolveWorkflowManager(ctx)
+	runID := strings.TrimSpace(stringArg(input, "run_id"))
+	if runID == "" {
+		runs := mgr.List()
+		if len(runs) == 0 {
+			return agent.ToolResult{Text: "No background workflows have been started in this session."}, nil
+		}
+		lines := make([]string, 0, len(runs))
+		var latest time.Time
+		anyRunning := false
+		for _, r := range runs {
+			lines = append(lines, statusLine(r))
+			if r.Status == "running" {
+				anyRunning = true
+				if r.LastActivity.After(latest) {
+					latest = r.LastActivity
+				}
+			}
+		}
+		text := strings.Join(lines, "\n")
+		// The list form observes running work too; give it the same anti-poll
+		// escalation, keyed under "" off the freshest activity across running runs.
+		if mgr.RecordStatusRead("", anyRunning, latest) >= workflowPollStopThreshold {
+			text += workflowPollStopText
+		}
+		return agent.ToolResult{Text: text}, nil
+	}
+	snap, ok := mgr.Read(runID)
+	if !ok {
+		return agent.ToolResult{}, fmt.Errorf("workflow_status: no run named %q in this session", runID)
+	}
+	text := formatRunDetail(snap)
+	if mgr.RecordStatusRead(runID, snap.Status == "running", snap.LastActivity) >= workflowPollStopThreshold {
+		text += workflowPollStopText
+	}
+	return agent.ToolResult{Text: text}, nil
+}
+
+// WorkflowKillTool cancels a running background workflow by id — for a run that
+// has stalled (workflow_status shows a large, growing "last activity" gap) or
+// is no longer wanted.
+type WorkflowKillTool struct{}
+
+func (WorkflowKillTool) Definition() agent.ToolDefinition {
+	return agent.ToolDefinition{
+		Name: "workflow_kill",
+		Description: "Cancel a running background workflow by run id (e.g. \"wf_1\"). Use when " +
+			"workflow_status shows a run is stuck (a large, growing 'last activity' gap) or you " +
+			"no longer want its result. Cancellation propagates to the workflow's in-flight " +
+			"sub-agents. A run that already finished is left as-is.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"run_id": map[string]any{
+					"type":        "string",
+					"description": "The run id to cancel (from the workflow tool / workflow_status).",
+				},
+			},
+			"required": []string{"run_id"},
+		},
+	}
+}
+
+func (WorkflowKillTool) Execute(ctx context.Context, _ string, input map[string]any) (agent.ToolResult, error) {
+	runID := strings.TrimSpace(stringArg(input, "run_id"))
+	if runID == "" {
+		return agent.ToolResult{}, fmt.Errorf("workflow_kill: run_id is required")
+	}
+	mgr := resolveWorkflowManager(ctx)
+	found, wasRunning := mgr.Kill(runID)
+	switch {
+	case !found:
+		return agent.ToolResult{}, fmt.Errorf("workflow_kill: no run named %q in this session", runID)
+	case !wasRunning:
+		return agent.ToolResult{Text: fmt.Sprintf("Workflow %s had already finished — nothing to cancel.", runID)}, nil
+	default:
+		return agent.ToolResult{Text: fmt.Sprintf("Cancelled workflow %s. It will report as killed shortly; "+
+			"workflow_status(%q) confirms.", runID, runID)}, nil
+	}
+}

@@ -1,0 +1,582 @@
+package anthropic
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/provider"
+	"github.com/open-octo/octo-agent/internal/provider/retry"
+)
+
+// TestSend_CustomHeaders verifies that Client.Headers are attached to the
+// outgoing request.
+func TestSend_CustomHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Header.Get("X-Tenant-Id"), "tenant-42"; got != want {
+			t.Errorf("X-Tenant-Id header = %q, want %q", got, want)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id": "msg_01",
+			"type": "message",
+			"role": "assistant",
+			"model": "claude-haiku-4-5-20251001",
+			"content": [{"type": "text", "text": "hi"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 1, "output_tokens": 1}
+		}`))
+	}))
+	defer srv.Close()
+
+	c, err := New("test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.BaseURL = srv.URL
+	c.Headers = map[string]string{"X-Tenant-Id": "tenant-42"}
+
+	if _, err := c.Send(context.Background(), provider.Request{
+		Model:    "claude-haiku-4-5-20251001",
+		Messages: []agent.Message{agent.NewUserMessage("hello")},
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+}
+
+// TestSend_CustomHeaderOverridesBuiltin verifies that a custom header can
+// override a built-in one (x-api-key), for gateways that require a
+// non-standard auth header.
+func TestSend_CustomHeaderOverridesBuiltin(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Header.Get("x-api-key"), "override-value"; got != want {
+			t.Errorf("x-api-key header = %q, want %q", got, want)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id": "msg_01",
+			"type": "message",
+			"role": "assistant",
+			"model": "claude-haiku-4-5-20251001",
+			"content": [{"type": "text", "text": "hi"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 1, "output_tokens": 1}
+		}`))
+	}))
+	defer srv.Close()
+
+	c, err := New("test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.BaseURL = srv.URL
+	c.Headers = map[string]string{"x-api-key": "override-value"}
+
+	if _, err := c.Send(context.Background(), provider.Request{
+		Model:    "claude-haiku-4-5-20251001",
+		Messages: []agent.Message{agent.NewUserMessage("hello")},
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+}
+
+func TestSend_Success(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Headers
+		if got, want := r.Header.Get("x-api-key"), "test-key"; got != want {
+			t.Errorf("x-api-key header = %q, want %q", got, want)
+		}
+		if got := r.Header.Get("anthropic-version"); got == "" {
+			t.Errorf("anthropic-version header empty")
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json", ct)
+		}
+
+		// Body
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var req apiRequest
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			t.Fatalf("decode req: %v", err)
+		}
+		if req.Model != "claude-haiku-4-5-20251001" {
+			t.Errorf("model = %q, want claude-haiku-4-5-20251001", req.Model)
+		}
+		// System is now sent in the cacheable array form: a single text block
+		// carrying the prompt plus an ephemeral cache_control breakpoint.
+		sysJSON, _ := json.Marshal(req.System)
+		if !strings.Contains(string(sysJSON), `"you are octo"`) {
+			t.Errorf("system missing prompt text: %s", sysJSON)
+		}
+		if !strings.Contains(string(sysJSON), `"ephemeral"`) {
+			t.Errorf("system missing cache_control breakpoint: %s", sysJSON)
+		}
+		if len(req.Messages) != 1 {
+			t.Fatalf("messages len = %d, want 1", len(req.Messages))
+		}
+		// The last message carries a cache breakpoint, so its content is sent
+		// as a block array (not a bare string) with an ephemeral marker.
+		msgJSON := string(req.Messages[0].Content)
+		if req.Messages[0].Role != "user" || !strings.Contains(msgJSON, `"hello"`) {
+			t.Errorf("first message = %+v, want a user block carrying 'hello'", req.Messages[0])
+		}
+		if !strings.Contains(msgJSON, `"ephemeral"`) {
+			t.Errorf("last message should carry a cache breakpoint: %s", msgJSON)
+		}
+
+		// Response
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id": "msg_01",
+			"type": "message",
+			"role": "assistant",
+			"model": "claude-haiku-4-5-20251001",
+			"content": [
+				{"type": "text", "text": "hi there"},
+				{"type": "text", "text": " — i'm octo"}
+			],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 12, "output_tokens": 7}
+		}`))
+	}))
+	defer srv.Close()
+
+	c, err := New("test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.BaseURL = srv.URL
+
+	resp, err := c.Send(context.Background(), provider.Request{
+		Model:        "claude-haiku-4-5-20251001",
+		SystemPrompt: "you are octo",
+		Messages:     []agent.Message{agent.NewUserMessage("hello")},
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if resp.Content != "hi there — i'm octo" {
+		t.Errorf("Content = %q, want %q", resp.Content, "hi there — i'm octo")
+	}
+	if resp.Model != "claude-haiku-4-5-20251001" {
+		t.Errorf("Model = %q", resp.Model)
+	}
+	if resp.StopReason != "end_turn" {
+		t.Errorf("StopReason = %q", resp.StopReason)
+	}
+	if resp.InputTokens != 12 || resp.OutputTokens != 7 {
+		t.Errorf("Usage = (%d, %d), want (12, 7)", resp.InputTokens, resp.OutputTokens)
+	}
+}
+
+// TestSend_LargeResponseBody verifies that successful responses larger than the
+// error-body cap are read in full, not truncated mid-JSON.
+func TestSend_LargeResponseBody(t *testing.T) {
+	longText := strings.Repeat("x", 5000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		resp := fmt.Sprintf(`{
+			"id": "msg_large",
+			"type": "message",
+			"role": "assistant",
+			"model": "claude-haiku-4-5-20251001",
+			"content": [{"type": "text", "text": %q}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 10, "output_tokens": 100}
+		}`, longText)
+		_, _ = w.Write([]byte(resp))
+	}))
+	defer srv.Close()
+
+	c, err := New("test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.BaseURL = srv.URL
+
+	resp, err := c.Send(context.Background(), provider.Request{
+		Model:    "claude-haiku-4-5-20251001",
+		Messages: []agent.Message{agent.NewUserMessage("generate a long response")},
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if resp.Content != longText {
+		t.Errorf("Content length = %d, want %d", len(resp.Content), len(longText))
+	}
+}
+
+// TestSend_UserImage_WireFormat verifies a standalone image block on a user
+// message (e.g. a pasted clipboard image) serializes to Anthropic's base64
+// image source nested in the user message content array.
+func TestSend_UserImage_WireFormat(t *testing.T) {
+	var capturedBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedBody, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(`{"id":"msg","type":"message","role":"assistant","model":"x","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+
+	_, err := c.Send(context.Background(), provider.Request{
+		Model: "x",
+		Messages: []agent.Message{{
+			Role: agent.RoleUser,
+			Blocks: []agent.ContentBlock{
+				agent.NewTextBlock("what is this?"),
+				mustPNGBlock(t),
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	var req struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type   string `json:"type"`
+				Text   string `json:"text"`
+				Source *struct {
+					Type      string `json:"type"`
+					MediaType string `json:"media_type"`
+					Data      string `json:"data"`
+				} `json:"source"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(capturedBody, &req); err != nil {
+		t.Fatalf("decode: %v\n%s", err, capturedBody)
+	}
+	if len(req.Messages) != 1 || len(req.Messages[0].Content) != 2 {
+		t.Fatalf("want 1 message with text+image content: %s", capturedBody)
+	}
+	img := req.Messages[0].Content[1]
+	if img.Type != "image" || img.Source == nil {
+		t.Fatalf("content[1] = %+v, want image with source", img)
+	}
+	if img.Source.Type != "base64" || img.Source.MediaType != "image/png" || img.Source.Data == "" {
+		t.Errorf("image source = %+v, want base64 image/png with data", img.Source)
+	}
+}
+
+func TestSend_SystemMessageStripped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var req apiRequest
+		_ = json.Unmarshal(bodyBytes, &req)
+		// Anthropic forbids role:"system" inside the messages array — verify
+		// our adapter strips it and routes content to req.System instead.
+		for _, m := range req.Messages {
+			if m.Role == "system" {
+				t.Errorf("system role leaked into Messages: %+v", m)
+			}
+		}
+		_, _ = w.Write([]byte(`{"id":"msg","type":"message","role":"assistant","model":"x","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+
+	_, err := c.Send(context.Background(), provider.Request{
+		Model: "claude-haiku-4-5-20251001",
+		Messages: []agent.Message{
+			agent.NewSystemMessage("ignore-me-in-array"),
+			agent.NewUserMessage("hi"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+}
+
+func TestSend_HTTPError_Wrapped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{
+			"type":"error",
+			"error":{"type":"invalid_request_error","message":"max_tokens must be > 0"}
+		}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+
+	_, err := c.Send(context.Background(), provider.Request{
+		Model:    "x",
+		Messages: []agent.Message{agent.NewUserMessage("hi")},
+	})
+	if err == nil {
+		t.Fatal("Send: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "HTTP 400") {
+		t.Errorf("error should mention HTTP 400: %v", err)
+	}
+	if !strings.Contains(err.Error(), "max_tokens must be > 0") {
+		t.Errorf("error should include upstream message: %v", err)
+	}
+}
+
+func TestSend_ValidatesRequest(t *testing.T) {
+	c, _ := New("k")
+	c.BaseURL = "http://invalid"
+
+	if _, err := c.Send(context.Background(), provider.Request{}); err == nil {
+		t.Error("empty request should error")
+	}
+	if _, err := c.Send(context.Background(), provider.Request{Model: "x"}); err == nil {
+		t.Error("missing messages should error")
+	}
+}
+
+func TestSend_DefaultMaxTokens(t *testing.T) {
+	var capturedMaxTokens int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var req apiRequest
+		_ = json.Unmarshal(bodyBytes, &req)
+		capturedMaxTokens = req.MaxTokens
+		_, _ = w.Write([]byte(`{"id":"m","type":"message","role":"assistant","model":"x","content":[],"stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0}}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+
+	_, err := c.Send(context.Background(), provider.Request{
+		Model:    "x",
+		Messages: []agent.Message{agent.NewUserMessage("hi")},
+		// MaxTokens intentionally left as zero — adapter should apply the default.
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capturedMaxTokens != DefaultMaxTokens {
+		t.Errorf("MaxTokens = %d, want default %d", capturedMaxTokens, DefaultMaxTokens)
+	}
+}
+
+func TestSend_AppendsMessagesPath(t *testing.T) {
+	// Verify the client always POSTs to BaseURL + "/v1/messages", regardless
+	// of whether the caller's BaseURL has a trailing slash. This is the
+	// guarantee that makes pointing at Anthropic-compatible third parties
+	// (e.g. DeepSeek at https://api.deepseek.com/anthropic) work transparently.
+	cases := []struct {
+		name string
+		base string
+	}{
+		{"no trailing slash", ""}, // populated below with srv.URL
+		{"trailing slash", ""},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var gotPath string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				_, _ = w.Write([]byte(`{"id":"m","type":"message","role":"assistant","model":"x","content":[],"stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0}}`))
+			}))
+			defer srv.Close()
+
+			cl, _ := New("k")
+			cl.BaseURL = srv.URL
+			if i == 1 {
+				cl.BaseURL = srv.URL + "/"
+			}
+
+			_, err := cl.Send(context.Background(), provider.Request{
+				Model:    "x",
+				Messages: []agent.Message{agent.NewUserMessage("hi")},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotPath != "/v1/messages" {
+				t.Errorf("path = %q, want /v1/messages", gotPath)
+			}
+		})
+	}
+}
+
+func TestSend_BaseAlreadyHasV1_StripsDuplicate(t *testing.T) {
+	// Mirrors the OpenAI client test: if a relay bakes "/v1" into its base
+	// URL, the client must detect it and only append "/messages" so the final
+	// URL is not ".../v1/v1/messages". Defensive parity with openai.Client.
+	cases := []struct {
+		name string
+		base string
+	}{
+		{"base ends with /v1", "https://gw.example.com/v1"},
+		{"base ends with /v1/", "https://gw.example.com/v1/"},
+		{"base ends with longer path + /v1", "https://gw.example.com/anthropic/v1"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cl, _ := New("k")
+			cl.BaseURL = c.base
+			got := cl.endpointURL()
+
+			// Must NOT contain "/v1/v1".
+			if strings.Contains(got, "/v1/v1") {
+				t.Errorf("endpointURL() = %q, must not contain /v1/v1", got)
+			}
+			// Must end with exactly "/v1/messages".
+			if !strings.HasSuffix(got, "/v1/messages") {
+				t.Errorf("endpointURL() = %q, must end with /v1/messages", got)
+			}
+		})
+	}
+}
+
+// Compile-time assertion: *Client implements provider.Provider.
+var _ provider.Provider = (*Client)(nil)
+
+func TestSend_ParsesCacheUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"msg_01","type":"message","role":"assistant","model":"m",
+			"content":[{"type":"text","text":"hi"}],
+			"stop_reason":"end_turn",
+			"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":1200,"cache_read_input_tokens":3400}
+		}`))
+	}))
+	defer srv.Close()
+
+	c, err := New("k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.BaseURL = srv.URL
+
+	resp, err := c.Send(context.Background(), provider.Request{
+		Model:    "m",
+		Messages: []agent.Message{agent.NewUserMessage("hi")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.CacheWriteTokens != 1200 {
+		t.Errorf("CacheWriteTokens = %d, want 1200 (cache_creation_input_tokens)", resp.CacheWriteTokens)
+	}
+	if resp.CacheReadTokens != 3400 {
+		t.Errorf("CacheReadTokens = %d, want 3400 (cache_read_input_tokens)", resp.CacheReadTokens)
+	}
+}
+
+func TestSend_RetriesTransientThenSucceeds(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			// First attempt: transient 503 with a Retry-After the policy caps.
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"type":"overloaded_error","message":"try again"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"m","type":"message","role":"assistant","model":"x",
+			"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",
+			"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+	c.Retry = retry.Policy{MaxAttempts: 4, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond}
+
+	resp, err := c.Send(context.Background(), provider.Request{
+		Model:    "x",
+		Messages: []agent.Message{agent.NewUserMessage("hi")},
+	})
+	if err != nil {
+		t.Fatalf("expected success after retry, got %v", err)
+	}
+	if resp.Content != "ok" {
+		t.Errorf("content = %q, want ok", resp.Content)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("expected 2 HTTP attempts (1 retry), got %d", got)
+	}
+}
+
+func TestSend_DoesNotRetryClientError(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusBadRequest) // 400: not retryable
+		_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"bad"}}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+	c.Retry = retry.Policy{MaxAttempts: 4, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}
+
+	if _, err := c.Send(context.Background(), provider.Request{
+		Model:    "x",
+		Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}); err == nil {
+		t.Fatal("expected error for 400")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("400 should not be retried; attempts=%d", got)
+	}
+}
+
+// TestSend_ToolUseWithNonToolUseStopReason verifies a response carrying a
+// tool_use block is treated as a tool-use turn even when a (misbehaving)
+// compatible backend reports stop_reason "end_turn" instead of "tool_use".
+func TestSend_ToolUseWithNonToolUseStopReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"msg","type":"message","role":"assistant","model":"x","content":[{"type":"tool_use","id":"toolu_1","name":"edit_file","input":{"path":"a.go"}}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New("test-key")
+	c.BaseURL = srv.URL
+	resp, err := c.Send(context.Background(), provider.Request{
+		Model: "x", Messages: []agent.Message{agent.NewUserMessage("edit it")},
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if resp.StopReason != "tool_use" {
+		t.Errorf("StopReason = %q, want tool_use (tool_use block present despite stop_reason end_turn)", resp.StopReason)
+	}
+	gotTool := false
+	for _, b := range resp.Blocks {
+		if b.Type == "tool_use" && b.Name == "edit_file" {
+			gotTool = true
+		}
+	}
+	if !gotTool {
+		t.Error("expected an edit_file tool_use block")
+	}
+}
+
+// mustPNGBlock builds an image block from a minimal valid PNG. NewImageBlock
+// identifies the format by sniffing the bytes rather than trusting the caller's
+// label, so a fixture needs the real 8-byte signature — truncated stand-ins are
+// correctly rejected.
+func mustPNGBlock(t *testing.T) agent.ContentBlock {
+	t.Helper()
+	blk, ok := agent.NewImageBlock("image/png", []byte("\x89PNG\r\n\x1a\n"))
+	if !ok {
+		t.Fatal("fixture PNG was rejected by NewImageBlock")
+	}
+	return blk
+}

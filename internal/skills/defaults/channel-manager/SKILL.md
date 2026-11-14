@@ -1,0 +1,459 @@
+---
+name: channel-manager
+system: true
+description: |
+  Configure IM platform channels (Feishu, Weixin/WeChat, WeCom, DingTalk, Discord, Telegram) for octo.
+  Guides the user through platform consoles, collects credentials, writes ~/.octo/channels.yml,
+  and diagnoses connection problems.
+  Trigger on: "channel setup", "setup feishu", "setup weixin", "setup wechat", "setup wecom",
+  "setup dingtalk", "setup discord", "setup telegram",
+  "channel config", "channel status", "channel enable", "channel disable", "channel doctor",
+  "connect feishu", "connect wechat", "connect wecom", "connect dingtalk", "connect discord", "connect telegram",
+  "配置飞书", "设置微信", "接入企业微信", "配置钉钉", "连接飞书", "渠道设置", "渠道状态",
+  "启用渠道", "禁用渠道", "渠道诊断", "绑定飞书机器人", "配置 IM 渠道".
+  Subcommands: setup, status, enable <platform>, disable <platform>, doctor.
+---
+
+# Channel Manager Skill
+
+## Terminology
+
+When conversing in Chinese, refer to a user-created agent profile as **专家**
+(not 智能体) when asking whether to bind a channel instance to one — matches
+the desktop/web UI's Chinese labels. English conversations keep "agent".
+
+Configure IM platform channels for octo. Supported platforms: `feishu`, `weixin`, `wecom`, `dingtalk`, `discord`, `telegram`.
+
+## How channels work in octo
+
+- Config lives in `~/.octo/channels.yml` (YAML, mode 600). Edit it directly with
+  `read_file` / `write_file`.
+- The server API is written `127.0.0.1:8088` throughout this skill, the default
+  address. If the Environment section has an `Octo server:` line, use that
+  address in every command instead.
+- Each platform can have **multiple bot instances** — e.g. 3 Feishu bots in one group,
+  each bound to a different expert agent. Instances are named; the name becomes the
+  `adapter_id` used in profile `channel_bindings`.
+- Adapters run inside `octo serve`, started alongside the HTTP server (skip with
+  `--no-channel`). Config changes are applied on save via `POST /api/channels/<platform>`
+  — no full restart needed.
+- Weixin login state lives separately in `~/.octo/weixin-credentials.json`, written by
+  the QR-login flow this skill drives (`POST /api/channels/weixin/login` on the running serve).
+
+`channels.yml` schema (multi-instance):
+
+```yaml
+channels:
+  feishu:
+    - name: code-review-bot       # instance name (adapter_id); omit for single-instance
+      enabled: true | false
+      app_id: string              # required
+      app_secret: string          # required
+      domain: string              # optional, default https://open.feishu.cn
+      allowed_users: string       # optional, comma-separated user IDs; empty = allow all
+    - name: ops-bot               # second instance, same platform
+      enabled: true
+      app_id: ...
+      app_secret: ...
+  weixin:
+    - enabled: true | false
+      token: string               # bot token; optional if cred_path exists
+      cred_path: string           # optional, default ~/.octo/weixin-credentials.json
+      base_url: string            # optional, default https://ilinkai.weixin.qq.com
+      allowed_users: string
+  dingtalk:
+    - name: ...                   # optional
+      enabled: true | false
+      client_id: string           # required (AppKey)
+      client_secret: string       # required (AppSecret)
+      allowed_users: string
+  wecom:
+    - name: ...
+      enabled: true | false
+      bot_id: string              # required, intelligent robot Bot ID (starts with "aib")
+      secret: string              # required, robot secret
+      allowed_users: string
+  discord:
+    - name: ...
+      enabled: true | false
+      bot_token: string           # required, from the Discord Developer Portal
+      allowed_users: string
+  telegram:
+    - name: ...
+      enabled: true | false
+      bot_token: string           # required, from @BotFather
+      base_url: string            # optional, default https://api.telegram.org
+      parse_mode: string          # optional, default "Markdown"; empty string disables
+      allowed_users: string
+```
+
+**New instance on an existing platform**: append another `-` entry under the platform key with a unique `name`. The `name` field is the `adapter_id`; single-instance setups can omit it (the platform name is used as the default).
+
+## Hot-reload after config change
+
+After writing `channels.yml`, apply the change without a full restart:
+
+```bash
+curl -s -X POST "http://127.0.0.1:8088/api/channels/<platform>/reload"
+```
+
+- HTTP 200 → the adapter started immediately. Done.
+- Connection refused → the server isn't running. Ask to start it with `octo serve`.
+
+Use this in place of `restart_server` throughout this skill. The tool is no longer
+available in the desktop build (the server runs in-process with no supervisor), so
+hot-reload via the API is the only zero-downtime path.
+
+---
+
+## Command Parsing
+
+| User says | Subcommand |
+|---|---|
+| `channel setup`, `setup feishu`, `setup weixin`, `setup wechat`, `setup wecom`, `setup dingtalk`, `setup discord`, `setup telegram` | setup |
+| `channel status` | status |
+| `channel enable <platform>` | enable |
+| `channel disable <platform>` | disable |
+| `channel doctor` | doctor |
+
+---
+
+## `status`
+
+1. Read `~/.octo/channels.yml`. If missing or empty: "No channels configured yet. Run `/channel-manager setup` to get started." and stop.
+2. Check whether the server (which hosts the adapters) is responding:
+   ```bash
+   curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8088/api/health
+   ```
+   `200` → RUNNING. Non-200 / connection refused → STOPPED.
+   > Do NOT use `pgrep -f "octo.*serve"`: the server process is named `octo-desktop` in the desktop build and won't match. The health check works uniformly across `octo serve`, desktop, and TUI-hosted serves.
+3. Display:
+
+```
+Channel Status                       (adapter process: RUNNING/STOPPED)
+─────────────────────────────────────────────────────
+Platform   Enabled   Details
+feishu     ✅ yes    app_id: cli_xxx…
+weixin     ✅ yes    credentials: present
+dingtalk   ❌ no     (not configured)
+─────────────────────────────────────────────────────
+```
+
+- Feishu: show `app_id` truncated to 12 chars.
+- Weixin: show whether `token` is set or a credential file exists (`cred_path`, else `~/.octo/weixin-credentials.json`). Never print the token value.
+- DingTalk: show `client_id` truncated to 12 chars. Never print `client_secret`.
+- WeCom: show `bot_id` truncated to 12 chars. Never print `secret`.
+- Discord: show whether `bot_token` is set (`token: present`). Never print the token value.
+- Telegram: show whether `bot_token` is set (`token: present`). Never print the token value.
+
+If the process is STOPPED but at least one platform is enabled, ask: "`octo serve` 未运行，是否现在启动？" If the user agrees and you can start it safely, run `octo serve` in the background. If it is RUNNING but started before a recent config change, trigger a hot reload (see "Hot-reload after config change") so the new config takes effect without a restart.
+
+---
+
+## `setup`
+
+Ask which platform to connect. `ask_user_question` takes at most 4 options, so
+ask it in two steps rather than cramming all six in: first the family, then the
+platform within it.
+
+> Which platform would you like to connect?
+>
+> 1. Feishu (飞书)
+> 2. Telegram (Bot API)
+> 3. Discord
+> 4. Something else (WeChat, WeCom, DingTalk)
+
+If they pick "Something else", ask again with those three:
+
+> Which one?
+>
+> 1. Weixin (Personal WeChat via iLink QR login)
+> 2. WeCom (企业微信 intelligent robot)
+> 3. DingTalk (钉钉)
+
+After a platform is chosen, ask whether this is a new configuration or an additional
+instance on an existing platform:
+
+> Is this a new platform setup, or adding another bot instance to an existing one?
+>
+> (If the platform isn't configured yet, skip this question.)
+
+**Adding an instance to an existing platform**: append a new `-` entry under the
+platform key with a `name`. Ask the user for a name (e.g. "code-review-bot",
+"ops-bot"), then proceed to the platform-specific credentials steps below. The
+`name` is the `adapter_id` — it appears in InboundEvent and is used for
+profile `channel_bindings`.
+
+**After credentials are validated and saved**, ask:
+
+> Do you want to bind this bot instance to an expert agent? If yes, which agent?
+
+List the available agents via `GET /api/agents`. When the user picks one, call
+`POST /api/agents/:id/bind` with `{"platform": "<platform>", "adapter_id": "<name>", "chat_id": "<group or DM id>"}`.
+The `adapter_id` must match the instance `name` in channels.yml.
+
+**Unbinding** — when the user asks to unbind (解绑 / 改回默认 agent / 换回默认):
+
+Call `DELETE /api/agents/:id/bind` with the same body
+`{"platform": "<platform>", "adapter_id": "<name>", "chat_id": "<group or DM id>"}`.
+The match is exact on **all three fields** (platform, adapter_id, chat_id) — the
+`chat_id` for a DM is the user's IM id (e.g. the weixin `user_id` from the login
+response). After the call the agent's `channel_bindings` no longer contains that
+entry and the chat falls back to the default agent. Confirm success by checking the
+response — the returned agent JSON must not list the removed binding.
+
+> The `chat_id` to use for unbind is the same one used at bind time. If you don't
+> have it handy, list the agent via `GET /api/agents/:id` and read
+> `channel_bindings` for the exact `platform` / `adapter_id` / `chat_id` triple.
+
+### Feishu setup
+
+#### Phase 1 — Create the app
+
+1. Tell the user to open <https://open.feishu.cn/app> (log in if needed), then:
+   "Click 'Create Enterprise Self-Built App' (创建企业自建应用), fill in a name (e.g. octo) and description, and submit. Reply done." Wait for "done". Always create a new app — do NOT reuse existing apps.
+
+#### Phase 2 — Enable Bot capability
+
+2. "On the Add App Capabilities page, find the Bot (机器人) card and click Add. Reply done." Wait for "done".
+
+#### Phase 3 — Get credentials
+
+3. "Open 'Credentials & Basic Info' (凭证与基础信息) in the left menu, copy App ID and App Secret, and paste them here as: App ID: xxx, App Secret: xxx". Parse `app_id` and `app_secret` from the reply.
+
+#### Phase 4 — Add message permissions
+
+4. "Open 'Permission Management' (权限管理) → bulk import (批量导入), clear the example content, paste the JSON below, and confirm. Reply done." Wait for "done".
+
+```json
+{
+  "scopes": {
+    "tenant": [
+      "im:message",
+      "im:message.p2p_msg:readonly",
+      "im:message:send_as_bot"
+    ],
+    "user": []
+  }
+}
+```
+
+#### Phase 5 — Validate and save
+
+5. Validate the credentials:
+   ```bash
+   curl -s -X POST "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal" \
+     -H "Content-Type: application/json" \
+     -d '{"app_id":"<APP_ID>","app_secret":"<APP_SECRET>"}'
+   ```
+   Check for `"code":0`. On failure show the error and re-ask for credentials (up to 3 tries).
+6. Merge into `~/.octo/channels.yml` (preserve other platforms), then `chmod 600 ~/.octo/channels.yml`:
+   ```yaml
+   channels:
+     feishu:
+       - name: <NAME>             # user-chosen instance name
+         enabled: true
+         app_id: <APP_ID>
+         app_secret: <APP_SECRET>
+   ```
+
+#### Phase 6 — Configure event subscription (Long Connection)
+
+**CRITICAL**: octo's Feishu adapter uses a WebSocket long connection, and Feishu refuses to save the long-connection event config until a client is connected. So the adapter must be running first.
+
+7. Tell the user to (re)start `octo serve` and wait until the log prints `[feishu] connected to WebSocket`.
+8. "In 'Events & Callbacks' (事件与回调), select 'Long Connection' (长连接) mode and save. Then click Add Event, search `im.message.receive_v1`, and add it. Reply done." Wait for "done".
+
+#### Phase 7 — Publish
+
+9. "Open 'Version Management & Release' (版本管理与发布), create a version (e.g. 1.0.0) and publish it. Reply done." Wait for "done".
+10. "✅ Feishu channel configured." Trigger a hot reload (see "Hot-reload after config change") so the new adapter starts immediately. If the server isn't running, ask the user to start `octo serve` first. Then say: "Find the bot in Feishu and send it a message."
+
+### Weixin setup (Personal WeChat via iLink QR login)
+
+Weixin uses a QR-code login — no app credentials needed.
+
+> Do NOT `pgrep` for `octo serve` before this flow — on desktop the server runs as `octo-desktop` and won't match. Just call the API; if it fails with connection refused, then offer to start the server.
+
+1. Start the QR login flow via the serve API (the response carries the QR link):
+   ```bash
+   curl -s -X POST http://127.0.0.1:8088/api/channels/weixin/login
+   # → {"status":"pending","qr_url":"https://…"}      (or "already_logged_in")
+   ```
+   Pass `-d '{"force":true}'` to re-login over existing credentials.
+2. If the response is `already_logged_in`:
+   - Do **not** tell the user the credentials are definitely valid. The cached token may have expired.
+   - Say: "检测到本地已保存微信登录态，但无法确认是否仍有效。是否重新扫码登录？（回复 `重新登录` 强制重新扫码，回复 `继续` 直接复用当前登录态）"
+   - If the user replies `重新登录`, call `POST /api/channels/weixin/login` with `-d '{"force":true}'` and continue from step 3.
+   - If the user replies `继续` (or any other confirmation), proceed to step 4.
+3. Relay the QR link to the user:
+   > Open this link and scan the QR code with WeChat, then confirm login in the app:
+   > `<qr_url from the response>`
+4. Poll until the flow finishes (every ~3s, up to 5 minutes):
+   ```bash
+   curl -s http://127.0.0.1:8088/api/channels/weixin/login
+   ```
+   - `"status":"done"` — credentials are saved to `~/.octo/weixin-credentials.json`. Continue.
+   - `"status":"pending"` with a new `qr_url` — the QR expired and was refreshed; relay the new link.
+   - `"status":"failed"` — show the `error` and offer to retry from step 1.
+   This agent-driven flow is the only way to log in; the web Channels panel
+   intentionally has no inline QR button.
+5. Enable the platform in `~/.octo/channels.yml` (preserve other platforms), then `chmod 600`:
+   ```yaml
+   channels:
+     weixin:
+       - enabled: true
+   ```
+   The adapter reads `~/.octo/weixin-credentials.json` automatically; only set `cred_path` if the user keeps credentials elsewhere.
+6. After writing `channels.yml`, trigger a hot reload (see "Hot-reload after config change") so the new adapter starts immediately. If the server isn't running, tell the user to start `octo serve`.
+7. "✅ Weixin channel configured. Once `octo serve` is running, message the bot on WeChat."
+
+### DingTalk setup
+
+1. Tell the user to open <https://open-dev.dingtalk.com/> (log in if needed), then:
+   "Create an internal app (企业内部应用): Application Development → Create Application. Reply done." Wait for "done".
+2. "In the app, open 'Add Application Capabilities' (添加应用能力) and add the Bot (机器人) capability. In the bot's message receiving mode, select **Stream mode** (Stream 模式) — octo connects over a WebSocket stream, no callback URL needed. Save/publish the capability. Reply done." Wait for "done".
+3. "Open 'Credentials & Basic Info' (凭证与基础信息), copy Client ID (AppKey) and Client Secret (AppSecret), and paste them here as: Client ID: xxx, Client Secret: xxx". Parse the reply.
+4. Validate:
+   ```bash
+   curl -s -X POST "https://api.dingtalk.com/v1.0/oauth2/accessToken" \
+     -H "Content-Type: application/json" \
+     -d '{"appKey":"<CLIENT_ID>","appSecret":"<CLIENT_SECRET>"}'
+   ```
+   Success returns an `accessToken` field. On failure show the error and re-ask (up to 3 tries).
+5. Merge into `~/.octo/channels.yml` (preserve other platforms), then `chmod 600`:
+   ```yaml
+   channels:
+     dingtalk:
+       - name: <NAME>
+         enabled: true
+         client_id: <CLIENT_ID>
+         client_secret: <CLIENT_SECRET>
+   ```
+6. Trigger a hot reload (see "Hot-reload after config change"). If the server isn't running, remind the user to start `octo serve`. Then say: "✅ DingTalk channel configured. Publish the app version if you haven't, then message the robot in DingTalk."
+
+### WeCom setup (企业微信 intelligent robot)
+
+WeCom "API mode" intelligent robots connect over a WebSocket long connection — no public callback URL needed.
+
+1. Tell the user to open <https://work.weixin.qq.com/wework_admin/frame#/aiHelper/create> (scan to log in if needed), then:
+   "Scroll to the bottom of the right panel and click 'API mode creation' (API 模式创建). Reply done." Wait for "done".
+2. "Click 'Add' next to 'Visible Range' (可见范围), select the top-level company node, and confirm. Reply done." Wait for "done".
+3. "If the Secret is not visible, click 'Get Secret' (获取 Secret). Copy the Bot ID and Secret **before** clicking Save, and paste them here as: Bot ID: xxx, Secret: xxx". Parse the reply. Trim whitespace; the `bot_id` starts with `aib` — if the two values look swapped, swap them back.
+4. "Click Save, enter a name (e.g. octo) and description, confirm, and click Save again. Reply done." Wait for "done".
+5. Merge into `~/.octo/channels.yml` (preserve other platforms), then `chmod 600`:
+   ```yaml
+   channels:
+     wecom:
+       - name: <NAME>
+         enabled: true
+         bot_id: <BOT_ID>
+         secret: <SECRET>
+   ```
+   There is no public REST endpoint to pre-validate these credentials — they are checked when the WebSocket subscribes. After `octo serve` starts, an invalid pair logs `[wecom] authentication failed`.
+6. Trigger a hot reload (see "Hot-reload after config change"). If the server isn't running, remind the user to start `octo serve`. Then say: "✅ WeCom channel configured. Find the bot in the WeCom client under Contacts → Smart Bot (智能机器人) and message it."
+
+### Discord setup
+
+Discord requires manual portal interaction (hCaptcha gates application creation). Guide the user through the portal in one round-trip.
+
+1. Tell the user to open <https://discord.com/developers/applications>, then give **all** of the following in a single message and collect the values from their plain reply. Don't reach for `ask_user_question` here — it needs 2-4 discrete choices, and a token has none:
+   > 1. Click **New Application** (top-right), name it (e.g. "octo"), accept the ToS, click **Create**.
+   > 2. In the left nav click **Bot**.
+   > 3. Scroll to **Privileged Gateway Intents** and turn on **MESSAGE CONTENT INTENT**, then **Save Changes**.
+   > 4. Scroll up, click **Reset Token** → **Yes, do it!** → **Copy**. (The token is shown only once — copy before navigating away.)
+   > 5. In the left nav click **General Information** and copy the **Application ID**.
+   >
+   > Paste both back as one line: `token=YOUR_BOT_TOKEN app_id=YOUR_APPLICATION_ID`
+
+   If the user chats in a non-English language, append the localized label in parens after each bolded English button name (the English label is what they physically click). Parse with tolerant matching (`token=\S+`, `app_id=\d+`); if either field is missing, re-ask with the same format reminder (up to 3 tries).
+2. Validate the token:
+   ```bash
+   curl -s -H "Authorization: Bot <BOT_TOKEN>" \
+     -H "User-Agent: DiscordBot (https://github.com/open-octo/octo-agent, 1.0)" \
+     https://discord.com/api/v10/users/@me
+   ```
+   Success returns the bot user JSON with an `id`. A 401 means a bad token — re-ask.
+3. Merge into `~/.octo/channels.yml` (preserve other platforms), then `chmod 600`:
+   ```yaml
+   channels:
+     discord:
+       - name: <NAME>
+         enabled: true
+         bot_token: <BOT_TOKEN>
+   ```
+4. Build the invite URL with the Application ID and tell the user to open it:
+   `https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot&permissions=274878220912`
+   > Pick your server from the dropdown → Continue → Authorize. If the dropdown is empty you don't have a server yet — open <https://discord.com/channels/@me>, click the **+** button → Create My Own, then re-open the invite link.
+5. Trigger a hot reload (see "Hot-reload after config change"). If the server isn't running, remind the user to start `octo serve`. Then say: "✅ Discord channel configured. @-mention the bot in a channel or DM it."
+
+### Telegram setup (Bot API)
+
+Telegram is the simplest — no browser automation, no QR. The user creates a bot via @BotFather and pastes the token.
+
+1. Tell the user:
+   > Open Telegram and chat with **@BotFather** (https://t.me/BotFather). Send `/newbot`, pick a display name and a username ending in `bot`. BotFather replies with an HTTP API token like `123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ`. Paste the token here.
+   >
+   > Optional: if your network blocks `api.telegram.org`, also give me the base URL of your self-hosted Bot API server.
+
+   Parse the token (matches `^\d+:[\w-]{30,}$`).
+2. Validate with `getMe`:
+   ```bash
+   curl -s "<BASE_URL_OR_https://api.telegram.org>/bot<TOKEN>/getMe"
+   ```
+   Success returns `"ok":true`. `401 Unauthorized` means a wrong token — re-ask.
+3. Merge into `~/.octo/channels.yml` (preserve other platforms; omit `base_url` unless the user gave one), then `chmod 600`:
+   ```yaml
+   channels:
+     telegram:
+       - name: <NAME>
+         enabled: true
+         bot_token: <TOKEN>
+   ```
+4. Trigger a hot reload (see "Hot-reload after config change"). If the server isn't running, remind the user to start `octo serve`. Then say: "✅ Telegram channel configured. Open your bot in Telegram and send it a message."
+   > **For group chats**: disable Privacy Mode first (@BotFather → `/mybots` → Bot Settings → Group Privacy → Turn off), then **remove and re-add the bot to the group** — otherwise it cannot receive any group messages, including @-mentions.
+
+---
+
+## `enable` / `disable`
+
+1. Read `~/.octo/channels.yml`. If the platform has no entry (or required fields are missing), redirect to `setup`.
+2. Toggle `enabled: true|false` for that platform only; preserve every other field and platform.
+3. Write back, `chmod 600 ~/.octo/channels.yml`.
+4. Say "✅ `<platform>` channel enabled." / "❌ `<platform>` channel disabled.", then trigger a hot reload (see "Hot-reload after config change"). If the server isn't running, remind the user to start `octo serve`.
+
+---
+
+## `doctor`
+
+Check each item, report ✅ / ❌ with remediation:
+
+1. **Config file** — `~/.octo/channels.yml` exists, is valid YAML, and has mode 600 (`stat -f %Lp` on macOS, `stat -c %a` on Linux).
+2. **Required fields** — for each enabled **instance** (list under each platform):
+   - Feishu: `app_id`, `app_secret` non-empty.
+   - Weixin: `token` non-empty, or a readable credential file (`cred_path`, else `~/.octo/weixin-credentials.json`).
+   - DingTalk: `client_id`, `client_secret` non-empty.
+   - WeCom: `bot_id` (starts with `aib`), `secret` non-empty.
+   - Discord: `bot_token` non-empty.
+   - Telegram: `bot_token` non-empty.
+   Also check that no two instances share the same `name` (adapter_id) across or within platforms.
+3. **Feishu credentials** (if enabled) — run the tenant_access_token curl from setup Phase 5; `"code":0` → ✅, else ❌ "Feishu credentials rejected — re-run setup".
+4. **DingTalk credentials** (if enabled) — run the accessToken curl from setup step 4; `accessToken` present → ✅, else ❌ "DingTalk credentials invalid — re-run setup".
+5. **Weixin credentials** (if enabled) — credential file exists and contains a non-empty `token` → ✅, else ❌ "Re-run the weixin QR login (web Channels panel, or `POST /api/channels/weixin/login`)".
+6. **Discord credentials** (if enabled) — run the `/users/@me` curl from Discord setup step 2; an `id` in the response → ✅, else ❌ "Discord token invalid or revoked — re-run setup".
+7. **Telegram credentials** (if enabled) — run the `getMe` curl from Telegram setup step 2; `"ok":true` → ✅, else ❌ "Telegram token rejected by getMe — re-run setup".
+8. **WeCom credentials** (if enabled) — no public REST validation endpoint; check the `octo serve` output for `[wecom] authentication failed` → ❌ "WeCom credentials incorrect — re-run setup", or `[wecom] connected, authenticating` with no auth error → ✅.
+9. **Serve process** — use the health check from `status` (`curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8088/api/health`); if no enabled platform, skip; if enabled but not running, ❌ "Run `octo serve`" (and ask to start it if the user agrees).
+10. **Recorded issue** (if serve is running) — query the live status instead of only grepping logs:
+    ```bash
+    curl -s http://127.0.0.1:8088/api/channels
+    ```
+    Each entry's `issue` field (omitted when healthy) carries the exact reason the adapter isn't running: an unregistered/misconfigured/invalid-config skip at startup, or a crash-and-restart status such as `restarting (2/10) after crash: ...` or `gave up after 11 crashes: ...`. A non-empty `issue` → ❌, quote it verbatim, and point at the matching setup step; a "gave up" issue means retries are exhausted and the platform needs `enable`/`disable` + hot reload (or a config fix + full server restart) to try again — it will not recover on its own.
+
+---
+
+## Security
+
+- Always mask secrets in output — show at most the first 4 and last 4 characters.
+- `~/.octo/channels.yml` must be mode 600; fix with `chmod 600` after every write.
+- Never echo `app_secret`, `client_secret`, `secret`, `bot_token`, or `token` values back to the user.

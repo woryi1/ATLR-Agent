@@ -1,0 +1,508 @@
+import type { AskQuestion } from './askStepper'
+
+export type View = 'chat' | 'agents' | 'skills' | 'workflows' | 'tasks' | 'browser' | 'mcp' | 'channels' | 'lightapps'
+export type SidebarMode = 'full' | 'rail' | 'hidden'
+export type MemTab = 'soul' | 'user' | 'memories'
+export type ArtifactView = 'preview' | 'code'
+export type TagStatus = 'success' | 'info' | 'warning' | 'error' | 'default'
+
+// Session matches the server-side session item returned by the REST API and
+// broadcast over the WebSocket. The UI stores it as-is; title/name may differ
+// depending on which endpoint produced the record.
+export interface Session {
+  id: string
+  name: string
+  title: string
+  created_at: string
+  updated_at: string
+  model: string
+  model_id: string
+  // "running" while a turn is in flight (see server sessionStatus) — seeded by
+  // GET /api/sessions, kept live via session_update (subscribed tabs) and the
+  // global session_activity turn_started/turn_ended pair (all tabs).
+  status: 'idle' | 'running' | string
+  source: string
+  agent_profile: string
+  pinned: boolean
+  total_tasks: number
+  turn_count: number
+  working_dir: string
+  permission_mode: 'interactive' | 'auto' | 'strict' | string
+  reasoning_effort: 'low' | 'medium' | 'high' | string
+  show_reasoning?: boolean
+  context_usage: number
+  // Set when this session has an outstanding ask_user_question awaiting an
+  // answer — seeded by the initial GET /api/sessions, kept live via the global
+  // session_activity broadcast (App.svelte), independent of whether this
+  // tab is currently subscribed to the session.
+  pending_question?: boolean
+  // Set when a permission confirmation is awaiting an answer — the approval
+  // analogue of pending_question, driving the mobile feed's needs-approval card.
+  pending_confirmation?: boolean
+  // Optional UI-only fields carried by some broadcasts.
+  time?: string
+  icon?: string
+  // BranchedFrom is the session id this session was branched from, if any.
+  branched_from?: string
+}
+
+// SessionGroup is a Web-UI sidebar grouping. Membership lives here (session
+// IDs), not on the session, so the CLI/TUI listing is unaffected. Collapsed is
+// persisted server-side so the folded state is consistent across the Web UI
+// and the desktop webview.
+// A group with a working_dir is a "project": every session in it runs its
+// tools there, overriding each session's own working dir. Without one it is a
+// plain group, exactly as before projects existed.
+export interface SessionGroup {
+  id: string
+  name: string
+  session_ids: string[]
+  collapsed?: boolean
+  /** Set on a project — its generated workspace, where its sessions run. */
+  working_dir?: string
+  /** External folders the project references (repos and plain folders alike). */
+  source_dirs?: string[]
+  /** Set on a scheduled task's run cluster. */
+  task_id?: string
+  /** The project's own reasoning level ("low".."max"; "" = off/unset). */
+  reasoning_effort?: string
+  /** The member session the user was last looking at in this project. */
+  last_session_id?: string
+}
+
+export interface Skill {
+  name: string
+  desc: string
+  icon: string
+  tagStatus: TagStatus
+  tagLabel: string
+  enabled: boolean
+  source: string
+}
+
+export interface Workflow {
+  name: string
+  desc: string
+  icon: string
+  tagStatus: TagStatus
+  tagLabel: string
+  source: string
+}
+
+export interface ScheduledTask {
+  name: string
+  target: string
+  cron: string
+  nextRun: string
+  tagStatus: TagStatus
+  tagLabel: string
+}
+
+export interface McpServer {
+  name: string
+  command: string
+  transport: string
+  tools: number
+  icon: string
+  tagStatus: TagStatus
+  tagLabel: string
+  enabled: boolean
+}
+
+export interface Channel {
+  platform: string
+  adapter_id?: string
+  enabled: boolean
+  running?: boolean
+  has_config?: boolean
+  fields?: Record<string, string>
+  issue?: string
+}
+
+export interface Memory {
+  name: string
+  path: string
+  size: number
+  updated_at: string
+  source: string
+}
+
+export interface RecallFile {
+  name: string
+  path: string
+  size: string
+  age: string
+  icon: string
+  orphan: boolean
+}
+
+export interface Artifact {
+  name: string
+  type: string
+  ver: string
+  short: string
+  icon: string
+  code: string
+  preview: string
+  path: string
+  // src is set for image artifacts only: the artifacts endpoint URL. Images are
+  // rendered by a plain <img> in the host document rather than through the
+  // sandboxed `preview` iframe (which cannot authenticate — see lib/artifacts.ts),
+  // and the download action saves these bytes.
+  src?: string
+  // code and preview are built lazily on first selection (hydrateArtifact in
+  // lib/artifacts.ts); loaded flips true once they are populated. Image
+  // artifacts observe as loaded — they carry src instead of a preview document.
+  loaded: boolean
+  // Set when the lazy build could not fetch the body: preview holds a
+  // placeholder note rather than the document, and code is empty. Actions
+  // that persist the body (copy, download) are disabled.
+  loadFailed?: boolean
+  // HTML artifacts render as a page of their own (/_artifacts/<token>/, see
+  // internal/server/artifact_pages.go): originURL is the page URL the frame
+  // loads by src, and preview stays empty. originUnavailable is set instead
+  // when the grant request failed, and the panel says the preview could not
+  // load in its place.
+  originURL?: string
+  originUnavailable?: boolean
+  // Observation count for this path in the session; bumps on every re-write
+  // so a byte-identical URL still reloads the frame.
+  rev?: number
+}
+
+// SkillInfo matches the Go server skill struct
+export interface SkillInfo {
+  name: string
+  description: string
+  source: string
+  enabled: boolean
+}
+
+// McpServerInfo matches the Go server MCP server struct
+export interface McpServerInfo {
+  name: string
+  transport: string
+  source: string
+  disabled: boolean
+  invalid: boolean
+  command: string
+  args: string[]
+  env: Record<string, string>
+  url: string
+  headers: Record<string, string>
+  auth: string
+  status: 'connected' | 'error' | 'disabled' | 'invalid' | 'disconnected'
+  error: string
+  tools: string[]
+}
+
+// McpTool matches a single advertised tool from a connected MCP server.
+export interface McpTool {
+  name: string
+  description?: string
+  inputSchema?: Record<string, any>
+}
+
+// McpServerDetail matches the Go server mcpServerDetail struct.
+export interface McpServerDetail {
+  name: string
+  transport: string
+  source: string
+  disabled: boolean
+  invalid?: string
+  command?: string
+  args?: string[]
+  env?: Record<string, string>
+  url?: string
+  headers?: Record<string, string>
+  auth?: string
+  status: 'connected' | 'error' | 'disabled' | 'invalid' | 'disconnected'
+  error?: string
+  tools: number
+  tool_list?: McpTool[]
+}
+
+// ToolSearchSettings matches the Go server tool search settings struct
+export interface ToolSearchSettings {
+  enabled: 'auto' | 'on' | 'off'
+  threshold_pct: number
+}
+
+// WebSocket event interfaces
+export interface WsEventOutput {
+  type: 'output'
+  content: string
+}
+
+export interface WsEventHistoryUserMessage {
+  type: 'history_user_message'
+  content: string
+  created_at: string
+  images: string[]
+}
+
+export interface WsEventAssistantMessage {
+  type: 'assistant_message'
+  content: string
+  files: string[]
+  thinking: string
+}
+
+// Timing note: live tool events carry a server-stamped `ts` (ms) so a
+// mid-turn replay keeps true start/end times; history-replayed tool events
+// carry `created_at` instead, following the history_user_message convention.
+// Same concept, two names — one per event family.
+export interface WsEventToolCall {
+  type: 'tool_call'
+  name: string
+  args: string
+  summary: string
+  ts?: number
+}
+
+export interface WsEventToolResult {
+  type: 'tool_result'
+  result: string
+  ui_payload: any
+  ts?: number
+}
+
+export interface WsEventToolError {
+  type: 'tool_error'
+  error: string
+  ts?: number
+}
+
+export interface WsEventToolStdout {
+  type: 'tool_stdout'
+  lines: string[]
+}
+
+export interface WsEventProgress {
+  type: 'progress'
+  message: string
+  progress_type: string
+  phase: string
+  status: string
+  started_at: string
+  elapsed: number
+}
+
+export interface WsEventComplete {
+  type: 'complete'
+  iterations: number
+  duration: number
+  awaiting_user_feedback: boolean
+}
+
+export interface WsEventSessionUpdate {
+  type: 'session_update'
+  status: string
+  tasks: number
+  latency: number
+  context_usage: number
+  working_dir: string
+  permission_mode: 'interactive' | 'auto' | 'strict'
+  reasoning_effort: 'off' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | string
+  show_reasoning: boolean
+}
+
+export interface WsEventTodoUpdate {
+  type: 'todo_update'
+  todos: any[]
+}
+
+export interface WsEventSessionDeleted {
+  type: 'session_deleted'
+  session_id: string
+}
+
+export interface WsEventRequestFeedback {
+  type: 'request_feedback'
+  session_id: string
+  question: string
+  context: string
+  options: string[]
+}
+
+export interface WsEventRequestConfirmation {
+  type: 'request_confirmation'
+  session_id: string
+  id: string
+  message: string
+  kind: string
+  // #1105: what's actually being approved. At most one is set.
+  tool_name?: string
+  command?: string // terminal
+  diff?: string // edit_file
+  input?: string // other tools
+}
+
+export interface WsEventConfirmationComplete {
+  type: 'confirmation_complete'
+  session_id: string
+  id: string
+  result: string
+}
+
+export interface WsEventDismissConfirmation {
+  type: 'dismiss_confirmation'
+  session_id: string
+  id: string
+}
+
+export interface WsEventRequestUserQuestion {
+  type: 'request_user_question'
+  session_id: string
+  question_id: string
+  /** 1-4 questions, navigated as tabs with a review/submit tab. */
+  questions: AskQuestion[]
+  /** Masked-input question (replay secret collection): render a password field. */
+  secret?: boolean
+}
+
+export interface WsEventBackgroundTaskUpdate {
+  type: 'background_task_update'
+  session_id: string
+  running: boolean
+  tasks: any[]
+}
+
+export interface WsEventDiff {
+  type: 'diff'
+  old_size: number
+  new_size: number
+  diff: string
+  truncated: boolean
+}
+
+export interface WsEventFilePreview {
+  type: 'file_preview'
+  path: string
+  operation: string
+  is_new_file: boolean
+}
+
+export interface WsEventShellPreview {
+  type: 'shell_preview'
+  command: string
+}
+
+export interface WsEventNextMessageSuggestion {
+  type: 'next_message_suggestion'
+  text: string
+}
+
+// Cross-session signal, broadcast globally regardless of subscription — see
+// wsEventSessionActivity in internal/server/ws_types.go for why this exists
+// (request_user_question/session_update/complete only reach subscribers of
+// that exact session).
+export interface WsEventSessionActivity {
+  type: 'session_activity'
+  session_id: string
+  kind: 'question_pending' | 'question_resolved' | 'confirm_pending' | 'confirm_resolved' | 'turn_started' | 'turn_ended' | 'turn_complete'
+}
+
+// Discriminated union of all WebSocket event types
+export type WsEvent =
+  | WsEventOutput
+  | WsEventHistoryUserMessage
+  | WsEventAssistantMessage
+  | WsEventToolCall
+  | WsEventToolResult
+  | WsEventToolError
+  | WsEventToolStdout
+  | WsEventProgress
+  | WsEventComplete
+  | WsEventSessionUpdate
+  | WsEventTodoUpdate
+  | WsEventSessionDeleted
+  | WsEventRequestFeedback
+  | WsEventRequestConfirmation
+  | WsEventConfirmationComplete
+  | WsEventDismissConfirmation
+  | WsEventRequestUserQuestion
+  | WsEventBackgroundTaskUpdate
+  | WsEventDiff
+  | WsEventFilePreview
+  | WsEventShellPreview
+  | WsEventNextMessageSuggestion
+  | WsEventSessionActivity
+
+// ── Git Diff review panel ─────────────────────────────────────────────────
+// Mirrors internal/server/diff_parse.go. Prefixed Git* because WsEventDiff
+// above is a different thing entirely (the edit_file tool's inline preview).
+
+export interface GitDiffLine {
+  kind: 'context' | 'add' | 'del'
+  content: string
+}
+
+export interface GitDiffHunk {
+  header: string
+  lines: GitDiffLine[]
+}
+
+export interface GitDiffPatch {
+  old_path: string
+  new_path: string
+  hunks: GitDiffHunk[]
+}
+
+export type GitDiffStatus = 'M' | 'A' | 'D' | 'R' | 'C' | 'T' | '?'
+
+export interface GitDiffFile {
+  path: string
+  /** Renames and copies only. */
+  old_path?: string
+  status: GitDiffStatus
+  staged: boolean
+  adds: number
+  dels: number
+  binary: boolean
+  /** patch holds a prefix of the change; total_lines is the full size. */
+  truncated: boolean
+  /** The response line budget ran out before this file, so patch is null. */
+  omitted: boolean
+  total_lines: number
+  patch: GitDiffPatch | null
+}
+
+export interface GitDiffRepo {
+  root: string
+  name: string
+  branch: string
+  /** Short commit, set only when HEAD is detached. */
+  commit?: string
+  files: GitDiffFile[]
+  /** This repository's git commands failed; the others still rendered. */
+  error?: string
+}
+
+export interface GitDiffResponse {
+  repos: GitDiffRepo[]
+  truncated_files: number
+  omitted_files: number
+}
+
+export interface GitDiffSummaryRepo {
+  root: string
+  name: string
+  files: { path: string; status: string; staged: boolean }[]
+  error?: string
+}
+
+export interface GitDiffSummaryResponse {
+  repos: GitDiffSummaryRepo[]
+}
+
+// ChatMessage is the UI-layer chat message type
+export interface ChatMessage {
+  id: string
+  type: 'user' | 'assistant' | 'progress' | 'tool_group'
+  content: string
+  streaming: boolean
+  createdAt: number
+  tools: any[]
+  todos: any[]
+}

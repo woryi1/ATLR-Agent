@@ -1,0 +1,330 @@
+# Light Apps：对话生成、持久可用的前端小程序
+
+## 背景
+
+octo-agent 已经有一套完整的生成 + 展示循环：Agent 生成 HTML → `show_artifact` → Artifacts panel 渲染。但这个链路是**一次性**的——刷新页面，Artifact 就没了。用户下次想用同一个对账工具、会议模板、随机生成器，得重新描述一遍需求，Agent 重新生成一遍。
+
+同时，Agent 的 token 成本决定了"事事问 Agent"不是最优解。很多场景是**固定流程**——输入确定、规则确定、输出确定——每次走一遍 LLM 又贵又慢。
+
+本方案在现有能力上加一层**持久化**：把"用一次就丢的 Artifact"升级为"保存后随时打开的 Light App"，不引入新工具、不新增后端模块。
+
+## 核心原则
+
+> **不做新工具。** Agent 用已有的 `write_file` / `read_file` / `edit_file` 操作 Light App 文件，`show_artifact` 做预览。Web UI 从文件系统直接读目录列表渲染。全链路零新 tool。
+
+> **够用就好。** 只做纯前端 HTML Light App。不做 Python 进程、不做 TCP 端口分配、不做后端沙箱。octo 自己 origin 下的页面路由（`/_apps/<slug>/`）就是运行容器。
+
+## 设计概览
+
+```
+对话中生成 HTML → show_artifact 预览 ──→ 用户确认保存
+                                          ↓
+                              write_file 写入 ~/.octo/light-apps/<slug>/
+                                          ↓
+                              用户之后在「轻应用」面板点击打开
+                                          ↓
+                              Artifacts panel 渲染 index.html
+```
+
+生成阶段费 token，使用阶段零 token——和 Swiflow 的理念一致，但用 octo-agent 原生能力承载。
+
+## 存储约定
+
+```
+~/.octo/light-apps/
+├── csv-reconcile/
+│   ├── manifest.json
+│   └── index.html
+└── meeting-minutes/
+    ├── manifest.json
+    └── index.html
+```
+
+### manifest.json
+
+```json
+{
+  "slug": "csv-reconcile",
+  "name": "CSV 对账工具",
+  "description": "上传两份 CSV，按指定列对比差异结果",
+  "icon": "📊",
+  "created_at": "2026-07-26T10:00:00Z"
+}
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `slug` | ✅ | 目录名，字母/数字/连字符，唯一 |
+| `name` | ✅ | 展示名称 |
+| `description` | ✅ | 一句话描述，在列表卡片中展示 |
+| `icon` | ✅ | 单个 emoji，在卡片和标题中展示 |
+| `created_at` | ✅ | ISO-8601 时间，Agent 生成时填入 |
+| `mount` | | `"view"` 时在左侧导航有自己的入口；UI 卡片上的开关（`PUT /api/light-apps/{slug}/mount`）或手写 |
+| `public` | | 为真时 `/_apps/<slug>/` 不需要登录即可访问；只由 UI 开关写入 |
+| `databases` | | 页面查询的具名数据库列表；只在应用公开时起作用，公开应用只能读列出的库（`dev-docs/named-databases-design.md`） |
+
+### index.html
+
+入口 HTML。约束（与会话制品相同）：
+
+- **同目录文件用相对路径**：脚本、样式、图片、字体、模型、音视频、数据文件、其他 `.html` 页面放在应用目录里，`./app.js`、`./style.css` 直接引用；不能以 `/` 开头，应用挂在路径前缀之下
+- **外链不限**：可以加载任意 CDN、调用任意公网 API
+- **文件处理**：`<input type="file">` + `FileReader` API，浏览器端搞定
+- **不调 octo 的 API**：这是指导，不是技术限制
+- **持久化存储可用**：直接用标准 `localStorage`，按应用划分命名空间
+- **文件导出可用**：直接用标准 `<a download>` 写法
+- **表单 submit 处理器必须 `event.preventDefault()`**：不拦的话 frame 会被重载、应用内存态全丢
+
+### 运行环境
+
+轻应用从 octo 自己 origin 下的 `/_apps/<slug>/` 渲染，由 `internal/server/lightapp_pages.go` 服务，和会话制品的
+`/_artifacts/<token>/` 同一套机制（`dev-docs/same-origin-artifacts-design.md`）。本机、桌面端、隧道、域名、IP 直连
+都走这一条路。页面与 `/api` 同一套鉴权：本机走回环豁免，远程靠 UI 已有的登录 cookie（iframe 同源，请求自动带上）；
+manifest `public` 为真的应用不需要登录。
+
+面板里的 iframe 用 `src` 加载它，sandbox 为 `ARTIFACT_ORIGIN_SANDBOX`
+（`allow-scripts allow-same-origin allow-forms allow-modals allow-downloads allow-pointer-lock`，
+`web/src/lib/artifacts.ts`），`allow="fullscreen; clipboard-write"`。不给 `allow-popups` 和 `allow-top-navigation`，
+应用误操作不会弹窗或把 octo 标签页跳走。
+
+隔离只到"不干扰界面"为止：iframe 是独立文档，样式和全局变量不串；`localStorage` 由注入脚本包进
+`octo.page.<slug>:` 前缀，应用 `clear()` 清不掉界面的设置，应用之间也不会互相覆盖。应用与界面同源，
+它的脚本能以用户身份调 API，这是有意接受的取舍（SECURITY.md）。
+
+同目录的任何文件都按扩展名服务，入口之外的 `.html` 也会被注入同一段脚本。入口整读做注入，上限 64 MB；
+其余文件流式服务、不设上限。
+
+`allow-modals` 的代价照旧：alert/confirm/prompt、`window.print()`、`beforeunload` 是 tab 级 modal，
+一个 `while(true) alert()` 的坏应用能卡住整个页面直到用户勾"阻止此页再弹对话框"。接受这个取舍：
+轻应用是用户让自己的 agent 写的。
+
+### 服务端注入的脚本
+
+服务端在入口 `<head>` 开始标签之后（没有就在 doctype 之后，再没有就在最前面）插入两段 `<script>`：一行配置
+`window.__octoPage={"download":<bool>,"ns":"<slug>"}`（`json.Marshal` 会转义 `<>&`），以及嵌入二进制的
+`internal/server/page_shim.js`。插在页面脚本之前，保证页面第一次访问 `localStorage` 时拿到的已经是包装后的对象。
+
+脚本做两件事：
+
+- **localStorage 命名空间。** `Object.defineProperty(window, 'localStorage', …)` 换成一个 Proxy，底层仍是真实存储；
+  键加前缀，`clear()`、`length`、`key(i)` 只作用于自己前缀下的键，属性读写同样经过前缀。
+- **下载桥（仅桌面端）。** 桌面 webview 没有 download delegate，`<a download>` 是静默空操作。服务端在
+  `cfg.Native != nil` 时把 `download` 置真，脚本拦截标准写法——document 级 click 监听 +
+  `HTMLAnchorElement.prototype.click` 补丁覆盖游离锚点——把目标 `fetch` 成 Blob，经
+  `{__laBridge:1, op:'download', ns, name, blob}` 交给宿主，宿主 `deliverLaDownload`（`web/src/lib/laDownload.ts`）
+  走 `/api/native/save-file` 的系统保存对话框。宿主只听用 `registerLaIframe` 登记过的窗口，且 `ns` 必须等于登记的
+  slug。上限 100MB、文件名剥路径分隔符和控制字符、同一时刻只开一个保存对话框。
+
+### 存储迁移
+
+应用的旧数据可能在两处：`<slug>.apps.localhost` 的 `localStorage`（此前的独立源），以及宿主 IndexedDB
+`octo-la-storage` 里 `{slug}:{key}` 的行（更早的 srcdoc shim）。宿主第一次打开某个应用时
+（`ensureLightAppStorage`，`web/src/lib/laStorage.ts`）把两处数据写进命名空间，只写还不存在的键，
+然后记 `octo.page.migrated.<slug>`；iframe 的 `src` 等迁移完成才设置。读旧独立源的方法是插一个隐藏 iframe 加载
+`http://<slug>.apps.localhost:<port>/__octo_export`，该页面把自己的 `localStorage` 整份 `postMessage` 回来；
+只有 UI 在 `localhost` / `127.0.0.1` 上时才这么做，5 秒无回音按无数据处理。`*.apps.localhost` 上只剩这一个导出页。
+
+对轻应用来说这些都是**零改动**：继续写标准的 `localStorage` 和 `<a download>`，没有专用接口。
+
+## Agent 交互流程
+
+### 生成 + 保存
+
+```
+用户：「我想做一个 CSV 对账工具」
+    ↓
+Agent: clarify ── 确认列结构、对账规则、输出格式
+    ↓
+Agent: write_file 写入临时位置，生成完整 index.html
+    ↓
+Agent: show_artifact ── 在 Artifacts panel 展示，用户预览交互
+    ↓
+Agent: （预判场景——对账是重复性任务）主动问：
+      「效果满意吗？要不要存成轻应用，以后随时打开？」
+    ↓
+用户：「存，叫 csv-reconcile」
+    ↓
+Agent: write_file ~/.octo/light-apps/csv-reconcile/manifest.json
+Agent: write_file ~/.octo/light-apps/csv-reconcile/index.html
+    ↓
+Agent: 「已保存！以后在轻应用面板随时打开。」
+```
+
+### 更新已有应用
+
+```
+用户：「之前那个 CSV 对账工具，加一个导出 Excel 的功能」
+    ↓
+Agent: read_file ~/.octo/light-apps/csv-reconcile/index.html
+    ↓
+Agent: edit_file 修改
+    ↓
+Agent: show_artifact ── 展示更新后的版本
+    ↓
+Agent: write_file 覆盖原 index.html
+```
+
+### 删除
+
+```
+用户：「删除 CSV 对账」
+    ↓
+Agent: rm -rf ~/.octo/light-apps/csv-reconcile/
+```
+
+（Agent 可以用 terminal 或确认后用 write_file 覆盖，推荐 terminal `rm -rf`）
+
+## System Prompt 注入
+
+在 Agent 的 system prompt 中新增以下知识段落：
+
+```
+## Light Apps
+
+You can turn HTML artifacts into reusable "Light Apps" that users open anytime
+without consuming LLM tokens. When you generate an HTML page for the user,
+evaluate whether the task is REPEATABLE — if yes, proactively suggest saving.
+
+### Storage
+~/.octo/light-apps/<slug>/
+  manifest.json  {"slug":"...","name":"...","description":"...","icon":"..."}
+  index.html     the app; files it needs go beside it
+
+### When to suggest
+  ✅ Repeated tasks: daily/weekly reports, data reconciliation, format
+     conversion, template tools, worksheet generators, checklist tools
+  ✅ Well-defined input → output with fixed rules
+  ✅ Pure client-side HTML/CSS/JS
+  ❌ One-off research or analysis
+  ❌ Tasks needing LLM reasoning each time
+  ❌ Backend-dependent workflows (use a skill or workflow instead)
+
+### Workflow
+1. Generate the HTML, preview with show_artifact
+2. Ask the user: "保存为轻应用？"
+3. On confirmation: write manifest.json + index.html per the storage spec above
+4. Use existing write_file — no special tools needed
+
+### Constraints
+- index.html is served at /_apps/<slug>/; files beside it load by relative path, never with a leading `/`
+- External scripts, stylesheets and APIs may come from any host
+- No calls to octo's API from inside the page
+- Use FileReader + <input type="file"> for file processing
+- Use emoji or inline SVG for icons
+- Follow artifact-design skill conventions for layout and colors
+```
+
+## 生成质量保障
+
+Agent 生成 Light App HTML 时，已有 `artifact-design` 技能自动生效，确保：
+
+- **窄屏适配**：Artifacts panel 默认宽度 ~720px，不用宽屏布局
+- **配色规范**：走 artifact-design 的 `references/charts.md` 分类/顺序/发散色板
+- **外链克制**：artifact-design skill 要求只在需要真库时才用 CDN，同目录文件走相对路径
+- **中文友好**：系统默认字体覆盖 CJK
+
+不需要为 Light App 单独写新的 skill——现有技能已经覆盖了 HTML 生成的全部约束。
+
+## Web UI
+
+### 导航入口
+
+在「我的数据」栏目下，位于「助手记忆」和「文件回收站」之间，新增「轻应用」导航项。
+
+### 交互原则：Agentic First UI
+
+面板上的操作按钮不直接修改数据——而是**启动正确的对话**，让 Agent 来执行。这符合 octo-agent「agentic first UI」的设计理念：用户面对的不是工具面板，而是 Agent 的快捷入口。
+
+- **新建** → 打开新会话，Agent 引导用户描述需求并生成 Light App
+- **编辑** → 打开新会话，预加载当前 Light App 内容，Agent 根据用户要求修改
+- **删除** → 仅需二次确认，不必走 Agent。如果用户要批量清理或条件删除，可以在对话里让 Agent 用 `rm` 处理
+
+### 面板布局
+
+```
+┌─ 轻应用 ────────────────────────────────────────────┐
+│                                      [+ 新建轻应用] │
+│                                                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌───────────┐  │
+│  │     📊       │  │     📝       │  │    🗺️     │  │
+│  │  CSV 对账工具│  │  会议纪要模板│  │  旅行路线  │  │
+│  │  上传两份    │  │  结构化记录  │  │  行程规划  │  │
+│  │  CSV 对比   │  │  要点和待办  │  │  可视化    │  │
+│  │             │  │             │  │           │  │
+│  │ [打开] [编辑]│  │ [打开] [编辑]│  │ [打开] [编辑]│
+│  │        [删除]│  │        [删除]│  │        [删除]│
+│  └──────────────┘  └──────────────┘  └───────────┘  │
+│                                                     │
+│  ── 还没有轻应用 ──                                  │
+│  点击「新建轻应用」让 Agent 帮你生成一个吧！          │
+│                                                     │
+└──────────────────────────────────────────────────────┘
+```
+
+### 卡片元素
+
+每个卡片展示：
+- **icon**（emoji，大号显示在卡片顶部）
+- **name**（应用名称，粗体）
+- **description**（一行灰色小字）
+- **操作按钮**（三个，底部分布）
+
+### 操作按钮行为
+
+| 按钮 | 行为 |
+|---|---|
+| **打开** | 在 Artifacts panel 渲染 `index.html`。面板按 slug 缓存 HTML；tab 条上有刷新按钮，关闭 tab 会清掉缓存 |
+| **编辑** | 打开新会话，自动填入上下文：「请帮我修改轻应用「{name}」，当前内容：{index.html 摘要}」 |
+| **删除** | 弹出二次确认：「确定删除轻应用「{name}」吗？」，确认后删除对应目录 |
+
+### 顶部新建按钮
+
+「+ 新建轻应用」按钮打开新会话，自动填入引导性 prompt：「我想创建一个新的轻应用，用来……」。Agent 按已有流程 clarify → 生成 → 预览 → 保存。
+
+### 数据来源
+
+前端可以直接通过 octo-agent 的文件读取能力访问 `~/.octo/light-apps/`，或者通过一个轻量 API 端点：
+
+```
+GET /api/light-apps           →  {"apps": [{slug, name, description, icon, created_at, updated_at}], "dir"}
+GET /api/light-apps/{slug}    →  {"manifest": {...}, "html": "<index.html content>"}
+```
+
+推荐走 API 而不是让前端直接读文件系统——路径解析、安全边界更清晰。实现只是读目录 + 解析 manifest.json + 读 index.html，几十行 Go。
+
+`updated_at` 是 `index.html` 的 mtime，服务端读取时临时打上，不写进 manifest.json。
+
+### 变更检测
+
+Agent 改轻应用走的是普通文件工具，服务端没有任何"文件变了"的广播（仓库里没有 fsnotify，侧栏的 store_watch 也是同样的取舍）。面板里有打开的轻应用时，前端每 5 秒拉一次列表，把当前 tab 的 `updated_at` 和它渲染那份的 stamp 比对，不一致就在应用上方浮一条「{name} 已更新 · 刷新」；页面切到后台时暂停。只提示不自动重载——运行中的应用有自己的状态，刷掉它得由用户决定。
+
+## 和现有功能的关系
+
+| 现有能力 | 关系 | 说明 |
+|---|---|---|
+| **Skills** | 互补 | Skill 是给 Agent 看的指令模板；Light App 是给用户用的工具 |
+| **Workflows** | 互补 | Workflow 编排 Agent 多步骤执行；Light App 不经过 Agent |
+| **Artifacts** | 升级 | Artifacts 是临时展示；Light App 是持久化的 Artifact |
+| **Cron tasks** | 无关 | Cron 定时触发 Agent；Light App 不适合做定时任务 |
+| **show_artifact** | 复用 | 预览和打开都用同一个 panel，不需要新工具 |
+
+## 不做的事
+
+- **不做 Python/Node 运行时 Light App**。保持零外部依赖，只用浏览器沙箱。如果未来真有需求（如需要 pandas 处理大 CSV），再评估是否引入 `pyodide`（WASM Python）而不是起系统进程。
+- **不做 Light App 间的数据共享**。每个 App 独立，不引入跨 App 的消息机制。
+- **不做 Light App 的版本管理**。覆盖即更新，不保留历史版本。用户要回滚可以自己在对话里让 Agent 重新生成。
+- **不做「从 Light App 回调 Agent」**。纯前端闭环。宿主与轻应用之间只有桌面端下载这一条 postMessage 通道，不扩成通用 RPC。用户想用 AI 能力时回到对话。
+
+## 实现分阶段
+
+| 阶段 | 内容 | 预估 |
+|---|---|---|
+| **P0 - 核心** | System prompt 注入 Light Apps 知识 | 加一段 prompt，10 分钟 |
+| **P0 - 核心** | Agent 生成 HTML 时主动建议保存 | prompt 驱动，不写代码 |
+| **P1 - UI** | 前端「轻应用」列表页 | 一个 Vue 页面，~150 行 |
+| **P1 - API** | `GET /api/light-apps` + `GET /api/light-apps/{slug}` | 两个 handler，~50 行 Go |
+| **P1 - UI** | Artifacts panel 打开 Light App | 复用现有能力 |
+| **P2 - 优化** | 列表页搜索、排序、空状态引导 | 锦上添花 |
+
+P0 不写一行代码，配好 prompt 就能让 Agent 开始生成和保存 Light App。
+P1 加前端入口和 API 端点，用户才能真正「打开」已保存的应用。

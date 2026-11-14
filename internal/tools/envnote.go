@@ -1,0 +1,88 @@
+package tools
+
+import (
+	"os"
+	"runtime"
+)
+
+// Locale returns the session's effective locale (LC_ALL with precedence over
+// LANG), or "" when neither is set. Reported in the env context so the model
+// can anticipate the default encoding and sort order (e.g. a GBK Windows
+// console, a non-UTF-8 locale).
+func Locale() string {
+	if lc := os.Getenv("LC_ALL"); lc != "" {
+		return lc
+	}
+	return os.Getenv("LANG")
+}
+
+// shellEnvNoteWindows is the Windows shell guidance injected into the session
+// environment context. It lives next to shellCommand (sandbox.go) — the code
+// that actually picks PowerShell — so the behavior and its description can't
+// drift apart, and is shared by the CLI and server context builders.
+//
+// Beyond dialect, it covers the three traps that strand a session that
+// installs a tool mid-conversation:
+//   - each terminal command inherits octo's startup PATH, so a fresh install
+//     is invisible until PATH is refreshed in-command or octo restarts;
+//   - installers raise a UAC dialog only a user at the screen can approve;
+//   - the default execution policy blocks Node's npm.ps1 shim.
+//
+// It also steers file writes away from the PowerShell cmdlets entirely: their
+// default encodings (ANSI from Set-Content, UTF-16LE from `>`) re-encode files
+// that were UTF-8, which users see as their source files getting corrupted.
+//
+// Quoting gets its own line because models carry bash's `\"` escape into
+// PowerShell, where it closes the string instead: inline `python -c "..."`
+// code then reaches the interpreter with its quotes stripped (#2563).
+const shellEnvNoteWindows = "- Shell: PowerShell. Use PowerShell syntax and cmdlets " +
+	"(Get-ChildItem, Get-Content, Select-String, Remove-Item, $env:VAR), not POSIX sh. " +
+	"Chain commands with `;` rather than `&&` (Windows PowerShell 5.1 lacks `&&`). " +
+	"Prefer the built-in read_file / glob / grep tools over shelling out — they're identical across platforms.\n" +
+	"- Quoting: PowerShell's escape character is the backtick, not backslash — inside \"...\" a `\\\"` ENDS the string " +
+	"(a bash habit), and `$` expands. Don't inline multi-line code with `python -c` / `node -e`: write it to a file " +
+	"with write_file and run that, or pipe a single-quoted here-string, which applies no escaping at all " +
+	"(`@'` on its own line, the code, then `'@ | python -` at the start of a line).\n" +
+	"- Writing files: never create or rewrite a file with `Set-Content`, `Add-Content`, `Out-File`, `>` or `>>`. " +
+	"Windows PowerShell 5.1 writes ANSI (the host code page — GBK on a Chinese Windows) from Set-Content/Add-Content " +
+	"and UTF-16LE from `>`/Out-File, while Get-Content decodes as ANSI, so a read-modify-write pipeline such as " +
+	"`(Get-Content f) -replace 'a','b' | Set-Content f` silently re-encodes a UTF-8 file and drops every character " +
+	"the code page cannot map. Use write_file / edit_file instead — they always read and write UTF-8.\n" +
+	"- Installing tools mid-session: every terminal command runs in a fresh shell inheriting octo's " +
+	"startup PATH, so a tool installed via winget/MSI is NOT found afterwards even though the install " +
+	"succeeded. Refresh PATH inside the same command — " +
+	"`$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')` " +
+	"— or invoke the binary by full path (e.g. `& \"$env:ProgramFiles\\nodejs\\node.exe\" -v`). " +
+	"If oddities persist, ask the user to restart octo.\n" +
+	"- Installers raise a UAC elevation dialog the user must approve at the screen — warn them to expect it. " +
+	"When winget is unavailable (older Windows 10) or the user is a novice, prefer handing them a download " +
+	"link (e.g. the nodejs.org LTS installer) to click through the GUI installer, then verify afterwards.\n" +
+	"- The default PowerShell execution policy blocks Node's npm.ps1 shim ('running scripts is disabled') — " +
+	"invoke `npm.cmd` / `npx.cmd` explicitly instead.\n"
+
+// shellEnvNoteDarwin covers the macOS equivalents: sudo prompts hang the
+// non-interactive shell, mid-session installs miss this session's PATH
+// (Apple Silicon Homebrew lives in /opt/homebrew/bin), a fresh Mac pops the
+// Xcode CLT dialog on first git/compiler use, and novices do better with a
+// GUI .pkg than with installing Homebrew first.
+const shellEnvNoteDarwin = "- Shell notes (macOS): never run `sudo` through the terminal tool — the password " +
+	"prompt can't be answered here and the command hangs; use a GUI installer or Homebrew instead. " +
+	"A tool installed mid-session may not be on this session's PATH (commands inherit octo's startup " +
+	"environment; Apple Silicon Homebrew installs to /opt/homebrew/bin) — invoke it by full path " +
+	"(e.g. `/opt/homebrew/bin/node -v`) or ask the user to restart octo. " +
+	"On a fresh Mac the first `git`/compiler use pops the Xcode Command Line Tools install dialog while " +
+	"the command itself fails — tell the user to click Install, wait for it to finish, then retry. " +
+	"For novice users without Homebrew, hand them a GUI installer link (e.g. the nodejs.org LTS .pkg) " +
+	"rather than installing Homebrew first.\n"
+
+// ShellEnvNote returns platform-shell guidance for the session environment
+// context, or "" on platforms where the default POSIX assumptions hold.
+func ShellEnvNote() string {
+	switch runtime.GOOS {
+	case "windows":
+		return shellEnvNoteWindows
+	case "darwin":
+		return shellEnvNoteDarwin
+	}
+	return ""
+}

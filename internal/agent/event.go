@@ -1,0 +1,226 @@
+package agent
+
+// EventKind tags an AgentEvent by what happened.
+type EventKind string
+
+const (
+	// EventTextDelta carries one piece of the assistant's text reply, as it
+	// arrives off the provider stream. Multiple deltas concatenate to form
+	// the full reply text.
+	EventTextDelta EventKind = "text_delta"
+
+	// EventThinkingDelta carries one fragment of a reasoning model's thinking
+	// trace, streamed before the visible reply. Text holds the fragment;
+	// fragments concatenate to form the full trace. Emitted only when the Sender
+	// surfaces reasoning (e.g. reasoning display is enabled); observers render it
+	// dimmed and distinct from the answer. It is NOT part of Reply.Content.
+	EventThinkingDelta EventKind = "thinking_delta"
+
+	// EventToolInputDelta fires zero or more times while the LLM is
+	// streaming a tool_use block's input arguments (e.g. write_file's
+	// content field). ToolID / ToolName identify the call; InputDelta is
+	// the raw JSON fragment as it arrived on the wire — fragments
+	// concatenate to form the final JSON object. EventToolStarted (with
+	// the fully-parsed Input map) still fires after the arguments are
+	// complete and parsed.
+	//
+	// These events are useful for live-rendering large tool arguments
+	// (e.g. showing a file's content as it's being written) in a Web UI.
+	// Most CLI consumers can ignore them.
+	EventToolInputDelta EventKind = "tool_input_delta"
+
+	// EventToolStarted fires immediately before a tool is dispatched.
+	// ToolID / ToolName / Input identify the call.
+	EventToolStarted EventKind = "tool_started"
+
+	// EventToolProgress fires zero or more times between EventToolStarted and
+	// EventToolDone, surfacing incremental tool output (e.g. a long shell
+	// command's stdout line-by-line). Only tools that implement
+	// StreamingToolExecutor emit these; tools that don't are silent until
+	// EventToolDone. Chunk carries the new fragment, NOT the running total —
+	// it's not truncated (the consumer is responsible for any rate limiting
+	// or batching).
+	EventToolProgress EventKind = "tool_progress"
+
+	// EventToolDone fires after a successful tool execution.
+	// Output carries the tool's combined stdout/stderr text (truncated to
+	// EventToolOutputCap if longer).
+	EventToolDone EventKind = "tool_done"
+
+	// EventToolError fires when the tool executor reports an error result
+	// (IsError=true on the underlying ToolResultBlock). Err carries the
+	// failure message; Output may still contain partial stdout from the
+	// failing process.
+	EventToolError EventKind = "tool_error"
+
+	// EventTurnDone fires once at the end of a successful Run/RunStream,
+	// after the assistant's final reply is committed to history. Reply
+	// carries the aggregated final Reply.
+	EventTurnDone EventKind = "turn_done"
+
+	// EventTurnError marks a turn-level failure — the LLM call (or turn setup)
+	// errored out, as opposed to a single tool failing (EventToolError). The
+	// agent loop does not emit it; Run/RunStream returns the error directly and
+	// transports surface it under this kind so consumers can tell a turn abort
+	// from a per-tool error. Err carries the failure message.
+	EventTurnError EventKind = "turn_error"
+
+	// EventSteerInjected fires when the agent loop drains the inbox and
+	// injects mid-turn user messages into history. Messages carries the
+	// drained texts so observers (e.g. the TUI) can render them in the
+	// transcript at the correct chronological position — before the next
+	// assistant reply, not after the turn ends.
+	EventSteerInjected EventKind = "steer_injected"
+
+	// EventCompactStarted fires when history compaction begins, just before
+	// the summarization side-call. Compact carries the pre-compaction context
+	// estimate and how much is being folded so observers can show a "compacting
+	// conversation history" indicator. Compaction is silent to the model; these
+	// events exist only to keep the user informed.
+	EventCompactStarted EventKind = "compact_started"
+
+	// EventCompactProgress fires repeatedly while the summary streams back from
+	// the model. Chunk carries the newest text fragment of the summary;
+	// Compact.SummaryTokens is the running estimate of summary length so far.
+	// Observers can show a live "generated ~N tokens" indicator. Fires only
+	// when the underlying Sender streams; otherwise compaction jumps straight
+	// from started to done.
+	EventCompactProgress EventKind = "compact_progress"
+
+	// EventCompactDone fires once compaction finishes (or fails). Compact
+	// carries the before/after context estimates; when they are equal the
+	// compaction was a no-op (summarization failed or returned nothing) and the
+	// full history was kept. Observers should clear any compaction indicator.
+	EventCompactDone EventKind = "compact_done"
+
+	// EventGoalUpdated fires when the session goal record changes during a
+	// turn — usage accounting moved the counters or a budget crossing flipped
+	// the status. Goal carries the updated snapshot. Mutations made outside a
+	// turn (slash commands, HTTP API) don't flow through here; the mutating
+	// surface returns the Goal to its caller directly.
+	EventGoalUpdated EventKind = "goal_updated"
+
+	// EventImageDescribing fires around each image the pre-send transform hands
+	// to the vision helper, so the UI can explain the pause before the model
+	// starts replying. ImageStatus is "started", "done" or "failed";
+	// ImageName/ImageIndex/ImageTotal identify which image, and Err carries the
+	// reason on "failed". Cached descriptions emit nothing — there is no wait
+	// to explain.
+	EventImageDescribing EventKind = "image_describing"
+)
+
+// EventToolOutputCap is the maximum length of the Output field emitted on
+// EventToolDone / EventToolError. The agent loop never truncates the actual
+// tool result going back into the conversation — this cap only applies to
+// what's surfaced to event observers (Web UI cards, IM previews), where a
+// 100KB shell dump would be useless noise.
+//
+// 8KB is enough for web_fetch/read_file/grep previews (first ~40 lines) to
+// remain useful while keeping event payloads small; the frontend folds long
+// outputs anyway.
+const EventToolOutputCap = 8 * 1024
+
+// AgentEvent is the union shape carried over the EventHandler callback.
+//
+// All fields are populated only for the EventKinds that need them; the rest
+// stay at zero values. The contract for each kind:
+//
+//   - EventTextDelta:      Text
+//   - EventThinkingDelta:  Text
+//   - EventToolInputDelta: ToolID, ToolName, InputDelta
+//   - EventToolStarted:    ToolID, ToolName, Input
+//   - EventToolProgress:   ToolID, ToolName, Chunk
+//   - EventToolDone:       ToolID, ToolName, Output, UI (when the tool provides one)
+//   - EventToolError:      ToolID, ToolName, Output (may be empty), Err
+//   - EventTurnDone:       Reply
+//   - EventSteerInjected:  Messages
+//   - EventCompactStarted:  Compact (BeforeTokens, FoldedMsgs, KeptTurns, MaxTokens)
+//   - EventCompactProgress: Chunk, Compact (SummaryTokens, MaxTokens)
+//   - EventCompactDone:     Compact (BeforeTokens, AfterTokens, FoldedMsgs)
+//   - EventGoalUpdated:     Goal
+//   - EventImageDescribing: ImageName, ImageIndex, ImageTotal, ImageStatus, Err (on "failed")
+//
+// JSON tags are included so the WS transport (M8 web server) can marshal
+// events directly without an intermediate type.
+type AgentEvent struct {
+	Kind       EventKind      `json:"kind"`
+	Text       string         `json:"text,omitempty"`
+	ToolID     string         `json:"tool_id,omitempty"`
+	ToolName   string         `json:"tool_name,omitempty"`
+	Input      map[string]any `json:"input,omitempty"`
+	InputDelta string         `json:"input_delta,omitempty"`
+	Chunk      string         `json:"chunk,omitempty"`
+	Output     string         `json:"output,omitempty"`
+	Err        string         `json:"err,omitempty"`
+
+	// UI is the tool's optional structured result payload (EventToolDone).
+	// Unlike Output it is never truncated — it is already a compact summary
+	// built by the tool itself (see ToolResult.UI).
+	UI       any           `json:"ui,omitempty"`
+	Reply    *Reply        `json:"reply,omitempty"`
+	Messages []string      `json:"messages,omitempty"`
+	Compact  *CompactStats `json:"compact,omitempty"`
+	Goal     *Goal         `json:"goal,omitempty"`
+
+	// Steer carries the full inbox items behind an EventSteerInjected —
+	// including attachment blocks — for handlers that render more than the
+	// plain texts in Messages.
+	Steer []InboxItem `json:"-"`
+
+	// Image* describe one image going through the vision helper
+	// (EventImageDescribing). ImageName is the file's basename, or "image"
+	// when the block has no on-disk copy; ImageIndex/ImageTotal are 1-based
+	// over the images needing description this turn.
+	ImageName   string `json:"image_name,omitempty"`
+	ImageIndex  int    `json:"image_index,omitempty"`
+	ImageTotal  int    `json:"image_total,omitempty"`
+	ImageStatus string `json:"image_status,omitempty"`
+
+	// SteerBaseIndex is the history position the first steer item was appended
+	// at (EventSteerInjected only). Item k of Steer/Messages lands at
+	// SteerBaseIndex+k, so a persistence-aware handler can label each steered
+	// user message with its true message_index for later edit/branch.
+	SteerBaseIndex int `json:"-"`
+}
+
+// CompactStats carries the numbers behind the compaction events. BeforeTokens
+// and AfterTokens prefer the provider's real input token count when available
+// (lastInputTokens) and fall back to a heuristic estimate otherwise. They exist
+// for a human-readable progress indicator, nothing more.
+type CompactStats struct {
+	// BeforeTokens is the context size before compaction (real when available).
+	BeforeTokens int `json:"before_tokens,omitempty"`
+	// AfterTokens is the context size after compaction (real when available, done only).
+	AfterTokens int `json:"after_tokens,omitempty"`
+	// FoldedMsgs is how many leading messages were folded into the summary.
+	FoldedMsgs int `json:"folded_msgs,omitempty"`
+	// KeptTurns is how many recent user turns were kept verbatim.
+	KeptTurns int `json:"kept_turns,omitempty"`
+	// SummaryTokens is the running estimate of the summary generated so far
+	// (progress only).
+	SummaryTokens int `json:"summary_tokens,omitempty"`
+	// ReclaimedTokens is how many tokens the no-LLM stale-tool-result
+	// reclamation pass freed (done only). When set with FoldedMsgs == 0 the
+	// compaction was handled entirely by the cheap reclamation tier — no
+	// summarize call was made.
+	ReclaimedTokens int `json:"reclaimed_tokens,omitempty"`
+	// MaxTokens is the summary's output-token cap, for a "N / max" readout.
+	MaxTokens int `json:"max_tokens,omitempty"`
+}
+
+// EventHandler is the callback type passed into Agent.RunStream. The handler
+// is invoked synchronously from the agent loop — if it blocks, the loop
+// blocks. Implementations that need async fan-out (e.g. WS to multiple
+// clients) should buffer into a channel and return immediately.
+type EventHandler func(AgentEvent)
+
+// truncateOutput is the helper used by the agent loop before placing tool
+// output into an AgentEvent. Keeping it here rather than in agent.go puts
+// the size policy next to the cap constant.
+func truncateOutput(s string) string {
+	if len(s) <= EventToolOutputCap {
+		return s
+	}
+	// Add a clear marker so consumers know they only got a slice.
+	return s[:EventToolOutputCap] + "…[truncated]"
+}

@@ -1,0 +1,455 @@
+package tools
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/memory"
+)
+
+// imageExtensions maps file extensions to their MIME types for images
+// that multimodal models can consume.
+var imageExtensions = map[string]string{
+	".png":  "image/png",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif":  "image/gif",
+	".bmp":  "image/bmp",
+	".webp": "image/webp",
+	".ico":  "image/x-icon",
+	".tiff": "image/tiff",
+	".heic": "image/heic",
+}
+
+// ReadFileMaxLines caps how many lines a single read_file call returns.
+// Past this, the caller must paginate via offset/limit. Matches the cap
+// Claude Code's Read tool uses (helps keep LLM context sane).
+const ReadFileMaxLines = 2000
+
+// ReadFileImageMaxBytes is the maximum image file size read_file will
+// embed for multimodal models. Past this the user gets an error suggesting
+// they resize or compress the image.
+const ReadFileImageMaxBytes = 5 * 1024 * 1024 // 5 MB
+
+// ReadFileTool reads a UTF-8 text file, optionally a window of it, and
+// returns its content with each line prefixed by its 1-based line number
+// (the `cat -n` format the LLM is already familiar with).
+//
+// For image files (.png, .jpg, .jpeg, .gif, .webp, .bmp, .tiff, .heic, .ico)
+// the tool reads the raw bytes and returns them as an image content block
+// for multimodal model consumption alongside a short text description.
+type ReadFileTool struct{}
+
+func (ReadFileTool) Definition() agent.ToolDefinition {
+	return agent.ToolDefinition{
+		Name: "read_file",
+		Description: "Read a UTF-8 text file and return its content with cat-n-style " +
+			"line numbers. Up to 2000 lines per call — use offset/limit to paginate. " +
+			"The line-number column is for your reference only — it is not part of the " +
+			"file, so never copy it into edit_file's old_string. " +
+			"When the response includes '[end of file: N lines total]' the entire file " +
+			"has been read; do not call read_file again for the same path. " +
+			"Absolute paths are preferred; relative paths resolve against the current " +
+			"working directory. Refuses binary extensions (executables, archives, " +
+			"PDFs, DBs), files whose content is binary or UTF-16 (use the terminal " +
+			"tool for those), and blocking device files (/dev/random, /dev/tty etc). " +
+			"Image files (.png, .jpg, .jpeg, .gif, .webp, .bmp, .tiff, .heic, .ico) " +
+			"are returned as image content for multimodal model consumption, or a " +
+			"refusal if the active model does not accept image input.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{
+					"type":        "string",
+					"description": "File path (absolute preferred). Image files are supported for multimodal models.",
+				},
+				"offset": map[string]any{
+					"type":        "integer",
+					"description": "1-based line number to start from. Defaults to 1 (beginning of file). Only applies to text files.",
+				},
+				"limit": map[string]any{
+					"type":        "integer",
+					"description": "Maximum lines to return. Defaults to 2000. Only applies to text files.",
+				},
+			},
+			"required": []string{"path"},
+		},
+	}
+}
+
+func (ReadFileTool) Execute(ctx context.Context, _ string, input map[string]any) (agent.ToolResult, error) {
+	path, err := requiredPath("read_file", input)
+	if err != nil {
+		return agent.ToolResult{}, err
+	}
+	// Refuse UNC / network paths (\\server\share, //server/share) before
+	// resolving. On Windows these trigger an SMB connection that can leak
+	// NTLM credentials to an attacker-controlled host; nowhere does a
+	// legitimate read need one.
+	if isUNCPath(path) {
+		return agent.ToolResult{}, fmt.Errorf("read_file: refusing network/UNC path %q — it could leak credentials to a remote host", path)
+	}
+	abs, err := resolvePathIn(WorkingDir(ctx), path)
+	if err != nil {
+		return agent.ToolResult{}, err
+	}
+
+	// Refuse device files that would block forever or generate infinite
+	// output. /dev/null is permitted because it just returns EOF immediately.
+	if isBlockedDevicePath(abs) {
+		return agent.ToolResult{}, fmt.Errorf("read_file: refusing to read %s — device file would block or stream indefinitely", path)
+	}
+
+	// Check for image files first — multimodal models can consume them, and so
+	// can a text-only model backed by a vision helper (the agent layer swaps
+	// the block for a description before it goes on the wire). With neither,
+	// refuse: the provider silently drops image blocks, and a model that
+	// believes it "read" an image it cannot see hallucinates the contents.
+	if mimeType := imageMIMEType(abs); mimeType != "" {
+		if !ImagesAllowed(ctx) {
+			return agent.ToolResult{
+				Text: fmt.Sprintf("%s is an image file (%s) and the active model does not accept image input — the contents cannot be read or described. Do not guess what the image shows; tell the user to switch to a vision-capable model, or to set `vision_helper` in their config so a vision model can describe images for this one.", path, mimeType),
+			}, nil
+		}
+		return readImageFile(abs, path, mimeType)
+	}
+
+	// Refuse non-image binaries by extension. Cheaper than mime-sniffing
+	// and stops the LLM from blowing its context on a multi-MB .exe.
+	if reason := isLikelyBinaryPath(abs); reason != "" {
+		return agent.ToolResult{}, fmt.Errorf("read_file: refusing to read %s — %s", path, reason)
+	}
+
+	isMemory := memory.IsMemoryPath(abs)
+
+	offset := intArg(input, "offset", 1)
+	if offset < 1 {
+		offset = 1
+	}
+	limit := intArg(input, "limit", ReadFileMaxLines)
+	if limit < 1 || limit > ReadFileMaxLines {
+		limit = ReadFileMaxLines
+	}
+
+	f, err := os.Open(abs)
+	if err != nil {
+		return agent.ToolResult{}, fmt.Errorf("read_file: open %q: %w", path, err)
+	}
+	defer f.Close()
+
+	// Content sniff: the extension check above misses binaries with an
+	// unknown or missing extension (./a.out, a PNG saved as .txt). Reading
+	// them yields NUL-laced garbage lines the model can't use — refuse and
+	// point at the terminal tool instead.
+	if reason, serr := sniffBinaryPrefix(f); serr != nil {
+		return agent.ToolResult{}, fmt.Errorf("read_file: %s: %w", path, serr)
+	} else if reason != "" {
+		return agent.ToolResult{}, fmt.Errorf("read_file: refusing to read %s — %s", path, reason)
+	}
+
+	// Larger initial buffer than bufio.Scanner's 64KiB default so long
+	// lines (minified JS, base64 blobs) don't trip MaxScanTokenSize.
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+
+	var (
+		out       strings.Builder
+		lineNum   int
+		returned  int
+		truncated bool
+	)
+	for scanner.Scan() {
+		lineNum++
+		if lineNum < offset {
+			continue
+		}
+		if returned >= limit {
+			// Hit the line cap with at least one more line in the file.
+			// lineNum already points at that next unshown line, so it is
+			// the offset the caller should resume from.
+			truncated = true
+			break
+		}
+		// Width-6 line number column matches `cat -n` so a 100k-line file
+		// still aligns. Tab after the column keeps Markdown/code blocks
+		// rendering correctly in UIs.
+		fmt.Fprintf(&out, "%6d\t%s\n", lineNum, scanner.Text())
+		returned++
+	}
+	if err := scanner.Err(); err != nil {
+		return agent.ToolResult{}, fmt.Errorf("read_file: scan %q: %w", path, err)
+	}
+
+	if returned == 0 && lineNum > 0 {
+		// A past-end offset used to be an error, which made agents retry
+		// the same file or backtrack. Returning a clear "already at EOF"
+		// result lets them stop paginating instead of looping.
+		return agent.ToolResult{
+			Text: fmt.Sprintf("[end of file: %d lines total. Offset %d is past the end — no more content to read.]", lineNum, offset),
+		}, nil
+	}
+	if returned == 0 {
+		return agent.ToolResult{Text: "[empty file]"}, nil
+	}
+
+	// UI payload built before the truncation/EOF footers land in out, so the
+	// preview shows file content only. Total line count is unknown when the
+	// scan stopped early at the cap.
+	ui := map[string]any{
+		"type":            "file_read",
+		"path":            path,
+		"lines_read":      returned,
+		"truncated":       truncated,
+		"content_preview": uiHead(out.String(), 8, 600),
+	}
+	if !truncated {
+		ui["total_lines"] = lineNum
+	}
+
+	if truncated {
+		// Without this footer the read stops silently at the cap, so the
+		// model can't tell a complete read from a truncated one — it then
+		// either edits against lines it never saw or re-reads the same
+		// window expecting different output. Spelling out the exact resume
+		// offset breaks that loop.
+		fmt.Fprintf(&out, "\n[truncated: shown lines %d-%d. Next unread line is %d. Continue with offset=%d if needed.]\n",
+			offset, offset+returned-1, lineNum, lineNum)
+	} else {
+		// Explicit EOF marker prevents agents from re-reading a file they
+		// already consumed just to confirm whether more content exists.
+		fmt.Fprintf(&out, "\n[end of file: %d lines total]\n", lineNum)
+	}
+
+	result := agent.ToolResult{Text: out.String(), UI: ui}
+	if isMemory {
+		memCount := memory.CountMemories(out.String())
+		result.Text = fmt.Sprintf("Recalled %d %s from %s\n\n%s", memCount, pluralize(memCount, "memory", "memories"), filepath.Base(abs), out.String())
+	}
+	return result, nil
+}
+
+// imageMIMEType returns the MIME type for known image extensions, or "".
+func imageMIMEType(absPath string) string {
+	ext := strings.ToLower(filepath.Ext(absPath))
+	return imageExtensions[ext]
+}
+
+// readImageFile reads an image file and returns a ToolResult with both a
+// text description and an image content block for multimodal models.
+func readImageFile(absPath, displayPath, mimeType string) (agent.ToolResult, error) {
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return agent.ToolResult{}, fmt.Errorf("read_file: stat %q: %w", displayPath, err)
+	}
+	if info.Size() > ReadFileImageMaxBytes {
+		return agent.ToolResult{}, fmt.Errorf(
+			"read_file: image %s is %s — exceeds %s limit. Resize or compress before reading.",
+			displayPath, formatBytes(info.Size()), formatBytes(ReadFileImageMaxBytes),
+		)
+	}
+
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return agent.ToolResult{}, fmt.Errorf("read_file: read %q: %w", displayPath, err)
+	}
+
+	desc := fmt.Sprintf("Image: %s (%s, %s)", displayPath, mimeType, formatBytes(info.Size()))
+	blk, ok := agent.NewImageBlock(mimeType, data)
+	if !ok {
+		// imageExtensions admits formats the providers don't accept (bmp, ico,
+		// tiff, heic). Sending one fails the whole request, so say what
+		// happened instead — the model can suggest converting the file.
+		return agent.ToolResult{Text: fmt.Sprintf(
+			"%s — this format cannot be sent to the model (only PNG, JPEG, GIF and WebP are accepted). Convert it first if it needs to be viewed.",
+			desc,
+		)}, nil
+	}
+	return agent.ToolResult{
+		Text:   desc,
+		Blocks: []agent.ContentBlock{blk},
+	}, nil
+}
+
+// formatBytes renders a byte count in human-readable form.
+func formatBytes(n int64) string {
+	const (
+		KB = 1024
+		MB = 1024 * KB
+	)
+	switch {
+	case n >= MB:
+		return fmt.Sprintf("%.1f MB", float64(n)/MB)
+	case n >= KB:
+		return fmt.Sprintf("%.1f KB", float64(n)/KB)
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
+// isUNCPath reports whether path is a UNC / network path. Both the Windows
+// backslash form (\\server\share) and the forward-slash form (//server/share,
+// which SMB clients also accept) are treated as UNC. A genuine local path
+// never needs a double-separator prefix, so this is safe to refuse outright.
+func isUNCPath(path string) bool {
+	return strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, "//")
+}
+
+// resolvePath normalises path → absolute against the process CWD, expanding
+// "~" and cleaning. Used where there's no tool context (permission path
+// extraction). Tool executors should prefer resolvePathIn(WorkingDir(ctx), …).
+func resolvePath(path string) (string, error) {
+	return resolvePathIn("", path)
+}
+
+// resolvePathIn is resolvePath rooted at base: a relative path is joined to
+// base (empty base falls back to the process CWD). base is normally
+// WorkingDir(ctx), so a worktree-isolated sub-agent's file operations land in
+// its worktree — the same directory its terminal commands run in.
+func resolvePathIn(base, path string) (string, error) {
+	if strings.HasPrefix(path, "~/") || path == "~" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve ~: %w", err)
+		}
+		path = filepath.Join(home, strings.TrimPrefix(path, "~"))
+	}
+	if !filepath.IsAbs(path) {
+		if base == "" {
+			cwd, err := os.Getwd()
+			if err != nil {
+				return "", fmt.Errorf("resolve cwd: %w", err)
+			}
+			base = cwd
+		}
+		path = filepath.Join(base, path)
+	}
+	return filepath.Clean(path), nil
+}
+
+// intArg pulls an int from input, accepting either int or float64
+// (JSON numbers arrive as float64 from encoding/json).
+func intArg(input map[string]any, key string, dflt int) int {
+	switch v := input[key].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	}
+	return dflt
+}
+
+// binaryExtensions is the set of file extensions read_file refuses outright.
+// The list focuses on formats that are almost never useful as text in an
+// LLM context (executables, archives, audio/video, compiled artefacts).
+// Images (.png, .jpg, etc.) are handled separately via imageExtensions —
+// they're returned as image content blocks for multimodal models.
+// PDFs remain refused because they need separate text extraction tooling.
+var binaryExtensions = map[string]string{
+	// Executables / libraries
+	".exe": "Windows executable", ".dll": "Windows library",
+	".so": "Linux shared object", ".dylib": "macOS dynamic library",
+	".o": "object file", ".a": "static archive", ".lib": "library",
+	".class": "Java class file", ".jar": "Java archive",
+	".pyc": "compiled Python", ".pyo": "compiled Python",
+	".wasm": "WebAssembly",
+	// Archives
+	".zip": "ZIP archive", ".tar": "tar archive", ".gz": "gzip archive",
+	".bz2": "bzip2 archive", ".xz": "xz archive", ".7z": "7-zip archive",
+	".rar": "RAR archive",
+	// Audio / video
+	".mp3": "MP3 audio", ".mp4": "MP4 video", ".mov": "video",
+	".avi": "video", ".mkv": "video", ".webm": "video",
+	".ogg": "audio", ".wav": "audio", ".flac": "audio", ".m4a": "audio",
+	// Fonts
+	".ttf": "font", ".otf": "font", ".woff": "web font", ".woff2": "web font",
+	// Documents (non-text)
+	".pdf": "PDF document (use a PDF-aware tool)",
+	".doc": "Word document", ".docx": "Word document",
+	".xls": "Excel spreadsheet", ".xlsx": "Excel spreadsheet",
+	".ppt": "PowerPoint", ".pptx": "PowerPoint",
+	// Databases / binary data
+	".db": "database", ".sqlite": "SQLite database", ".sqlite3": "SQLite database",
+	".dat": "binary data",
+}
+
+// isLikelyBinaryPath returns a human-readable reason if the path's
+// extension is on the binary-refusal list, otherwise "".
+func isLikelyBinaryPath(absPath string) string {
+	ext := strings.ToLower(filepath.Ext(absPath))
+	if reason, ok := binaryExtensions[ext]; ok {
+		return reason + " (read_file only handles text)"
+	}
+	return ""
+}
+
+// sniffPrefixBytes is how much of the file the content sniff examines. 512
+// bytes matches net/http.DetectContentType's window: enough to catch any
+// real binary format's header without a meaningful read cost.
+const sniffPrefixBytes = 512
+
+// sniffBinaryPrefix reads the first sniffPrefixBytes of f and reports a
+// refusal reason when the content is not text read_file can serve: a NUL
+// byte in the prefix marks a binary (every common binary format has one
+// early; UTF-8/ASCII text never does). UTF-16 text — NUL-laced by encoding,
+// not by nature — gets its own message pointing at a terminal conversion
+// instead of being lumped in with executables. The reader is rewound to the
+// start on success so the caller's scanner sees the whole file.
+func sniffBinaryPrefix(f *os.File) (reason string, err error) {
+	buf := make([]byte, sniffPrefixBytes)
+	n, rerr := io.ReadFull(f, buf)
+	if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+		return "", fmt.Errorf("sniff: %w", rerr)
+	}
+	buf = buf[:n]
+
+	// BOM check first, not nested under the NUL check: UTF-16 text that is
+	// pure non-ASCII (e.g. CJK-only with no newline in the first 512 bytes)
+	// has no NUL byte, but the BOM still identifies it.
+	if bytes.HasPrefix(buf, []byte{0xff, 0xfe}) || bytes.HasPrefix(buf, []byte{0xfe, 0xff}) {
+		return "file is UTF-16 encoded text (BOM detected); read_file only handles UTF-8/ASCII. " +
+			"Convert it via the terminal tool first (e.g. iconv -f utf-16 -t utf-8, or PowerShell " +
+			"Get-Content <file> | Set-Content -Encoding utf8 <out>)", nil
+	}
+	if bytes.IndexByte(buf, 0) >= 0 {
+		return "file content looks binary (NUL byte in the first 512 bytes); read_file only handles text. " +
+			"Use the terminal tool to inspect binary files (e.g. file, strings, xxd, or a script)", nil
+	}
+
+	if _, serr := f.Seek(0, io.SeekStart); serr != nil {
+		return "", fmt.Errorf("sniff rewind: %w", serr)
+	}
+	return "", nil
+}
+
+// blockedDevicePaths are paths whose read would block the agent forever
+// or generate effectively-infinite output. /dev/null is intentionally
+// absent — reading it just returns EOF and is safe.
+var blockedDevicePaths = map[string]struct{}{
+	"/dev/random":  {},
+	"/dev/urandom": {},
+	"/dev/zero":    {},
+	"/dev/full":    {},
+	"/dev/tty":     {},
+	"/dev/stdin":   {},
+	"/dev/stdout":  {},
+	"/dev/stderr":  {},
+}
+
+// isBlockedDevicePath reports whether the absolute path names a device
+// file that would block or stream indefinitely. The list is exact-match
+// only; /dev/pts/* and similar slot-allocated TTYs aren't covered here
+// because the LLM has no business reading them in the first place and
+// they'd surface via "would block" rather than "infinite output".
+func isBlockedDevicePath(absPath string) bool {
+	_, blocked := blockedDevicePaths[absPath]
+	return blocked
+}

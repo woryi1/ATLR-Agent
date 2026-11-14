@@ -1,0 +1,256 @@
+<script lang="ts">
+  import { cmdkOpen, view, sessions, activeSessionId, skills, openAgentSession, createNewSession, togglePanel, panelForView, lightappOpen, settingsModalOpen, openSettingsAt, isDesktopShell } from '../../lib/stores'
+  import { t } from '../../lib/i18n'
+
+  let query = $state('')
+  let inputEl = $state<HTMLInputElement | null>(null)
+  let activeIdx = $state(0)
+
+  function close() {
+    cmdkOpen.set(false)
+    query = ''
+    activeIdx = 0
+  }
+
+  function sessionIcon(s: any): string {
+    if (s.source === 'cron') return 'ant-design:clock-circle-outlined'
+    if (s.source === 'channel') return 'ant-design:send-outlined'
+    if (s.status === 'running') return 'ant-design:loading-outlined'
+    return 'ant-design:message-outlined'
+  }
+
+  function sessionName(s: any): string {
+    return s.name || s.title || s.id
+  }
+
+  function openSession(id: string) {
+    activeSessionId.set(id)
+    view.set('chat')
+    close()
+  }
+
+  function goTo(v: string) {
+    view.set(v as any)
+    close()
+  }
+
+  // Assistant Memory, the file recycle bin and archived sessions all moved
+  // into Settings' 数据管理 — no standalone views left to route to, so these
+  // deep-link straight to the sub-view instead of dropping the user on the
+  // Settings landing page (or, for 'files', on a dead view.set that rendered
+  // an empty main area).
+  function openDataSettings(sub: string) {
+    openSettingsAt('data', sub)
+    close()
+  }
+
+  function newSession() {
+    close()
+    createNewSession()
+  }
+
+  // Static actions. `available` narrows one to the views it makes sense on;
+  // omitted means always.
+  type PaletteAction = {
+    id: string
+    icon: string
+    label: () => string
+    shortcut: string
+    run: () => void
+    available?: () => boolean
+  }
+  const actions: PaletteAction[] = [
+    { id: 'new', icon: 'ant-design:plus-outlined', label: () => $t('nav.new_session'), shortcut: isDesktopShell ? '⌘N' : '', run: () => newSession() },
+    { id: 'agents', icon: 'ant-design:robot-outlined', label: () => $t('nav.agents'), shortcut: '', run: () => goTo('agents') },
+    { id: 'skills', icon: 'ant-design:thunderbolt-outlined', label: () => $t('nav.skills'), shortcut: '', run: () => goTo('skills') },
+    { id: 'workflows', icon: 'ant-design:partition-outlined', label: () => $t('nav.workflows'), shortcut: '', run: () => goTo('workflows') },
+    { id: 'tasks', icon: 'ant-design:clock-circle-outlined', label: () => $t('nav.tasks'), shortcut: '', run: () => goTo('tasks') },
+    { id: 'browser', icon: 'ant-design:global-outlined', label: () => $t('nav.browser'), shortcut: '', run: () => goTo('browser') },
+    { id: 'mcp', icon: 'ant-design:api-outlined', label: () => $t('nav.mcp'), shortcut: '', run: () => goTo('mcp') },
+    { id: 'channels', icon: 'ant-design:mobile-outlined', label: () => $t('nav.channels'), shortcut: '', run: () => goTo('channels') },
+    { id: 'archived', icon: 'ant-design:inbox-outlined', label: () => $t('settings.data.archived'), shortcut: '', run: () => openDataSettings('archived') },
+    { id: 'files', icon: 'ant-design:folder-open-outlined', label: () => $t('nav.file_recall'), shortcut: '', run: () => openDataSettings('trash') },
+    { id: 'memory', icon: 'ant-design:user-outlined', label: () => $t('nav.memory'), shortcut: '', run: () => openDataSettings('memory') },
+    { id: 'lightapps', icon: 'ant-design:appstore-outlined', label: () => $t('nav.light_apps'), shortcut: '', run: () => goTo('lightapps') },
+    { id: 'artifacts', icon: 'ant-design:file-text-outlined', label: () => $t('artifacts.toggle'), shortcut: '', run: () => togglePanel(), available: () => !!panelForView($view, $lightappOpen, $activeSessionId) },
+    { id: 'settings', icon: 'ant-design:setting-outlined', label: () => $t('nav.settings'), shortcut: '', run: () => { close(); settingsModalOpen.set(true) } },
+  ]
+
+  // Reactive filtered results
+  let q = $derived(query.trim().toLowerCase())
+
+  let matchedSessions = $derived(
+    $sessions.filter((s: any) => !q || sessionName(s).toLowerCase().includes(q)).slice(0, 8)
+  )
+
+  let matchedSkills = $derived(
+    q ? $skills.filter((s: any) => s.name.toLowerCase().includes(q) || (s.description ?? '').toLowerCase().includes(q)).slice(0, 5) : []
+  )
+
+  let matchedActions = $derived(
+    actions.filter((a) => (a.available?.() ?? true) && (!q || a.label().toLowerCase().includes(q)))
+  )
+
+  // Flat list for keyboard navigation
+  let flatItems = $derived([
+    ...matchedSessions.map((s: any) => ({ kind: 'session', data: s })),
+    ...matchedSkills.map((s: any) => ({ kind: 'skill', data: s })),
+    ...matchedActions.map((a) => ({ kind: 'action', data: a })),
+  ])
+
+  // Clamp activeIdx whenever the list changes
+  $effect(() => {
+    if (activeIdx >= flatItems.length) activeIdx = Math.max(0, flatItems.length - 1)
+  })
+
+  // Autofocus when opened
+  $effect(() => {
+    if ($cmdkOpen && inputEl) {
+      inputEl.focus()
+    }
+  })
+
+  // Running a skill result opens a fresh chat that invokes it, matching
+  // SkillsView's per-card "Use" — previously this just navigated to the
+  // Skills list, which looked like "run this skill" but acted like "open a
+  // list" (#1114).
+  function runSkill(name: string) {
+    openAgentSession(`/${name}`, name)
+    close()
+  }
+
+  function runItem(item: any) {
+    if (!item) return
+    if (item.kind === 'session') openSession(item.data.id)
+    else if (item.kind === 'skill') runSkill(item.data.name)
+    else if (item.kind === 'action') item.data.run()
+  }
+
+  function onKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') { e.preventDefault(); close() }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); activeIdx = Math.min(activeIdx + 1, flatItems.length - 1) }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); activeIdx = Math.max(activeIdx - 1, 0) }
+    else if (e.key === 'Enter') { e.preventDefault(); runItem(flatItems[activeIdx]) }
+  }
+
+  // Index helpers so each section knows its global offset for highlight
+  let skillsOffset = $derived(matchedSessions.length)
+  let actionsOffset = $derived(matchedSessions.length + matchedSkills.length)
+</script>
+
+{#if $cmdkOpen}
+<div class="backdrop" onclick={close}>
+  <div class="palette" onclick={(e) => e.stopPropagation()}>
+    <div class="search-row">
+      <iconify-icon icon="ant-design:search-outlined" width="16" style="color:var(--text-tertiary)"></iconify-icon>
+      <input
+        bind:this={inputEl}
+        bind:value={query}
+        onkeydown={onKeydown}
+        class="search-input"
+        placeholder={$t('cmdk.placeholder')}
+      />
+      <kbd>esc</kbd>
+    </div>
+    <div class="results">
+      {#if flatItems.length === 0}
+        <div class="empty">{$t('cmdk.no_matches').replace('{query}', query)}</div>
+      {/if}
+
+      {#if matchedSessions.length > 0}
+        <div class="group-label">{$t('nav.sessions')}</div>
+        {#each matchedSessions as s, i (s.id)}
+          <div
+            class="result-row"
+            class:active={activeIdx === i}
+            onclick={() => openSession(s.id)}
+            onmouseenter={() => activeIdx = i}
+          >
+            <iconify-icon icon={sessionIcon(s)} width="14" style="color:{activeIdx === i ? 'var(--blue-6)' : 'var(--text-tertiary)'}"></iconify-icon>
+            <span class="result-title" class:dim={activeIdx !== i}>{sessionName(s)}</span>
+            {#if activeIdx === i}
+              <iconify-icon icon="lucide:corner-down-left" width="13" style="color:var(--text-tertiary)"></iconify-icon>
+            {/if}
+          </div>
+        {/each}
+      {/if}
+
+      {#if matchedSkills.length > 0}
+        <div class="group-label">{$t('nav.skills')}</div>
+        {#each matchedSkills as s, i (s.name)}
+          {@const gi = skillsOffset + i}
+          <div
+            class="result-row"
+            class:active={activeIdx === gi}
+            onclick={() => runSkill(s.name)}
+            onmouseenter={() => activeIdx = gi}
+          >
+            <iconify-icon icon="ant-design:thunderbolt-outlined" width="14" style="color:{activeIdx === gi ? 'var(--blue-6)' : 'var(--text-tertiary)'}"></iconify-icon>
+            <span class="result-title mono" class:dim={activeIdx !== gi}>{s.name}</span>
+            {#if activeIdx === gi}
+              <iconify-icon icon="lucide:corner-down-left" width="13" style="color:var(--text-tertiary)"></iconify-icon>
+            {/if}
+          </div>
+        {/each}
+      {/if}
+
+      {#if matchedActions.length > 0}
+        <div class="group-label">{$t('cmdk.actions')}</div>
+        {#each matchedActions as a, i (a.id)}
+          {@const gi = actionsOffset + i}
+          <div
+            class="result-row"
+            class:active={activeIdx === gi}
+            onclick={() => a.run()}
+            onmouseenter={() => activeIdx = gi}
+          >
+            <iconify-icon icon={a.icon} width="14" style="color:{activeIdx === gi ? 'var(--blue-6)' : 'var(--text-tertiary)'}"></iconify-icon>
+            <span class="result-title" class:dim={activeIdx !== gi}>{a.label()}</span>
+            {#if a.shortcut}<span class="shortcut mono">{a.shortcut}</span>{/if}
+          </div>
+        {/each}
+      {/if}
+    </div>
+  </div>
+</div>
+{/if}
+
+<style>
+.backdrop {
+  position: fixed; inset: 0; z-index: 1000;
+  background: var(--scrim);
+  display: flex; align-items: flex-start; justify-content: center; padding-top: calc(12vh / var(--font-zoom));
+}
+.palette {
+  width: 92%; max-width: 520px; background: var(--bg-container);
+  border-radius: 12px; overflow: hidden;
+  box-shadow: 0 16px 48px rgba(0,0,0,0.18);
+  animation: octo-fadein 0.16s ease;
+}
+.search-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px; border-bottom: 1px solid var(--border-table);
+}
+.search-input {
+  flex: 1; border: none; outline: none; background: transparent;
+  font-size: 14px; color: var(--text); font-family: inherit;
+}
+.search-input::placeholder { color: var(--text-tertiary); }
+kbd {
+  font-size: 11px; font-family: var(--font-mono);
+  background: var(--bg-table-header); border: 1px solid var(--border-secondary); border-radius: 4px;
+  padding: 1px 6px; color: var(--text-tertiary);
+}
+.results { padding: 8px; max-height: 360px; overflow-y: auto; }
+.empty { padding: 16px 8px; font-size: 13px; color: var(--text-tertiary); text-align: center; }
+.group-label { font-size: 11px; font-weight: 600; letter-spacing: 0.4px; color: var(--text-tertiary); padding: 6px 8px; }
+.result-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px; border-radius: 6px; cursor: pointer;
+}
+.result-row.active { background: var(--active-blue-bg); }
+.result-title { font-size: 13px; color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result-title.dim { color: var(--text-secondary); }
+.shortcut { font-size: 11px; color: var(--text-tertiary); }
+.mono { font-family: var(--font-mono); }
+</style>

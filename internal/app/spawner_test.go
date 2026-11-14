@@ -1,0 +1,876 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/config"
+	"github.com/open-octo/octo-agent/internal/tools"
+)
+
+// subAgentSender returns a canned reply and counts how often it's been called.
+// The reply has no tool_use blocks so the child's Run terminates after one
+// turn — that's all we need to exercise the spawner glue.
+type subAgentSender struct {
+	reply        string
+	inputTokens  int
+	outputTokens int
+	calls        int32
+	lastSystem   string
+	lastModel    string
+	lastMessages []agent.Message
+}
+
+func (s *subAgentSender) SendMessages(_ context.Context, model, system string, msgs []agent.Message, _ int) (agent.Reply, error) {
+	atomic.AddInt32(&s.calls, 1)
+	s.lastSystem = system
+	s.lastModel = model
+	s.lastMessages = msgs
+	return agent.Reply{
+		Content:      s.reply,
+		InputTokens:  s.inputTokens,
+		OutputTokens: s.outputTokens,
+	}, nil
+}
+
+// nilExecutor exists so child Run can be called even though our stub Sender
+// never produces tool_use blocks (so Execute is never invoked).
+type nilExecutor struct{}
+
+func (nilExecutor) Execute(_ context.Context, _ string, _ map[string]any) (agent.ToolResult, error) {
+	return agent.ToolResult{Text: ""}, nil
+}
+
+func TestAgentSpawner_RunsChildAndRollsTokensIntoParent(t *testing.T) {
+	send := &subAgentSender{reply: "sub-agent answer", inputTokens: 200, outputTokens: 80}
+	parent := agent.New(send, "parent-model")
+	parent.System = "PARENT SYSTEM"
+	parent.MaxTokens = 4096
+
+	parentTools := []agent.ToolDefinition{
+		{Name: "read_file"},
+		{Name: "grep"},
+		{Name: "sub_agent"},
+	}
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return parentTools })
+
+	res, err := sp.Spawn(context.Background(), tools.SpawnRequest{
+		Description: "Investigate",
+		Prompt:      "What is in the cache module?",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Reply != "sub-agent answer" {
+		t.Errorf("Reply = %q", res.Reply)
+	}
+	if res.InputTokens != 200 || res.OutputTokens != 80 {
+		t.Errorf("token usage in result = (%d,%d)", res.InputTokens, res.OutputTokens)
+	}
+
+	// Tokens must roll back into the parent's session totals.
+	in, out := parent.SessionTokens()
+	if in != 200 || out != 80 {
+		t.Errorf("parent session tokens = (%d,%d), want (200,80)", in, out)
+	}
+
+	// Child must have inherited the parent's system + model fallback.
+	if send.lastSystem != "PARENT SYSTEM" {
+		t.Errorf("child system = %q, want parent's", send.lastSystem)
+	}
+	if send.lastModel != "parent-model" {
+		t.Errorf("child model = %q, want parent's default", send.lastModel)
+	}
+}
+
+func TestAgentSpawner_ModelOverrideUsesParentsEndpointWindow(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	cfg := config.Config{Endpoints: []config.Endpoint{
+		{
+			ID:       "endpoint-a",
+			Provider: "custom",
+			Models: []config.EndpointModel{
+				{Model: "parent-model", ContextWindow: 16_000},
+				{Model: "claude-sonnet-5", ContextWindow: 32_000},
+			},
+		},
+		{
+			ID:       "endpoint-b",
+			Provider: "custom",
+			Models:   []config.EndpointModel{{Model: "claude-sonnet-5", ContextWindow: 64_000}},
+		},
+	}}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	send := &subAgentSender{reply: "ok"}
+	parent := agent.New(send, "parent-model")
+	parent.SetModelDeployment("parent-model", 16_000, "endpoint-a")
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+
+	res, err := sp.Spawn(context.Background(), tools.SpawnRequest{
+		Description: "use sibling model",
+		Prompt:      "check the endpoint window",
+		Model:       "claude-sonnet-5",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, ok := sp.reg.get(res.AgentID)
+	if !ok {
+		t.Fatalf("spawned child %q not found", res.AgentID)
+	}
+	if got := child.agent.ContextWindow(); got != 32_000 {
+		t.Fatalf("child context window = %d, want endpoint-a override 32000", got)
+	}
+	if got := child.agent.ModelEndpointID(); got != "endpoint-a" {
+		t.Fatalf("child endpoint = %q, want endpoint-a", got)
+	}
+}
+
+func TestAgentSpawner_AppliesToolAllowlist(t *testing.T) {
+	send := &subAgentSender{reply: "ok"}
+	parent := agent.New(send, "parent-model")
+	parentTools := []agent.ToolDefinition{
+		{Name: "read_file"},
+		{Name: "grep"},
+		{Name: "terminal"},
+		{Name: "sub_agent"},
+	}
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return parentTools })
+
+	// Allowlist restricts to read_file + grep. sub_agent always excluded.
+	got := filterChildTools(parentTools, []string{"read_file", "grep"}, nil, false)
+	if len(got) != 2 {
+		t.Fatalf("filtered tools len = %d, want 2: %+v", len(got), got)
+	}
+	names := []string{got[0].Name, got[1].Name}
+	if !strings.Contains(strings.Join(names, ","), "read_file") || !strings.Contains(strings.Join(names, ","), "grep") {
+		t.Errorf("allowlist not applied: %v", names)
+	}
+
+	// No allowlist → all parent tools minus sub_agent.
+	got = filterChildTools(parentTools, nil, nil, false)
+	if len(got) != 3 {
+		t.Errorf("nil allowlist should keep all non-sub_agent tools: %+v", got)
+	}
+	for _, td := range got {
+		if td.Name == "sub_agent" {
+			t.Errorf("sub_agent must always be filtered out (no recursion)")
+		}
+	}
+
+	// Spawning should run with the inferred childTools (no error path here —
+	// we just verify the spawner doesn't choke when an allowlist is present).
+	_, err := sp.Spawn(context.Background(), tools.SpawnRequest{
+		Description: "x",
+		Prompt:      "y",
+		Tools:       []string{"read_file"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAgentSpawner_ModelOverride(t *testing.T) {
+	send := &subAgentSender{reply: "ok"}
+	parent := agent.New(send, "parent-model")
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+
+	_, err := sp.Spawn(context.Background(), tools.SpawnRequest{
+		Description: "x",
+		Prompt:      "y",
+		Model:       "claude-haiku-4-5",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if send.lastModel != "claude-haiku-4-5" {
+		t.Errorf("model override ignored: child ran with %q", send.lastModel)
+	}
+}
+
+func TestAgentSpawner_LiteModelOverrideUsesLiteSender(t *testing.T) {
+	send := &subAgentSender{reply: "ok"}
+	lite := &subAgentSender{reply: "lite ok"}
+	parent := agent.New(send, "parent-model")
+	parent.LiteSender = lite
+	parent.LiteModel = "lite-model"
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+
+	_, err := sp.Spawn(context.Background(), tools.SpawnRequest{
+		Description: "x",
+		Prompt:      "y",
+		Model:       "lite",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lite.calls != 1 {
+		t.Fatalf("lite sender calls = %d, want 1", lite.calls)
+	}
+	if lite.lastModel != "lite-model" {
+		t.Errorf("child ran with %q, want lite-model", lite.lastModel)
+	}
+	if send.calls != 0 {
+		t.Errorf("primary sender called %d times, want 0", send.calls)
+	}
+}
+
+func TestAgentSpawner_LiteModelFallsBackToParentWhenUnconfigured(t *testing.T) {
+	send := &subAgentSender{reply: "ok"}
+	parent := agent.New(send, "parent-model")
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+
+	_, err := sp.Spawn(context.Background(), tools.SpawnRequest{
+		Description: "x",
+		Prompt:      "y",
+		Model:       "lite",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if send.lastModel != "parent-model" {
+		t.Errorf("child ran with %q, want fallback to parent-model", send.lastModel)
+	}
+}
+
+func TestAgentSpawner_SpawnReturnsIDAndContinueResumesSameChild(t *testing.T) {
+	send := &subAgentSender{reply: "round one", inputTokens: 200, outputTokens: 80}
+	parent := agent.New(send, "parent-model")
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+
+	res, err := sp.Spawn(context.Background(), tools.SpawnRequest{Description: "x", Prompt: "first task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.AgentID == "" {
+		t.Fatal("Spawn should return a non-empty AgentID")
+	}
+	// First Run sent a single-message history.
+	if got := len(send.lastMessages); got != 1 {
+		t.Fatalf("after Spawn, child saw %d messages, want 1", got)
+	}
+
+	send.reply = "round two"
+	res2, err := sp.Continue(context.Background(), res.AgentID, "second task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res2.Reply != "round two" {
+		t.Errorf("Continue reply = %q", res2.Reply)
+	}
+	// Continuation carries history: [user1, assistant1, user2] = 3 messages.
+	if got := len(send.lastMessages); got != 3 {
+		t.Errorf("after Continue, child saw %d messages, want 3 (history carried over)", got)
+	}
+}
+
+// TestSubAgentManager_SendResumesSameChildThroughSpawner exercises the full
+// async path: SubAgentManager hands the model an agent_N handle, but the
+// resumable child lives in childRegistry under an 8-hex id. Manager.Send
+// (Spawner.Continue) must reach the same child, not miss the
+// registry and report "no longer alive".
+func TestSubAgentManager_SendResumesSameChildThroughSpawner(t *testing.T) {
+	send := &subAgentSender{reply: "round one", inputTokens: 100, outputTokens: 40}
+	parent := agent.New(send, "parent-model")
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+
+	mgr := tools.NewSubAgentManager(sp)
+	notes := make(chan tools.SubAgentNotification, 4)
+	mgr.SetOnExit(func(ev tools.SubAgentNotification) { notes <- ev })
+
+	id, err := mgr.Start(tools.SpawnRequest{Description: "x", Prompt: "first task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitNote := func(kind string) tools.SubAgentNotification {
+		t.Helper()
+		select {
+		case ev := <-notes:
+			if ev.Kind != kind {
+				t.Fatalf("got notification kind %q, want %q (result: %q)", ev.Kind, kind, ev.Result)
+			}
+			return ev
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for %q notification", kind)
+			return tools.SubAgentNotification{}
+		}
+	}
+
+	spawnNote := waitNote("spawn_done")
+	if spawnNote.Result != "round one" {
+		t.Errorf("spawn_done result = %q, want %q", spawnNote.Result, "round one")
+	}
+
+	send.reply = "round two"
+	if err := mgr.Send(id, "second task"); err != nil {
+		t.Fatal(err)
+	}
+
+	reply := waitNote("message_reply")
+	if strings.Contains(reply.Result, "no longer alive") {
+		t.Fatalf("Send failed to reach the child: %q", reply.Result)
+	}
+	if reply.Result != "round two" {
+		t.Errorf("message_reply result = %q, want %q", reply.Result, "round two")
+	}
+	// The continuation must reuse the same child: its history now carries
+	// [user1, assistant1, user2] = 3 messages.
+	if got := len(send.lastMessages); got != 3 {
+		t.Errorf("after Send, child saw %d messages, want 3 (same child resumed)", got)
+	}
+}
+
+func TestAgentSpawner_ContinueAccruesOnlyDeltaTokens(t *testing.T) {
+	send := &subAgentSender{reply: "ok", inputTokens: 200, outputTokens: 80}
+	parent := agent.New(send, "parent-model")
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+
+	res, err := sp.Spawn(context.Background(), tools.SpawnRequest{Description: "x", Prompt: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.InputTokens != 200 || res.OutputTokens != 80 {
+		t.Errorf("Spawn delta tokens = (%d,%d), want (200,80)", res.InputTokens, res.OutputTokens)
+	}
+
+	res2, err := sp.Continue(context.Background(), res.AgentID, "again")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The child's cumulative SessionTokens is now (400,160); Continue must
+	// report and accrue only this round's delta (200,80), not the cumulative.
+	if res2.InputTokens != 200 || res2.OutputTokens != 80 {
+		t.Errorf("Continue delta tokens = (%d,%d), want (200,80)", res2.InputTokens, res2.OutputTokens)
+	}
+	in, out := parent.SessionTokens()
+	if in != 400 || out != 160 {
+		t.Errorf("parent session tokens = (%d,%d), want (400,160) — double-counting bug if 600/240", in, out)
+	}
+}
+
+// erroringChildSender succeeds once with a tool_use reply (accruing tokens
+// and cache activity), then fails — a partial round that burned real tokens
+// before dying.
+type erroringChildSender struct {
+	calls int32
+}
+
+func (s *erroringChildSender) scripted() (agent.Reply, error) {
+	if atomic.AddInt32(&s.calls, 1) == 1 {
+		return agent.Reply{
+			StopReason:       "tool_use",
+			Blocks:           []agent.ContentBlock{agent.NewToolUseBlock("c1", "read_file", map[string]any{"path": "x"})},
+			InputTokens:      120,
+			OutputTokens:     30,
+			CacheReadTokens:  40,
+			CacheWriteTokens: 6,
+		}, nil
+	}
+	return agent.Reply{}, errors.New("boom")
+}
+
+func (s *erroringChildSender) SendMessages(_ context.Context, _, _ string, _ []agent.Message, _ int) (agent.Reply, error) {
+	return s.scripted()
+}
+
+// SendMessagesWithTools makes the sender a ToolSender so the child stays on
+// the runLoop path (a plain Sender falls back to single-shot TurnStream and
+// round 2 would never run).
+func (s *erroringChildSender) SendMessagesWithTools(_ context.Context, _, _ string, _ []agent.Message, _ int, _ []agent.ToolDefinition) (agent.Reply, error) {
+	return s.scripted()
+}
+
+// TestAgentSpawner_ErrorRoundStillAccruesTokens: when a child round dies on
+// an error after burning tokens, the delta (cache included) still folds into
+// the parent before the error propagates — otherwise a failed Spawn leaves
+// the parent's session totals and per-turn cache utilization under-counted.
+func TestAgentSpawner_ErrorRoundStillAccruesTokens(t *testing.T) {
+	send := &erroringChildSender{}
+	parent := agent.New(send, "parent-model")
+	// A non-empty toolbelt keeps the child on the tool-loop path — with no
+	// tools RunStream takes the single-shot fast path and round 2 never runs.
+	childTools := []agent.ToolDefinition{{Name: "read_file"}}
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return childTools })
+
+	_, err := sp.Spawn(context.Background(), tools.SpawnRequest{Description: "x", Prompt: "go"})
+	if err == nil {
+		t.Fatal("expected the child's round-2 failure to propagate")
+	}
+	in, out := parent.SessionTokens()
+	if in != 120 || out != 30 {
+		t.Errorf("parent session tokens = (%d,%d), want (120,30) from the partial round", in, out)
+	}
+	cr, cw := parent.SessionCacheTokens()
+	if cr != 40 || cw != 6 {
+		t.Errorf("parent session cache tokens = (%d,%d), want (40,6) from the partial round", cr, cw)
+	}
+}
+
+func TestAgentSpawner_ContinueUnknownID(t *testing.T) {
+	send := &subAgentSender{reply: "ok"}
+	parent := agent.New(send, "parent-model")
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+
+	_, err := sp.Continue(context.Background(), "nope", "hi")
+	if err == nil || !strings.Contains(err.Error(), "no longer alive") {
+		t.Errorf("expected 'no longer alive' error for unknown id, got %v", err)
+	}
+}
+
+func TestAgentSpawner_ConcurrentContinueSerialized(t *testing.T) {
+	send := &subAgentSender{reply: "ok", inputTokens: 10, outputTokens: 5}
+	parent := agent.New(send, "parent-model")
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+
+	res, err := sp.Spawn(context.Background(), tools.SpawnRequest{Description: "x", Prompt: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 10
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := sp.Continue(context.Background(), res.AgentID, "more"); err != nil {
+				t.Errorf("Continue: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// per-child mutex serializes the runs, so the cumulative total is exact:
+	// 1 Spawn + n Continue rounds. (Run under -race to catch History races.)
+	in, out := parent.SessionTokens()
+	if in != (n+1)*10 || out != (n+1)*5 {
+		t.Errorf("parent tokens = (%d,%d), want (%d,%d)", in, out, (n+1)*10, (n+1)*5)
+	}
+}
+
+func TestFilterChildTools_DropsSendMessage(t *testing.T) {
+	parentTools := []agent.ToolDefinition{
+		{Name: "read_file"},
+		{Name: "sub_agent"},
+	}
+	got := filterChildTools(parentTools, nil, nil, false)
+	for _, td := range got {
+		if td.Name == "sub_agent" {
+			t.Errorf("child toolbelt must not contain %q", td.Name)
+		}
+	}
+	if len(got) != 1 || got[0].Name != "read_file" {
+		t.Errorf("expected only read_file to survive, got %+v", got)
+	}
+}
+
+func TestFilterChildTools_ReadOnlyDropsMutators(t *testing.T) {
+	parentTools := []agent.ToolDefinition{
+		{Name: "read_file"},
+		{Name: "grep"},
+		{Name: "terminal"},
+		{Name: "write_file"},
+		{Name: "edit_file"},
+		{Name: "sqlite"},
+	}
+	got := filterChildTools(parentTools, nil, nil, true)
+	for _, td := range got {
+		if td.Name == "write_file" || td.Name == "edit_file" || td.Name == "sqlite" {
+			t.Errorf("read-only child must not contain %q", td.Name)
+		}
+	}
+	// terminal and the read tools survive — read-only only strips file mutators.
+	names := map[string]bool{}
+	for _, td := range got {
+		names[td.Name] = true
+	}
+	for _, want := range []string{"read_file", "grep", "terminal"} {
+		if !names[want] {
+			t.Errorf("read-only child should keep %q, got %+v", want, got)
+		}
+	}
+}
+
+func TestFilterChildTools_DisallowedSubtracted(t *testing.T) {
+	parentTools := []agent.ToolDefinition{
+		{Name: "read_file"},
+		{Name: "grep"},
+		{Name: "terminal"},
+		{Name: "write_file"},
+	}
+	// Denylist removes terminal even though it isn't a mutator and no allowlist
+	// is set; the rest survive.
+	got := filterChildTools(parentTools, nil, []string{"terminal"}, false)
+	names := map[string]bool{}
+	for _, td := range got {
+		names[td.Name] = true
+	}
+	if names["terminal"] {
+		t.Errorf("disallowed terminal must be removed: %+v", got)
+	}
+	for _, want := range []string{"read_file", "grep", "write_file"} {
+		if !names[want] {
+			t.Errorf("expected %q to survive denylist, got %+v", want, got)
+		}
+	}
+
+	// Denylist composes with an allowlist: allow read_file+grep, then deny grep.
+	got = filterChildTools(parentTools, []string{"read_file", "grep"}, []string{"grep"}, false)
+	if len(got) != 1 || got[0].Name != "read_file" {
+		t.Errorf("allow{read_file,grep} minus deny{grep} should leave read_file, got %+v", got)
+	}
+}
+
+func TestAgentSpawner_AppliesSystemSuffix(t *testing.T) {
+	send := &subAgentSender{reply: "ok"}
+	parent := agent.New(send, "parent-model")
+	parent.System = "BASE IDENTITY"
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+
+	if _, err := sp.Spawn(context.Background(), tools.SpawnRequest{
+		Prompt:       "go",
+		SystemSuffix: "PERSONA: explore only",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	lc := sp.reg.m[onlyChildID(t, sp)]
+	if lc == nil {
+		t.Fatal("expected a registered child")
+	}
+	if got := lc.agent.System; got != "BASE IDENTITY\n\nPERSONA: explore only" {
+		t.Errorf("child System = %q, want base + persona suffix", got)
+	}
+}
+
+// TestAgentSpawner_LeanSystemKeepsParentModel verifies a lean preset trims
+// the system prompt only: the child stays on the parent's model and sender
+// even when a lite model is configured (lite is for compaction, not for
+// running sub-agents).
+func TestAgentSpawner_LeanSystemKeepsParentModel(t *testing.T) {
+	main := &subAgentSender{reply: "main"}
+	lite := &subAgentSender{reply: "lite"}
+	parent := agent.New(main, "main-model")
+	parent.System = "FULL BASE"
+	parent.LeanSystem = "LEAN BASE"
+	parent.LiteSender = lite
+	parent.LiteModel = "lite-model"
+
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+	if _, err := sp.Spawn(context.Background(), tools.SpawnRequest{
+		Prompt: "go", LeanSystem: true, SystemSuffix: "PERSONA",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lc := sp.reg.m[onlyChildID(t, sp)]
+	if lc.agent.Model != "main-model" || lc.agent.GetSender() != main {
+		t.Errorf("lean child must keep the parent model/sender; got model=%q", lc.agent.Model)
+	}
+	if lc.agent.System != "LEAN BASE\n\nPERSONA" {
+		t.Errorf("lean child System = %q, want lean base + persona", lc.agent.System)
+	}
+}
+
+func TestAgentSpawner_LeanSystemFallsBackToFullSystem(t *testing.T) {
+	main := &subAgentSender{reply: "main"}
+	parent := agent.New(main, "main-model")
+	parent.System = "FULL BASE" // no LeanSystem configured
+
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+	if _, err := sp.Spawn(context.Background(), tools.SpawnRequest{Prompt: "go", LeanSystem: true}); err != nil {
+		t.Fatal(err)
+	}
+	lc := sp.reg.m[onlyChildID(t, sp)]
+	if lc.agent.System != "FULL BASE" {
+		t.Errorf("System = %q, want full-base fallback when no lean system", lc.agent.System)
+	}
+}
+
+func TestAgentSpawner_ExplicitModelOverride(t *testing.T) {
+	main := &subAgentSender{reply: "main"}
+	parent := agent.New(main, "main-model")
+
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+	if _, err := sp.Spawn(context.Background(), tools.SpawnRequest{Prompt: "go", Model: "explicit"}); err != nil {
+		t.Fatal(err)
+	}
+	lc := sp.reg.m[onlyChildID(t, sp)]
+	if lc.agent.Model != "explicit" || lc.agent.GetSender() != main {
+		t.Errorf("explicit model should win on the parent's sender; got model=%q", lc.agent.Model)
+	}
+}
+
+func TestAgentSpawner_ChildStartsFresh(t *testing.T) {
+	send := &subAgentSender{reply: "ok"}
+	parent := agent.New(send, "parent-model")
+	parent.History.Append(agent.NewUserMessage("secret parent context"))
+
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+	if _, err := sp.Spawn(context.Background(), tools.SpawnRequest{Prompt: "go"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, m := range sp.reg.m[onlyChildID(t, sp)].agent.History.Snapshot() {
+		if m.Content == "secret parent context" {
+			t.Error("a child never inherits the parent conversation")
+		}
+	}
+}
+
+// A child must not inherit the parent's turn-end guard: the task checklist is
+// the parent's, and a sub-agent ending its round is not the plan closing.
+func TestAgentSpawner_ChildHasNoTurnEndReminder(t *testing.T) {
+	send := &subAgentSender{reply: "ok"}
+	parent := agent.New(send, "parent-model")
+	parent.TurnEndReminder = func(context.Context, []string) string {
+		return "<system-reminder>close the plan</system-reminder>"
+	}
+
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+	if _, err := sp.Spawn(context.Background(), tools.SpawnRequest{Prompt: "go"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if sp.reg.m[onlyChildID(t, sp)].agent.TurnEndReminder != nil {
+		t.Error("a child must not carry the parent's turn-end reminder")
+	}
+}
+
+// onlyChildID returns the single registered child id, failing if there isn't
+// exactly one.
+func onlyChildID(t *testing.T, sp *Spawner) string {
+	t.Helper()
+	sp.reg.mu.Lock()
+	defer sp.reg.mu.Unlock()
+	if len(sp.reg.m) != 1 {
+		t.Fatalf("expected exactly 1 registered child, got %d", len(sp.reg.m))
+	}
+	for id := range sp.reg.m {
+		return id
+	}
+	return ""
+}
+
+func TestChildRegistry_LRUEviction(t *testing.T) {
+	reg := newChildRegistry()
+	ids := make([]string, 0, maxLiveChildren+1)
+	for i := 0; i < maxLiveChildren+1; i++ {
+		ids = append(ids, reg.put(&liveChild{}))
+	}
+	if _, ok := reg.get(ids[0]); ok {
+		t.Error("the least-recently-used child should have been evicted")
+	}
+	if _, ok := reg.get(ids[len(ids)-1]); !ok {
+		t.Error("the most-recently-added child should still be alive")
+	}
+	if len(reg.m) != maxLiveChildren {
+		t.Errorf("registry size = %d, want %d", len(reg.m), maxLiveChildren)
+	}
+}
+
+func TestChildRegistry_LRUKeepsRecentlyUsed(t *testing.T) {
+	reg := newChildRegistry()
+	first := reg.put(&liveChild{})
+	for i := 0; i < maxLiveChildren-1; i++ {
+		reg.put(&liveChild{})
+	}
+	// Touch `first` so it's no longer the LRU victim, then overflow by one.
+	if _, ok := reg.get(first); !ok {
+		t.Fatal("first should still be alive before overflow")
+	}
+	reg.put(&liveChild{}) // overflow → evicts the now-oldest, not `first`
+	if _, ok := reg.get(first); !ok {
+		t.Error("a recently-touched child must survive LRU eviction")
+	}
+}
+
+func TestChildRegistry_TTLEviction(t *testing.T) {
+	now := time.Now()
+	reg := newChildRegistry()
+	reg.now = func() time.Time { return now }
+
+	id := reg.put(&liveChild{})
+	if _, ok := reg.get(id); !ok {
+		t.Fatal("child should be alive immediately after put")
+	}
+	now = now.Add(childIdleTTL + time.Minute)
+	if _, ok := reg.get(id); ok {
+		t.Error("child should be evicted after idle TTL")
+	}
+}
+
+func TestAgentSpawner_MarksContextSoRecursionRefused(t *testing.T) {
+	send := &subAgentSender{reply: "ok"}
+	parent := agent.New(send, "parent-model")
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+
+	// Wire SpawnRequest into a real sub_agent tool that checks the sub-agent
+	// context flag. After Spawn returns, the OUTER context shouldn't be marked
+	// (only descendants of the spawn call are), but inside Spawn the child's
+	// Run sees the marked context. We can't reach that from the outside cleanly,
+	// so verify behavior by stubbing the spawner and asserting it would refuse
+	// a recursive sub_agent call.
+	tools.SetSpawner(sp)
+	t.Cleanup(func() { tools.SetSpawner(nil) })
+
+	// Simulating a sub_agent tool execution from inside a sub-agent's ctx:
+	ctx := tools.WithSubAgentMarker(context.Background())
+	_, err := (tools.AgentTool{}).Execute(ctx, "sub_agent", map[string]any{
+		"description": "nested",
+		"prompt":      "recurse",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot spawn") {
+		t.Errorf("recursive sub_agent should be refused, got %v", err)
+	}
+}
+
+func TestAgentSpawner_SessionDirPersistsTranscript(t *testing.T) {
+	tmp := t.TempDir()
+	send := &subAgentSender{reply: "sub-agent answer", inputTokens: 100, outputTokens: 40}
+	parent := agent.New(send, "parent-model")
+	sp := NewSpawner(parent, nilExecutor{}, func(context.Context) []agent.ToolDefinition { return nil })
+
+	res, err := sp.Spawn(context.Background(), tools.SpawnRequest{
+		Description: "Test",
+		Prompt:      "do something",
+		SessionDir:  tmp,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.AgentID == "" {
+		t.Fatal("expected non-empty AgentID")
+	}
+
+	// The session file should have been written.
+	path := filepath.Join(tmp, res.AgentID+".jsonl")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("session file not written: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("session file is empty")
+	}
+
+	// Should contain the prompt and the reply as JSONL records.
+	body := string(data)
+	if !strings.Contains(body, "do something") {
+		t.Error("session transcript missing user prompt")
+	}
+	if !strings.Contains(body, "sub-agent answer") {
+		t.Error("session transcript missing assistant reply")
+	}
+
+	// Continue should append to the same file.
+	before, _ := os.ReadFile(path)
+	_, err = sp.Continue(context.Background(), res.AgentID, "continue please")
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(path)
+	if len(after) <= len(before) {
+		t.Error("Continue should have appended more records to the session file")
+	}
+}
+
+// trailSender scripts a two-round child for the event-trail test: round 1
+// streams a text delta then returns a tool_use block; round 2 streams the
+// final answer. Implementing ToolStreamingSender makes the child loop emit
+// real EventTextDelta events (the buffered fallback wouldn't).
+type trailSender struct{ calls int32 }
+
+func (s *trailSender) SendMessages(_ context.Context, _, _ string, _ []agent.Message, _ int) (agent.Reply, error) {
+	return agent.Reply{Content: "unused"}, nil
+}
+
+func (s *trailSender) SendMessagesWithTools(_ context.Context, _, _ string, _ []agent.Message, _ int, _ []agent.ToolDefinition) (agent.Reply, error) {
+	return agent.Reply{Content: "unused"}, nil
+}
+
+func (s *trailSender) StreamMessagesWithTools(
+	_ context.Context, _, _ string, _ []agent.Message, _ int, _ []agent.ToolDefinition,
+	onChunk func(string), _ agent.ToolInputDeltaFunc, _ agent.ThinkingDeltaFunc,
+) (agent.Reply, error) {
+	if atomic.AddInt32(&s.calls, 1) == 1 {
+		onChunk("Let me look. ")
+		return agent.Reply{
+			Blocks: []agent.ContentBlock{
+				agent.NewTextBlock("Let me look. "),
+				agent.NewToolUseBlock("t1", "echo_tool", map[string]any{"q": "x"}),
+			},
+			StopReason: "tool_use",
+		}, nil
+	}
+	onChunk("All done.")
+	return agent.Reply{Content: "All done.", StopReason: "end_turn"}, nil
+}
+
+// echoExecutor returns a fixed payload for any tool call.
+type echoExecutor struct{}
+
+func (echoExecutor) Execute(_ context.Context, _ string, _ map[string]any) (agent.ToolResult, error) {
+	return agent.ToolResult{Text: "TOOL-OUTPUT-PAYLOAD"}, nil
+}
+
+func TestAgentSpawner_EventTrailCarriesOutputsAndText(t *testing.T) {
+	parent := agent.New(&trailSender{}, "parent-model")
+	childTools := []agent.ToolDefinition{{Name: "echo_tool"}}
+	sp := NewSpawner(parent, echoExecutor{}, func(context.Context) []agent.ToolDefinition { return childTools })
+
+	var events []tools.SubAgentEvent
+	ctx := tools.WithSubAgentEventSink(context.Background(), func(ev tools.SubAgentEvent) {
+		events = append(events, ev)
+	})
+
+	res, err := sp.Spawn(ctx, tools.SpawnRequest{Description: "trail", Prompt: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Reply != "All done." {
+		t.Fatalf("Reply = %q", res.Reply)
+	}
+
+	var kinds []string
+	for _, ev := range events {
+		kinds = append(kinds, ev.Kind)
+	}
+	want := []string{"text", "tool", "tool_done", "text"}
+	if len(kinds) != len(want) {
+		t.Fatalf("event kinds = %v, want %v", kinds, want)
+	}
+	for i := range want {
+		if kinds[i] != want[i] {
+			t.Fatalf("event kinds = %v, want %v", kinds, want)
+		}
+	}
+
+	if events[0].Text != "Let me look. " {
+		t.Errorf("first text = %q", events[0].Text)
+	}
+	if events[1].ToolID != "t1" || events[1].ToolName != "echo_tool" {
+		t.Errorf("tool event = %+v", events[1])
+	}
+	if q, _ := events[1].ToolInput["q"].(string); q != "x" {
+		t.Errorf("tool input = %v", events[1].ToolInput)
+	}
+	if events[2].ToolID != "t1" || events[2].ToolOutput != "TOOL-OUTPUT-PAYLOAD" {
+		t.Errorf("tool_done event = %+v", events[2])
+	}
+	if events[3].Text != "All done." {
+		t.Errorf("final text = %q", events[3].Text)
+	}
+}

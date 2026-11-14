@@ -1,0 +1,565 @@
+package anthropic
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/provider"
+	"github.com/open-octo/octo-agent/internal/provider/retry"
+)
+
+// canonicalStream is a realistic Anthropic SSE transcript:
+// message_start → content_block_start → two text deltas → content_block_stop
+// → message_delta (with stop_reason and final usage) → message_stop.
+//
+// Each event is preceded by `event: <type>` for fidelity to the wire format;
+// the parser ignores those and only reads `data:` lines, but including them
+// guards against a regression that would skip JSON parsing when an event:
+// line is present.
+const canonicalStream = "" +
+	"event: message_start\n" +
+	`data: {"type":"message_start","message":{"id":"msg_01","model":"claude-haiku-4-5-20251001","usage":{"input_tokens":12,"output_tokens":0}}}` + "\n\n" +
+	"event: content_block_start\n" +
+	`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+	"event: content_block_delta\n" +
+	`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi "}}` + "\n\n" +
+	"event: content_block_delta\n" +
+	`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"there"}}` + "\n\n" +
+	"event: content_block_stop\n" +
+	`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+	"event: message_delta\n" +
+	`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":7}}` + "\n\n" +
+	"event: message_stop\n" +
+	`data: {"type":"message_stop"}` + "\n\n"
+
+func TestSendStream_AggregatesAndCallsBack(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Headers: streaming requests must announce SSE acceptance and the
+		// JSON body must carry stream:true.
+		if got := r.Header.Get("Accept"); got != "text/event-stream" {
+			t.Errorf("Accept = %q, want text/event-stream", got)
+		}
+		if got := r.Header.Get("x-api-key"); got != "test-key" {
+			t.Errorf("x-api-key = %q", got)
+		}
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var req apiRequest
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			t.Fatalf("decode req: %v", err)
+		}
+		if !req.Stream {
+			t.Errorf("apiRequest.Stream = false, want true")
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, canonicalStream)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer srv.Close()
+
+	c, err := New("test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.BaseURL = srv.URL
+
+	var chunks []string
+	resp, err := c.SendStream(context.Background(), provider.Request{
+		Model:    "claude-haiku-4-5-20251001",
+		Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}, provider.StreamCallbacks{OnText: func(d string) { chunks = append(chunks, d) }})
+	if err != nil {
+		t.Fatalf("SendStream: %v", err)
+	}
+
+	// onChunk must fire once per text_delta, in order.
+	if got, want := strings.Join(chunks, "|"), "hi |there"; got != want {
+		t.Errorf("chunks = %q, want %q", got, want)
+	}
+	if resp.Content != "hi there" {
+		t.Errorf("Content = %q, want 'hi there'", resp.Content)
+	}
+	if resp.Model != "claude-haiku-4-5-20251001" {
+		t.Errorf("Model = %q", resp.Model)
+	}
+	if resp.StopReason != "end_turn" {
+		t.Errorf("StopReason = %q", resp.StopReason)
+	}
+	// InputTokens comes from message_start; OutputTokens from the final
+	// message_delta usage block.
+	if resp.InputTokens != 12 || resp.OutputTokens != 7 {
+		t.Errorf("Usage = (%d, %d), want (12, 7)", resp.InputTokens, resp.OutputTokens)
+	}
+}
+
+// TestSendStream_CustomHeaders is the regression test for the streaming path
+// missing Client.Headers entirely: SendStream builds its own request
+// independently of Send, so the header-merge loop had to be added there too.
+// This is the primary code path for real interactive chat (agent.go prefers
+// StreamMessagesWithTools whenever the provider implements it), so a gap here
+// would silently defeat the whole feature for normal usage.
+func TestSendStream_CustomHeaders(t *testing.T) {
+	var gotTenant, gotOverride string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTenant = r.Header.Get("X-Tenant-Id")
+		gotOverride = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, canonicalStream)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer srv.Close()
+
+	c, err := New("test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.BaseURL = srv.URL
+	c.Headers = map[string]string{"X-Tenant-Id": "tenant-42", "x-api-key": "override-value"}
+
+	if _, err := c.SendStream(context.Background(), provider.Request{
+		Model:    "claude-haiku-4-5-20251001",
+		Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}, provider.StreamCallbacks{}); err != nil {
+		t.Fatalf("SendStream: %v", err)
+	}
+
+	if gotTenant != "tenant-42" {
+		t.Errorf("X-Tenant-Id = %q, want tenant-42 (custom header must reach the streaming request)", gotTenant)
+	}
+	if gotOverride != "override-value" {
+		t.Errorf("x-api-key = %q, want override-value (custom header must override the built-in one on the streaming path too)", gotOverride)
+	}
+}
+
+func TestSendStream_NilCallbackTolerated(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, canonicalStream)
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+
+	resp, err := c.SendStream(context.Background(), provider.Request{
+		Model:    "x",
+		Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}, provider.StreamCallbacks{})
+	if err != nil {
+		t.Fatalf("SendStream: %v", err)
+	}
+	if resp.Content != "hi there" {
+		t.Errorf("Content = %q", resp.Content)
+	}
+}
+
+// TestStreamingHTTPClient_DropsTimeout ensures the streaming client drops the
+// injected client's end-to-end Timeout (which would kill a long generation
+// mid-stream) while preserving Transport, and without mutating the original.
+func TestStreamingHTTPClient_DropsTimeout(t *testing.T) {
+	tr := &http.Transport{}
+	c := &Client{HTTPClient: &http.Client{Timeout: 60 * time.Second, Transport: tr}}
+	got := c.streamingHTTPClient()
+	if got.Timeout != 0 {
+		t.Errorf("streaming client Timeout = %v, want 0", got.Timeout)
+	}
+	if got == c.HTTPClient {
+		t.Error("streaming client must be a clone, not the injected client")
+	}
+	if got.Transport != tr {
+		t.Error("clone must preserve the injected Transport")
+	}
+	if c.HTTPClient.Timeout != 60*time.Second {
+		t.Errorf("injected client Timeout was mutated to %v, want 60s", c.HTTPClient.Timeout)
+	}
+}
+
+// TestSendStream_IdleTimeout verifies that a server which sends a partial
+// stream and then goes silent (without closing) trips the idle guard instead
+// of blocking forever. The handler streams one event, flushes, then blocks
+// until the client aborts the request.
+func TestSendStream_IdleTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w,
+			`data: {"type":"message_start","message":{"id":"m","model":"x","usage":{"input_tokens":1,"output_tokens":0}}}`+"\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Stall: stop sending without closing until the client cancels.
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+	c.StreamIdleTimeout = 40 * time.Millisecond
+
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = c.SendStream(context.Background(), provider.Request{
+			Model:    "x",
+			Messages: []agent.Message{agent.NewUserMessage("hi")},
+		}, provider.StreamCallbacks{})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SendStream hung past the idle window — idle guard did not fire")
+	}
+	if !errors.Is(err, retry.ErrStreamIdle) {
+		t.Fatalf("err = %v, want retry.ErrStreamIdle", err)
+	}
+}
+
+func TestSendStream_HTTPError_Wrapped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+
+	_, err := c.SendStream(context.Background(), provider.Request{
+		Model:    "x",
+		Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}, provider.StreamCallbacks{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "HTTP 401") {
+		t.Errorf("error should mention HTTP 401: %v", err)
+	}
+	if !strings.Contains(err.Error(), "invalid x-api-key") {
+		t.Errorf("error should include upstream message: %v", err)
+	}
+}
+
+func TestSendStream_ValidatesRequest(t *testing.T) {
+	c, _ := New("k")
+	c.BaseURL = "http://invalid"
+
+	if _, err := c.SendStream(context.Background(), provider.Request{}, provider.StreamCallbacks{}); err == nil {
+		t.Error("empty request should error")
+	}
+	if _, err := c.SendStream(context.Background(), provider.Request{Model: "x"}, provider.StreamCallbacks{}); err == nil {
+		t.Error("missing messages should error")
+	}
+}
+
+func TestSendStream_NonTextDeltasIgnored(t *testing.T) {
+	// Future Anthropic versions emit input_json_delta for tool_use blocks.
+	// The text aggregator must skip any delta whose type is not "text_delta",
+	// so we don't accidentally splice JSON fragments into the assistant text.
+	mixed := "" +
+		`data: {"type":"message_start","message":{"id":"m","model":"x","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"keep"}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1}"}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" me"}}` + "\n\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":2}}` + "\n\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, mixed)
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+
+	resp, err := c.SendStream(context.Background(), provider.Request{
+		Model:    "x",
+		Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}, provider.StreamCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Content != "keep me" {
+		t.Errorf("Content = %q, want 'keep me' (input_json_delta should be skipped)", resp.Content)
+	}
+}
+
+// kimiStream mimics Kimi's Anthropic-compatible SSE: the single space after
+// "data:" is omitted (valid per the SSE spec), and cache accounting lands in
+// the final message_delta rather than in message_start.
+const kimiStream = "" +
+	`event:message_start` + "\n" +
+	`data:{"type":"message_start","message":{"id":"m","model":"kimi-for-coding","usage":{"input_tokens":1988,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}` + "\n\n" +
+	`event:content_block_start` + "\n" +
+	`data:{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+	`event:content_block_delta` + "\n" +
+	`data:{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"cached"}}` + "\n\n" +
+	`event:content_block_stop` + "\n" +
+	`data:{"type":"content_block_stop","index":0}` + "\n\n" +
+	`event:message_delta` + "\n" +
+	`data:{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":3,"cache_read_input_tokens":1988,"cache_creation_input_tokens":0}}` + "\n\n" +
+	`event:message_stop` + "\n" +
+	`data:{"type":"message_stop"}` + "\n\n"
+
+// TestSendStream_KimiNoSpaceAndDeltaCache guards two compatible-backend quirks:
+// SSE "data:" lines without a trailing space must still be parsed, and cache
+// accounting reported only in message_delta must be picked up.
+func TestSendStream_KimiNoSpaceAndDeltaCache(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, kimiStream)
+	}))
+	defer srv.Close()
+
+	c, err := New("test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.BaseURL = srv.URL
+
+	resp, err := c.SendStream(context.Background(), provider.Request{
+		Model:    "k2.6",
+		Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}, provider.StreamCallbacks{})
+	if err != nil {
+		t.Fatalf("SendStream: %v", err)
+	}
+
+	if resp.Content != "cached" {
+		t.Errorf("Content = %q, want 'cached' (no-space data: lines must parse)", resp.Content)
+	}
+	if resp.CacheReadTokens != 1988 {
+		t.Errorf("CacheReadTokens = %d, want 1988 (message_delta cache must be captured)", resp.CacheReadTokens)
+	}
+	// message_delta carries the non-cached remainder; on a full cache hit it's 0.
+	if resp.InputTokens != 0 {
+		t.Errorf("InputTokens = %d, want 0", resp.InputTokens)
+	}
+}
+
+// Compile-time assertion: *Client implements provider.StreamingProvider in the
+// test package too, in case future refactors split the file layout.
+var _ provider.StreamingProvider = (*Client)(nil)
+
+// toolUseEndTurnStream streams a tool_use block but reports stop_reason
+// "end_turn" in message_delta — the Anthropic-protocol analog of a gateway
+// mislabeling a tool call.
+const toolUseEndTurnStream = "" +
+	"event: message_start\n" +
+	`data: {"type":"message_start","message":{"id":"m","model":"x","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+	"event: content_block_start\n" +
+	`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"edit_file","input":{}}}` + "\n\n" +
+	"event: content_block_delta\n" +
+	`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.go\"}"}}` + "\n\n" +
+	"event: content_block_stop\n" +
+	`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+	"event: message_delta\n" +
+	`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":3}}` + "\n\n" +
+	"event: message_stop\n" +
+	`data: {"type":"message_stop"}` + "\n\n"
+
+// TestSendStream_ToolUseWithNonToolUseStopReason verifies the streaming path
+// treats an accumulated tool_use block as a tool-use turn even when stop_reason
+// is "end_turn".
+func TestSendStream_ToolUseWithNonToolUseStopReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, toolUseEndTurnStream)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer srv.Close()
+
+	c, _ := New("test-key")
+	c.BaseURL = srv.URL
+	resp, err := c.SendStream(context.Background(), provider.Request{
+		Model: "x", Messages: []agent.Message{agent.NewUserMessage("edit it")},
+	}, provider.StreamCallbacks{})
+	if err != nil {
+		t.Fatalf("SendStream: %v", err)
+	}
+	if resp.StopReason != "tool_use" {
+		t.Errorf("StopReason = %q, want tool_use (tool_use block present despite stop_reason end_turn)", resp.StopReason)
+	}
+	gotTool := false
+	for _, b := range resp.Blocks {
+		if b.Type == "tool_use" && b.Name == "edit_file" {
+			gotTool = true
+		}
+	}
+	if !gotTool {
+		t.Error("expected an edit_file tool_use block")
+	}
+}
+
+// TestSendStream_MidStreamResetIsTransient verifies a connection reset mid-body
+// surfaces as a transient stream error so the agent loop re-issues the round.
+func TestSendStream_MidStreamResetIsTransient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Promise more body than we deliver, then close the socket mid-line: the
+		// client sees a cut stream whose truncated final SSE chunk fails to
+		// parse — the mid-line manifestation of a reset. (A reset at an event
+		// boundary instead surfaces via scanner.Err(); both are wrapped transient.)
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("server does not support hijacking")
+		}
+		conn, bufrw, err := hj.Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		_, _ = bufrw.WriteString("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 4096\r\n\r\n")
+		_, _ = bufrw.WriteString("event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"par`)
+		_ = bufrw.Flush()
+		_ = conn.Close()
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+	_, err := c.SendStream(context.Background(), provider.Request{
+		Model: "x", Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}, provider.StreamCallbacks{})
+	if err == nil {
+		t.Fatal("expected an error from the reset stream")
+	}
+	var ts interface{ TransientStream() bool }
+	if !errors.As(err, &ts) || !ts.TransientStream() {
+		t.Errorf("mid-stream reset should be transient, got %v", err)
+	}
+}
+
+// TestSendStream_MessageStopWithoutStopReason_IsTransient covers a server that
+// closes the message early: message_stop arrives but no message_delta ever
+// carried a stop_reason. Seen from Kimi mid-thinking; accepting it ended the
+// turn on a half-written thinking block with no text and no retry.
+func TestSendStream_MessageStopWithoutStopReason_IsTransient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `data:{"type":"message_start","message":{"model":"k3","usage":{"input_tokens":83062}}}`+"\n\n")
+		_, _ = io.WriteString(w, `data:{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data:{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Maybe it"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data:{"type":"message_stop"}`+"\n\n")
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+	_, err := c.SendStream(context.Background(), provider.Request{
+		Model: "x", Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}, provider.StreamCallbacks{})
+	if err == nil {
+		t.Fatal("expected an error from a message_stop with no stop_reason")
+	}
+	var ts interface{ TransientStream() bool }
+	if !errors.As(err, &ts) || !ts.TransientStream() {
+		t.Errorf("message_stop without stop_reason should be transient, got %v", err)
+	}
+}
+
+// TestSendStream_StopReasonAfterMessageStop_Succeeds pins that the aggregator
+// reads past message_stop: a stop_reason arriving after it still ends the
+// message cleanly rather than tripping the early-close check above.
+func TestSendStream_StopReasonAfterMessageStop_Succeeds(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `data:{"type":"content_block_start","index":0,"content_block":{"type":"text"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data:{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data:{"type":"message_stop"}`+"\n\n")
+		_, _ = io.WriteString(w, `data:{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`+"\n\n")
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+	resp, err := c.SendStream(context.Background(), provider.Request{
+		Model: "x", Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}, provider.StreamCallbacks{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StopReason != "end_turn" || resp.Content != "hi" {
+		t.Errorf("got stop_reason=%q content=%q, want end_turn/hi", resp.StopReason, resp.Content)
+	}
+}
+
+// TestSendStream_CleanCloseWithoutTerminalEvent_IsTransient covers a
+// connection that drops exactly on an SSE event boundary mid-tool-call:
+// content_block_start and an input_json_delta both arrive as complete, valid
+// JSON (so neither fails to parse nor trips scanner.Err()), but the stream
+// ends with no message_delta/stop_reason and no message_stop. Before this was
+// fixed, that silently produced a "successful" tool_use response with
+// nil/garbled arguments instead of an error the agent loop could retry.
+func TestSendStream_CleanCloseWithoutTerminalEvent_IsTransient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"edit_file"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}`+"\n\n")
+		// Connection closes cleanly here — no message_delta, no message_stop.
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+	_, err := c.SendStream(context.Background(), provider.Request{
+		Model: "x", Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}, provider.StreamCallbacks{})
+	if err == nil {
+		t.Fatal("expected an error from the terminated-without-terminal-event stream")
+	}
+	var ts interface{ TransientStream() bool }
+	if !errors.As(err, &ts) || !ts.TransientStream() {
+		t.Errorf("clean close without a terminal event should be transient, got %v", err)
+	}
+}
+
+// TestSendStream_CleanCloseBeforeAnyBlock_IsTransient covers the narrower
+// case the first guard's `len(blockOrder) > 0` condition missed: a connection
+// that drops right after message_start — before any content_block_start ever
+// arrives — with no terminal event. A real response is never legitimately
+// empty this way, so this is truncation too, one event earlier than dying
+// mid-block.
+func TestSendStream_CleanCloseBeforeAnyBlock_IsTransient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `data: {"type":"message_start","message":{"model":"claude-x","usage":{"input_tokens":10,"output_tokens":0}}}`+"\n\n")
+		// Connection closes cleanly here — before any content_block_start,
+		// no message_delta, no message_stop.
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+	_, err := c.SendStream(context.Background(), provider.Request{
+		Model: "x", Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}, provider.StreamCallbacks{})
+	if err == nil {
+		t.Fatal("expected an error from the terminated-before-any-block stream")
+	}
+	var ts interface{ TransientStream() bool }
+	if !errors.As(err, &ts) || !ts.TransientStream() {
+		t.Errorf("clean close before any block should be transient, got %v", err)
+	}
+}

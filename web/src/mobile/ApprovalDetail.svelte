@@ -1,0 +1,117 @@
+<script lang="ts">
+  // Mobile approval detail: the high-value phone scenario — approve or reject a
+  // pending high-risk command. request_confirmation is now globally broadcast
+  // but this detail is a deep-linked page opened from the feed — it fetches the
+  // current confirmation state over REST so it always has the latest regardless
+  // of when the event arrived. Answers go over ws.answerConfirmation using the
+  // same contract as desktop ('yes' = allow once, 'always' = allow for session,
+  // anything else = deny). The desktop ConfirmModal overlay is suppressed on
+  // mobile (App.svelte) so this is the single surface.
+  import { activeSessionId } from '../lib/stores'
+  import { ws } from '../lib/ws'
+  import { getSessionConfirmation, type SessionConfirmation } from '../lib/api'
+  import { t } from '../lib/i18n'
+
+  let { onBack }: { onBack: () => void } = $props()
+
+  const sid = $derived($activeSessionId ?? '')
+  let c = $state<SessionConfirmation | null>(null)
+  let loading = $state(true)
+
+  // Fetch the current confirmation state over REST when this opens — even
+  // though request_confirmation is globally broadcast, this is a deep-linked
+  // page that needs the latest state regardless of when the event arrived.
+  $effect(() => {
+    const s = sid
+    if (!s) { c = null; loading = false; return }
+    loading = true
+    getSessionConfirmation(s)
+      .then(resp => { c = resp?.pending ? resp : null; loading = false })
+      .catch(() => { c = null; loading = false })
+  })
+
+  function answer(result: string) {
+    if (c?.id) ws.answerConfirmation(c.id, result)
+    onBack()
+  }
+
+  function diffClass(line: string): string {
+    if (line.startsWith('@@')) return 'hdr'
+    if (line.startsWith('-')) return 'rm'
+    if (line.startsWith('+')) return 'add'
+    return 'plain'
+  }
+</script>
+
+<header class="dhead">
+  <button class="back" onclick={onBack} aria-label={$t('m.back')}>
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--m-text)" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg>
+  </button>
+  <span class="dtitle">{$t('m.approval')}</span>
+</header>
+
+<div class="scroll">
+  {#if c}
+    <div class="warn">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--m-warning)" stroke-width="2"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 2 18a2 2 0 0 0 1.7 3h16.6A2 2 0 0 0 22 18L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+      <span>{$t('m.approval_warn')}</span>
+    </div>
+
+    {#if c.message}<p class="desc">{c.message}</p>{/if}
+
+    {#if c.command}
+      <div class="label">{$t('m.cmd')}</div>
+      <pre class="term"><span class="p">$</span> {c.command}</pre>
+    {:else if c.diff}
+      <div class="label">{$t('m.diff')}</div>
+      <div class="diff">
+        {#each c.diff.split('\n') as line}
+          <div class="dl {diffClass(line)}">{line}</div>
+        {/each}
+      </div>
+    {:else if c.input}
+      <div class="label">{$t('m.input')}</div>
+      <pre class="term">{c.input}</pre>
+    {/if}
+
+    <div class="actions">
+      {#if c.kind === 'ok'}
+        <button class="btnP" onclick={() => answer('ok')}>{$t('m.ok')}</button>
+      {:else}
+        <button class="btnP" onclick={() => answer('yes')}>{$t('m.approve')}</button>
+        <button class="btnD" onclick={() => answer('deny')}>{$t('m.deny')}</button>
+        <button class="btnG" onclick={() => answer('always')}>{$t('m.allow_session')}</button>
+      {/if}
+    </div>
+  {:else if loading}
+    <div class="empty">{$t('m.loading')}</div>
+  {:else}
+    <div class="empty">{$t('m.approval_gone')}</div>
+    <button class="btnD full" onclick={onBack}>{$t('m.back')}</button>
+  {/if}
+</div>
+
+<style>
+  .dhead { flex: none; display: flex; align-items: center; gap: 10px; padding: 6px 14px 12px; }
+  .back { flex: none; width: 34px; height: 34px; border-radius: 50%; border: none; background: var(--m-surface); display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: var(--m-shadow-card); }
+  .dtitle { font-size: 15px; font-weight: 600; color: var(--m-text); }
+  .scroll { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 6px 16px 20px; }
+  .warn { display: flex; align-items: center; gap: 8px; background: var(--m-tag-warn-bg); border: 1px solid var(--m-tag-warn-border); border-radius: 12px; padding: 12px 14px; margin-bottom: 14px; font-size: 13px; color: var(--m-text); }
+  .warn svg { flex: none; }
+  .desc { margin: 0 0 14px; font-size: 13px; line-height: 1.6; color: var(--m-text-2); }
+  .label { font-size: 12px; color: var(--m-text-3); margin: 0 2px 6px; }
+  .term { margin: 0 0 16px; padding: 12px 14px; background: var(--m-terminal-bg); color: var(--m-terminal-fg); border-radius: 12px; font-size: 12.5px; line-height: 1.7; font-family: ui-monospace, Menlo, monospace; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  .term .p { color: var(--m-success); }
+  .diff { margin-bottom: 16px; border: 1px solid var(--m-border); border-radius: 12px; overflow: hidden; font-size: 12.5px; line-height: 1.7; font-family: ui-monospace, Menlo, monospace; }
+  .dl { padding: 1px 12px; white-space: pre-wrap; word-break: break-all; }
+  .dl.hdr { color: var(--m-text-3); }
+  .dl.rm { background: var(--m-tag-warn-bg); color: var(--m-error); }
+  .dl.add { background: var(--m-tag-ok-bg); color: var(--m-tag-ok-text); }
+  .dl.plain { color: var(--m-text-2); }
+  .actions { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+  .btnP { padding: 12px 0; border-radius: 10px; border: none; background: var(--m-accent); color: #fff; font-size: 15px; font-weight: 600; font-family: inherit; cursor: pointer; }
+  .btnD { padding: 12px 0; border-radius: 10px; border: 1px solid var(--m-border); background: var(--m-surface); color: var(--m-text); font-size: 15px; font-weight: 500; font-family: inherit; cursor: pointer; }
+  .btnG { padding: 10px 0; border-radius: 10px; border: none; background: none; color: var(--m-text-3); font-size: 13px; font-family: inherit; cursor: pointer; }
+  .full { width: 100%; margin-top: 14px; }
+  .empty { padding: 40px 8px; text-align: center; font-size: 13px; color: var(--m-text-3); }
+</style>

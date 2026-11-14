@@ -1,0 +1,382 @@
+// Package prompt assembles the agent's system prompt from layered sources.
+//
+// The composed prompt is meant to be built ONCE per session and frozen: the
+// provider caches the system+tools prefix (see internal/provider/anthropic),
+// and recomputing the prompt mid-session would invalidate that cache for
+// every subsequent turn. Compose at session start, set it on Agent.System,
+// and don't touch it again.
+package prompt
+
+import (
+	_ "embed"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/open-octo/octo-agent/internal/datahome"
+)
+
+// base is the built-in foundation prompt: octo's identity plus the
+// tool-use, permission, and read-before-write norms. Embedded so it ships
+// in the single binary.
+//
+//go:embed base.md
+var base string
+
+// coauthorRule is injected right after base when coauthor mode is enabled.
+// It instructs the agent to append a Co-authored-by trailer to every git
+// commit message it writes, following Git trailer format (RFC 822-style
+// headers at the end of the message, separated by a blank line).
+const coauthorRule = `## Git commits
+
+When you run ` + "`git commit`" + ` (via the terminal tool or any other path), append the following Co-authored-by trailer to the commit message:
+
+  Co-authored-by: octo-agent <no-reply@octo-agent.dev>
+
+The trailer must be placed at the very end of the commit message, separated from the body by a blank line, following standard Git trailer format. Do not add this trailer if the user explicitly tells you not to.`
+
+// expertOverrideBanner is prepended to the profile's SystemPrompt when
+// expertMode is true. It makes explicit that the expert agent's configured
+// persona and rules take priority over the base prompt's generic guidance —
+// without it, detailed base-prompt instructions (tool-use norms, phase
+// boundaries, output style) can drown out the shorter custom prompt.
+const expertOverrideBanner = `# Expert Agent Configuration
+
+The system prompt below is **authoritative** and **overrides any conflicting
+instructions** in the sections above. Follow this persona, constraints, and
+rules even when they contradict earlier guidance.
+
+---
+`
+
+// ProjectContextFile is the per-repo conventions file Compose looks for in
+// the working directory. It carries project-specific rules the agent should
+// follow (the human-facing counterpart to CLAUDE.md).
+const ProjectContextFile = ".octorules"
+
+// maxIncludeDepth caps @include nesting so a deep (or accidentally recursive)
+// chain can't blow the stack or balloon the prompt. Cycles are caught
+// separately; this guards pathological-but-acyclic depth.
+const maxIncludeDepth = 5
+
+// userRulesPath returns the absolute path of the per-user global conventions
+// file (~/.octo/octorules.md) — the cross-project counterpart of the per-repo
+// ProjectContextFile. It's a var so tests can point it at a temp file. Returns
+// "" when the home directory can't be resolved.
+var userRulesPath = func() string {
+	path, err := datahome.Path("octorules.md")
+	if err != nil {
+		return ""
+	}
+	return path
+}
+
+// Compose assembles the session system prompt from up to ten layers (six
+// when expertMode is true), in order of increasing specificity:
+//
+//  1. base     — embedded octo foundation (always present)
+//
+//  2. soul     — ~/.octo/soul.md, if present (agent identity & behavior)
+//
+//  3. env      — environment snapshot (cwd, git, date, OS) the caller renders
+//
+//  4. skills   — the available-skills manifest the caller renders, if any
+//
+//  5. mcpTools — the available-MCP-tools manifest the caller renders, if any (see tools.MCPManifestFor)
+//
+//  6. memory   — cross-session memory the caller renders, if any (C9; includes inherited home-dir memories)
+//
+//  7. profile  — ~/.octo/user.md, if present (who the user is)
+//
+//  8. user     — ~/.octo/octorules.md, if present (cross-project user rules)
+//
+//  9. project  — ProjectContextFile in cwd, if present (repo conventions)
+//
+//  10. system   — the --system value, if any (highest-priority override, last).
+//     In expertMode, prefixed with an authoritative banner so the
+//     expert agent's persona overrides base-prompt instructions.
+//
+// Empty layers are skipped. Later layers appear later in the text, which is
+// the conventional way to let more specific instructions take precedence —
+// project rules override the user's global rules, and --system overrides all.
+//
+// soul sits right after base: it reshapes persona/behavior, but base's tool
+// and safety norms still precede it. skills and mcpTools are already-rendered
+// manifests (see skills.RenderManifest and tools.MCPManifestFor), passed in
+// rather than discovered here so this package keeps a one-directional dep
+// (prompt does not import skills or tools) and the prefix stays stable across
+// turns. soul/profile/user/project are read here (single files), like
+// octorules.
+//
+// The user and project files may pull in other files with @include directives
+// (see expandIncludes). env is passed in rather than computed here so this
+// package stays pure (no os/exec, no git); the caller snapshots it once at
+// session start, which keeps the cached prompt prefix stable across turns.
+//
+// coauthor, when true, injects a rule into the system prompt instructing the
+// agent to append a Co-authored-by trailer to every git commit message it writes.
+//
+// expertMode, when true, skips identity/persona layers (soul.md, user.md,
+// octorules.md, and project conventions) — these belong to the Default Agent
+// and would collide with an Expert Agent's custom system prompt.
+func Compose(userSystem, cwd, env, skills, mcpTools, memory string, coauthor, expertMode bool, extraRuleDirs ...string) string {
+	return compose(nil, userSystem, cwd, env, skills, mcpTools, memory, coauthor, expertMode, extraRuleDirs...)
+}
+
+// ComposeWithSuperMode is Compose with an explicit Super-mode decision for this
+// one composition. The server resolves the switch per PROJECT (a project's own
+// super_mode, else the global config value) and passes it here, because the
+// process-wide switch in supermode.go is shared by every session and cannot
+// express "on for this project only". A nil override (Compose/ComposePair) keeps
+// the process-wide switch, which is what the CLI/TUI still use.
+func ComposeWithSuperMode(superOn bool, userSystem, cwd, env, skills, mcpTools, memory string, coauthor, expertMode bool, extraRuleDirs ...string) string {
+	return compose(&superOn, userSystem, cwd, env, skills, mcpTools, memory, coauthor, expertMode, extraRuleDirs...)
+}
+
+// compose is Compose with a three-state Super decision: nil = process-wide
+// switch, non-nil = that value verbatim.
+func compose(superOverride *bool, userSystem, cwd, env, skills, mcpTools, memory string, coauthor, expertMode bool, extraRuleDirs ...string) string {
+	layers := []string{strings.TrimSpace(base)}
+
+	if coauthor {
+		layers = append(layers, coauthorRule)
+	}
+
+	if !expertMode {
+		if s := readSoul(); s != "" {
+			layers = append(layers, "# Agent identity (~/.octo/soul.md)\n\n"+s)
+		}
+	}
+	if e := strings.TrimSpace(env); e != "" {
+		layers = append(layers, e)
+	}
+	if s := strings.TrimSpace(skills); s != "" {
+		layers = append(layers, s)
+	}
+	if mt := strings.TrimSpace(mcpTools); mt != "" {
+		layers = append(layers, mt)
+	}
+	if m := strings.TrimSpace(memory); m != "" {
+		layers = append(layers, m)
+	}
+	if !expertMode {
+		if p := readUserProfile(); p != "" {
+			layers = append(layers, "# User profile (~/.octo/user.md)\n\n"+p)
+		}
+		if u := readUserContext(); u != "" {
+			layers = append(layers, "# User conventions (~/.octo/octorules.md)\n\n"+u)
+		}
+		if proj := readProjectContext(cwd); proj != "" {
+			layers = append(layers, "# Project conventions ("+ProjectContextFile+")\n\n"+proj)
+		}
+		// A project's mounted source folders contribute their conventions
+		// too, in mount order after the cwd's own — mounting the folder was
+		// the trust grant. Headed by the folder so the model can tell whose
+		// rules it is reading when several repos are mounted.
+		for _, d := range extraRuleDirs {
+			if r := readProjectContext(d); r != "" {
+				layers = append(layers, "# Project conventions ("+filepath.Join(d, ProjectContextFile)+")\n\n"+r)
+			}
+		}
+	}
+	if u := strings.TrimSpace(userSystem); u != "" {
+		if expertMode {
+			layers = append(layers, expertOverrideBanner+u)
+		} else {
+			layers = append(layers, u)
+		}
+	}
+
+	// Super mode prepends the user's fixed preamble to whatever this
+	// composition produced. Off is a byte-identical no-op; on is idempotent —
+	// see applySuperModeDecision. A caller with a per-project decision passes
+	// it explicitly (ComposeWithSuperMode); nil keeps the process-wide switch.
+	on := SuperModeEnabled()
+	if superOverride != nil {
+		on = *superOverride
+	}
+	return applySuperModeDecision(strings.Join(layers, "\n\n---\n\n"), on)
+}
+
+// ComposePair returns both the full system prompt and a "lean" variant that
+// drops the skills manifest, MCP tools manifest, and memory injection (the
+// heaviest, most optional layers). The lean variant seeds cheap read-only
+// sub-agents (explore) that don't need the full harness context. Other
+// layers — soul, env, user/project conventions — are kept in both (except in expertMode, where soul/user/project are dropped from both).
+func ComposePair(userSystem, cwd, env, skills, mcpTools, memory string, coauthor, expertMode bool, extraRuleDirs ...string) (full, lean string) {
+	full = Compose(userSystem, cwd, env, skills, mcpTools, memory, coauthor, expertMode, extraRuleDirs...)
+	lean = Compose(userSystem, cwd, env, "", "", "", coauthor, expertMode, extraRuleDirs...)
+	return full, lean
+}
+
+// ComposePairWithSuperMode is ComposePair with the per-project Super-mode
+// decision applied to both variants (see ComposeWithSuperMode).
+func ComposePairWithSuperMode(superOn bool, userSystem, cwd, env, skills, mcpTools, memory string, coauthor, expertMode bool, extraRuleDirs ...string) (full, lean string) {
+	full = ComposeWithSuperMode(superOn, userSystem, cwd, env, skills, mcpTools, memory, coauthor, expertMode, extraRuleDirs...)
+	lean = ComposeWithSuperMode(superOn, userSystem, cwd, env, "", "", "", coauthor, expertMode, extraRuleDirs...)
+	return full, lean
+}
+
+// IdentityPath resolves an identity file under dir, preferring the
+// canonical lowercase name and falling back to the legacy uppercase
+// spelling — pre-0.19 onboarding wrote SOUL.md/USER.md while composition
+// reads soul.md/user.md, which are distinct files on case-sensitive
+// filesystems. When neither exists, the canonical path is returned so
+// callers that create the file use the lowercase name.
+func IdentityPath(dir, lower string) string {
+	canonical := filepath.Join(dir, lower)
+	if _, err := os.Stat(canonical); err == nil {
+		return canonical
+	}
+	legacy := filepath.Join(dir, strings.ToUpper(strings.TrimSuffix(lower, ".md"))+".md")
+	if _, err := os.Stat(legacy); err == nil {
+		return legacy
+	}
+	return canonical
+}
+
+// soulPath and userProfilePath return the per-user identity files
+// (<data root>/User/soul.md, <data root>/User/user.md), or "" when the data
+// directory can't be resolved. They're vars so tests can point them at temp
+// files, mirroring userRulesPath.
+var soulPath = func() string {
+	dir, err := datahome.RegionPath(datahome.RegionUser)
+	if err != nil {
+		return ""
+	}
+	return IdentityPath(dir, "soul.md")
+}
+
+var userProfilePath = func() string {
+	dir, err := datahome.RegionPath(datahome.RegionUser)
+	if err != nil {
+		return ""
+	}
+	return IdentityPath(dir, "user.md")
+}
+
+// readSoul returns the trimmed, include-expanded contents of ~/.octo/soul.md
+// (agent identity & behavior), or "" if it's absent/unreadable/empty.
+func readSoul() string {
+	if p := soulPath(); p != "" {
+		return readContextFile(p)
+	}
+	return ""
+}
+
+// readUserProfile returns the trimmed, include-expanded contents of
+// ~/.octo/user.md (who the user is), or "" if it's absent/unreadable/empty.
+func readUserProfile() string {
+	if p := userProfilePath(); p != "" {
+		return readContextFile(p)
+	}
+	return ""
+}
+
+// readUserContext returns the trimmed, include-expanded contents of the
+// per-user global rules file, or "" if it's absent/unreadable/empty.
+func readUserContext() string {
+	p := userRulesPath()
+	if p == "" {
+		return ""
+	}
+	return readContextFile(p)
+}
+
+// readProjectContext returns the trimmed, include-expanded contents of
+// ProjectContextFile in cwd, or "" if it's absent/unreadable/empty. A missing
+// file is not an error — most directories won't have one.
+func readProjectContext(cwd string) string {
+	if cwd == "" {
+		return ""
+	}
+	return readContextFile(filepath.Join(cwd, ProjectContextFile))
+}
+
+// readContextFile reads a context file and expands its @include directives,
+// returning the trimmed result (or "" when the file is absent/unreadable).
+func readContextFile(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	// Seed the cycle set with the root file so it can't transitively include
+	// itself.
+	expanded := expandIncludes(string(b), filepath.Dir(abs), 0, map[string]bool{abs: true})
+	return strings.TrimSpace(expanded)
+}
+
+// expandIncludes inlines @include directives. A line whose first non-space
+// character is '@' is an include: the remainder (trimmed) is a file path,
+// resolved as ~/… (home), an absolute path, or relative to baseDir (the
+// directory of the file currently being expanded). The referenced file is
+// read and recursively expanded in place.
+//
+// Failures degrade to an inline HTML comment rather than aborting the prompt:
+//   - unreadable/missing →  <!-- missing include: PATH -->
+//   - already in the ancestor chain (cycle) →  <!-- include cycle: PATH -->
+//   - past maxIncludeDepth →  <!-- include depth exceeded: PATH -->
+//
+// seen tracks the current ancestor chain (added before recursing, removed
+// after) so a diamond include — the same file reached via two sibling
+// branches — is allowed, while a true cycle is not.
+func expandIncludes(content, baseDir string, depth int, seen map[string]bool) string {
+	var out strings.Builder
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if len(trimmed) < 2 || trimmed[0] != '@' {
+			out.WriteString(line)
+			out.WriteByte('\n')
+			continue
+		}
+
+		raw := strings.TrimSpace(trimmed[1:])
+		resolved := resolveIncludePath(raw, baseDir)
+		abs, err := filepath.Abs(resolved)
+		if err != nil {
+			abs = resolved
+		}
+
+		switch {
+		case depth+1 > maxIncludeDepth:
+			out.WriteString("<!-- include depth exceeded: " + raw + " -->\n")
+			continue
+		case seen[abs]:
+			out.WriteString("<!-- include cycle: " + raw + " -->\n")
+			continue
+		}
+
+		b, err := os.ReadFile(abs)
+		if err != nil {
+			out.WriteString("<!-- missing include: " + raw + " -->\n")
+			continue
+		}
+
+		seen[abs] = true
+		nested := expandIncludes(string(b), filepath.Dir(abs), depth+1, seen)
+		delete(seen, abs)
+
+		out.WriteString(strings.TrimRight(nested, "\n"))
+		out.WriteByte('\n')
+	}
+	return out.String()
+}
+
+// resolveIncludePath turns an @include target into a filesystem path: ~/… is
+// expanded against the home dir, absolute paths pass through, and everything
+// else is taken relative to baseDir (the including file's directory).
+func resolveIncludePath(raw, baseDir string) string {
+	if raw == "~" || strings.HasPrefix(raw, "~/") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			return filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(raw, "~"), "/"))
+		}
+	}
+	if filepath.IsAbs(raw) {
+		return raw
+	}
+	return filepath.Join(baseDir, raw)
+}

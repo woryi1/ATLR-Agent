@@ -1,0 +1,361 @@
+package tools
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestReadFile_HappyPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hello.txt")
+	writeTestFile(t, path, "line1\nline2\nline3\n")
+
+	out, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{"path": path})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	for _, want := range []string{"     1\tline1", "     2\tline2", "     3\tline3"} {
+		if !strings.Contains(out.Text, want) {
+			t.Errorf("output missing %q\n%s", want, out.Text)
+		}
+	}
+}
+
+func TestReadFile_OffsetAndLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "many.txt")
+	var b strings.Builder
+	for i := 1; i <= 10; i++ {
+		b.WriteString("line")
+		b.WriteByte(byte('0' + (i % 10)))
+		b.WriteByte('\n')
+	}
+	writeTestFile(t, path, b.String())
+
+	out, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{
+		"path":   path,
+		"offset": 3,
+		"limit":  2,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.Text, "     3\tline3") || !strings.Contains(out.Text, "     4\tline4") {
+		t.Errorf("offset/limit slice wrong:\n%s", out.Text)
+	}
+	if strings.Contains(out.Text, "     2\tline2") || strings.Contains(out.Text, "     5\tline5") {
+		t.Errorf("offset/limit returned unwanted lines:\n%s", out.Text)
+	}
+}
+
+func TestReadFile_TruncationFooter(t *testing.T) {
+	// A file longer than the requested window must report that it was
+	// truncated and tell the model the exact offset to resume from —
+	// otherwise the model can't tell a partial read from a complete one
+	// and ends up re-reading the same window or editing unseen lines.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "long.txt")
+	var b strings.Builder
+	for i := 1; i <= 10; i++ {
+		fmt.Fprintf(&b, "line%d\n", i)
+	}
+	writeTestFile(t, path, b.String())
+
+	out, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{
+		"path":   path,
+		"offset": 2,
+		"limit":  3,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	// Showed lines 2-4; the next unread line is 5.
+	if !strings.Contains(out.Text, "truncated") {
+		t.Errorf("expected truncation marker, got:\n%s", out.Text)
+	}
+	if !strings.Contains(out.Text, "offset=5") {
+		t.Errorf("expected resume offset=5, got:\n%s", out.Text)
+	}
+	if !strings.Contains(out.Text, "shown lines 2-4") {
+		t.Errorf("expected shown-range 2-4, got:\n%s", out.Text)
+	}
+	if !strings.Contains(out.Text, "Next unread line is 5") {
+		t.Errorf("expected 'Next unread line is 5', got:\n%s", out.Text)
+	}
+}
+
+func TestReadFile_EndOfFileFooterWhenComplete(t *testing.T) {
+	// A read that reaches EOF must report completion explicitly so the
+	// model knows not to re-read the file.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "exact.txt")
+	writeTestFile(t, path, "a\nb\nc\n")
+
+	out, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{
+		"path":  path,
+		"limit": 3,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if strings.Contains(out.Text, "truncated") {
+		t.Errorf("complete read should not be marked truncated:\n%s", out.Text)
+	}
+	if !strings.Contains(out.Text, "[end of file: 3 lines total]") {
+		t.Errorf("complete read should include end-of-file footer:\n%s", out.Text)
+	}
+}
+
+func TestReadFile_PastEnd(t *testing.T) {
+	// Reading past EOF should return a friendly marker, not an error,
+	// so agents stop paginating instead of looping on the same file.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "short.txt")
+	writeTestFile(t, path, "only\n")
+
+	out, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{
+		"path":   path,
+		"offset": 100,
+	})
+	if err != nil {
+		t.Fatalf("past-end read should not error, got %v", err)
+	}
+	if !strings.Contains(out.Text, "end of file") {
+		t.Errorf("expected end-of-file marker, got %q", out.Text)
+	}
+	if !strings.Contains(out.Text, "no more content") {
+		t.Errorf("expected 'no more content' hint, got %q", out.Text)
+	}
+}
+
+func TestReadFile_Missing(t *testing.T) {
+	_, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{
+		"path": "/definitely/not/a/real/path/12345",
+	})
+	if err == nil {
+		t.Fatal("expected error for missing file")
+	}
+}
+
+func TestReadFile_EmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty.txt")
+	writeTestFile(t, path, "")
+
+	out, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{"path": path})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.Text, "[empty file]") {
+		t.Errorf("expected [empty file] marker, got %q", out.Text)
+	}
+}
+
+func TestReadFile_RequiresPath(t *testing.T) {
+	_, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{})
+	if err == nil {
+		t.Fatal("expected error for missing path")
+	}
+}
+
+func TestReadFile_RejectsBinaryExtensions(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name    string
+		ext     string
+		wantSub string
+	}{
+		{"exe", ".exe", "Windows executable"},
+		{"zip", ".zip", "ZIP archive"},
+		{"pdf", ".pdf", "PDF document"},
+		{"sqlite", ".sqlite", "SQLite database"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(dir, "file"+c.ext)
+			writeTestFile(t, path, "bogus content")
+			_, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{"path": path})
+			if err == nil {
+				t.Fatalf("%s extension should be refused", c.ext)
+			}
+			if !strings.Contains(err.Error(), c.wantSub) {
+				t.Errorf("error should mention %q; got: %v", c.wantSub, err)
+			}
+		})
+	}
+}
+
+// TestReadFile_ImageNonVisionModel verifies that when the active model has no
+// image input, read_file refuses with an instructive message instead of
+// returning an image block the provider would silently drop — a text-only
+// model that "successfully reads" an image it cannot see confidently
+// hallucinates its contents.
+func TestReadFile_ImageNonVisionModel(t *testing.T) {
+	SetModelVision(false)
+	t.Cleanup(func() { SetModelVision(true) })
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shot.png")
+	if err := os.WriteFile(path, []byte("\x89PNG\r\n\x1a\nfake"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	res, err := ReadFileTool{}.Execute(context.Background(), "", map[string]any{"path": path})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(res.Blocks) != 0 {
+		t.Errorf("expected no image blocks for non-vision model, got %+v", res.Blocks)
+	}
+	if !strings.Contains(res.Text, "does not accept image input") {
+		t.Errorf("expected refusal text, got: %q", res.Text)
+	}
+}
+
+func TestReadFile_ReadsImage(t *testing.T) {
+	// A valid PNG header: 89 50 4E 47 0D 0A 1A 0A
+	pngHeader := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.png")
+	if err := os.WriteFile(path, pngHeader, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{"path": path})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(res.Text, "image/png") {
+		t.Errorf("expected image description with MIME type, got: %q", res.Text)
+	}
+	if len(res.Blocks) != 1 || res.Blocks[0].Type != "image" {
+		t.Errorf("expected 1 image block, got %+v", res.Blocks)
+	}
+	if res.Blocks[0].Image == nil || res.Blocks[0].Image.MIMEType != "image/png" {
+		t.Errorf("image block MIME type wrong: %+v", res.Blocks[0].Image)
+	}
+}
+
+func TestReadFile_ImageTooLarge(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.png")
+	// Write a file larger than ReadFileImageMaxBytes
+	big := make([]byte, ReadFileImageMaxBytes+1)
+	big[0] = 0x89 // PNG magic byte so it passes the extension check
+	if err := os.WriteFile(path, big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{"path": path})
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("expected size-limit error, got: %v", err)
+	}
+}
+
+func TestReadFile_AllowsTextExtensions(t *testing.T) {
+	// Sanity check that the binary list isn't too aggressive — common
+	// source-code extensions must still be readable.
+	dir := t.TempDir()
+	cases := []string{".go", ".ts", ".tsx", ".py", ".rb", ".md", ".json", ".yml", ".html", ".css", ".sql", ".rs"}
+	for _, ext := range cases {
+		t.Run(strings.TrimPrefix(ext, "."), func(t *testing.T) {
+			path := filepath.Join(dir, "x"+ext)
+			writeTestFile(t, path, "hello\n")
+			if _, err := (ReadFileTool{}).Execute(context.Background(), "read_file", map[string]any{"path": path}); err != nil {
+				t.Errorf("%s should be readable as text; got %v", ext, err)
+			}
+		})
+	}
+}
+
+func TestReadFile_RejectsBlockedDevicePaths(t *testing.T) {
+	// On non-Unix, these paths simply don't exist; the test is meaningful
+	// only where they would otherwise be readable. Skip if /dev itself
+	// isn't there.
+	if _, err := os.Stat("/dev"); err != nil {
+		t.Skip("/dev not present; skipping device-file test")
+	}
+	for _, p := range []string{"/dev/random", "/dev/urandom", "/dev/zero", "/dev/tty"} {
+		t.Run(strings.TrimPrefix(p, "/dev/"), func(t *testing.T) {
+			_, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{"path": p})
+			if err == nil {
+				t.Fatalf("%s should be refused", p)
+			}
+			if !strings.Contains(err.Error(), "device file") {
+				t.Errorf("error should mention device file; got %v", err)
+			}
+		})
+	}
+}
+
+func TestReadFile_AllowsDevNull(t *testing.T) {
+	// /dev/null returns EOF immediately; it's not on the blocklist.
+	if _, err := os.Stat("/dev/null"); err != nil {
+		t.Skip("/dev/null not present; skipping")
+	}
+	out, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{"path": "/dev/null"})
+	if err != nil {
+		t.Fatalf("/dev/null should be readable (returns EOF): %v", err)
+	}
+	if !strings.Contains(out.Text, "[empty file]") {
+		t.Errorf("expected [empty file] marker, got %q", out.Text)
+	}
+}
+
+func TestReadFile_RefusesUNCPath(t *testing.T) {
+	for _, p := range []string{`\\evil-host\share\file`, "//evil-host/share/file"} {
+		_, err := ReadFileTool{}.Execute(context.Background(), "read_file", map[string]any{"path": p})
+		if err == nil || !strings.Contains(err.Error(), "UNC") {
+			t.Errorf("read_file should refuse UNC path %q, got %v", p, err)
+		}
+	}
+}
+
+func TestIsUNCPath(t *testing.T) {
+	unc := []string{`\\server\share`, "//server/share"}
+	for _, p := range unc {
+		if !isUNCPath(p) {
+			t.Errorf("isUNCPath(%q) = false, want true", p)
+		}
+	}
+	notUNC := []string{"/etc/passwd", "relative/path", "~/file", `C:\Users\me`, "/single/slash"}
+	for _, p := range notUNC {
+		if isUNCPath(p) {
+			t.Errorf("isUNCPath(%q) = true, want false", p)
+		}
+	}
+}
+
+// With a vision helper configured, read_file hands back the image block even
+// though the model itself can't see: the agent layer replaces it with a
+// description before the request goes out. Refusing here would make the helper
+// unreachable from the tool that most needs it.
+func TestReadFile_ImageTextOnlyModelWithVisionHelper(t *testing.T) {
+	SetModelVision(false)
+	SetImageDescriberActive(true)
+	t.Cleanup(func() { SetModelVision(true); SetImageDescriberActive(false) })
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shot.png")
+	if err := os.WriteFile(path, []byte("\x89PNG\r\n\x1a\nfake"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	res, err := ReadFileTool{}.Execute(context.Background(), "", map[string]any{"path": path})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(res.Blocks) == 0 {
+		t.Fatalf("expected an image block when a vision helper is configured, got text: %q", res.Text)
+	}
+	if res.Blocks[0].Type != "image" {
+		t.Errorf("block type = %q, want image", res.Blocks[0].Type)
+	}
+	if strings.Contains(res.Text, "does not accept image input") {
+		t.Errorf("should not refuse when a helper is configured, got: %q", res.Text)
+	}
+}

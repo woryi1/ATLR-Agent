@@ -1,0 +1,882 @@
+package agent
+
+import (
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestHistoryRewriteDirty checks that every non-append mutation marks the
+// history as rewritten and that plain appends do not — Session.SyncFrom
+// relies on this to know when the persisted file's prefix went stale.
+func TestHistoryRewriteDirty(t *testing.T) {
+	mutations := []struct {
+		name string
+		do   func(h *History)
+	}{
+		{"ReplaceAll", func(h *History) { h.ReplaceAll([]Message{NewUserMessage("x")}) }},
+		{"Reset", func(h *History) { h.Reset() }},
+		{"TruncateTo", func(h *History) { h.TruncateTo(1) }},
+		{"replaceLast", func(h *History) { h.replaceLast(NewUserMessage("y")) }},
+		{"popLast", func(h *History) { h.popLast() }},
+	}
+	for _, m := range mutations {
+		t.Run(m.name, func(t *testing.T) {
+			h := NewHistory()
+			h.Append(NewUserMessage("a"))
+			h.Append(NewAssistantMessage("b"))
+			if h.RewriteDirty() {
+				t.Fatal("Append alone must not mark history rewritten")
+			}
+			m.do(h)
+			if !h.RewriteDirty() {
+				t.Fatalf("%s did not mark history rewritten", m.name)
+			}
+			if !h.takeRewriteDirty() {
+				t.Fatal("takeRewriteDirty returned false on a dirty history")
+			}
+			if h.RewriteDirty() || h.takeRewriteDirty() {
+				t.Fatal("takeRewriteDirty did not clear the flag")
+			}
+		})
+	}
+}
+
+// TestSessionSave_RewriteAfterHistoryRewrite is the corruption guard for
+// incremental mid-turn saves: a history rewrite (compaction) that leaves the
+// message count at or above the persisted count used to slip past Save's
+// length check, appending on top of a stale prefix. SyncFrom must carry the
+// rewrite over so Save rewrites the file.
+func TestSessionSave_RewriteAfterHistoryRewrite(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := NewSession("m", "")
+	h := NewHistory()
+	for _, m := range []Message{
+		NewUserMessage("one"), NewAssistantMessage("two"), NewUserMessage("three"),
+	} {
+		h.Append(m)
+	}
+	sess.SyncFrom(h)
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Rewrite history to the SAME length with a different prefix — the case
+	// the pure length check cannot see.
+	h.ReplaceAll([]Message{
+		NewUserMessage("[summary]"), NewUserMessage("three"), NewAssistantMessage("four"),
+	})
+	sess.SyncFrom(h)
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save after rewrite: %v", err)
+	}
+
+	got, err := LoadSession(sess.ID)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(got.Messages) != 3 || got.Messages[0].Content != "[summary]" || got.Messages[2].Content != "four" {
+		t.Fatalf("persisted messages do not match rewritten history: %+v", got.Messages)
+	}
+}
+
+// TestSessionSave_NoopWhenUnchanged checks the fast path the server's
+// per-event persister depends on: a Save with no new messages must leave the
+// file byte-for-byte untouched.
+func TestSessionSave_NoopWhenUnchanged(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := NewSession("m", "")
+	sess.Messages = []Message{NewUserMessage("hello")}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	path, _ := sess.SavePath()
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	if err := sess.Save(); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Fatal("no-op Save modified the file")
+	}
+}
+
+// TestLoadSession_DropsPartialTail simulates a crash mid-append: the file
+// ends in an incomplete JSON line. Loading must succeed with the complete
+// records, and the next Save must rewrite the file so the dangling bytes
+// can't fuse with a future append into one corrupt line.
+func TestLoadSession_DropsPartialTail(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := NewSession("m", "")
+	sess.Messages = []Message{NewUserMessage("hello"), NewAssistantMessage("world")}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	path, _ := sess.SavePath()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := f.WriteString(`{"type":"message","message":{"content":"PARTIAL-TAIL`); err != nil {
+		t.Fatalf("write tail: %v", err)
+	}
+	f.Close()
+
+	got, err := LoadSession(sess.ID)
+	if err != nil {
+		t.Fatalf("load with partial tail: %v", err)
+	}
+	if len(got.Messages) != 2 {
+		t.Fatalf("messages = %d, want 2 (partial tail dropped)", len(got.Messages))
+	}
+
+	// Resume the session: append a message and save. The partial tail must
+	// not survive into the rewritten file.
+	got.Messages = append(got.Messages, NewUserMessage("again"))
+	if err := got.Save(); err != nil {
+		t.Fatalf("save after tail drop: %v", err)
+	}
+	raw, _ := os.ReadFile(path)
+	if strings.Contains(string(raw), "PARTIAL-TAIL") {
+		t.Fatal("partial tail bytes survived the post-recovery save")
+	}
+	re, err := LoadSession(sess.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(re.Messages) != 3 || re.Messages[2].Content != "again" {
+		t.Fatalf("reloaded messages = %+v, want 3 ending in \"again\"", re.Messages)
+	}
+}
+
+// TestSessionBoundRoundTrip checks that BoundEntry and BoundAt survive a save/load cycle.
+func TestSessionBoundRoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := NewSession("m", "")
+	sess.Bind(EntryTUI, false)
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	loaded, err := LoadSession(sess.ID)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !loaded.BoundTo(EntryTUI) {
+		t.Fatalf("bound entry = %q, want %q", loaded.BoundEntry, EntryTUI)
+	}
+	if loaded.BoundAt.IsZero() {
+		t.Fatal("BoundAt not persisted")
+	}
+}
+
+// TestContentUpdatedAt_AdvancesOnRealContent checks that Save stamps
+// ContentUpdatedAt when new messages are actually persisted — the case the
+// sidebar's unread dot cares about.
+func TestContentUpdatedAt_AdvancesOnRealContent(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := NewSession("m", "")
+	if !sess.ContentUpdatedAt.IsZero() {
+		t.Fatal("ContentUpdatedAt should start zero")
+	}
+	sess.Messages = []Message{NewUserMessage("hello")}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	first := sess.ContentUpdatedAt
+	if first.IsZero() {
+		t.Fatal("ContentUpdatedAt not stamped by a real content save")
+	}
+
+	sess.Messages = append(sess.Messages, NewAssistantMessage("hi"))
+	if err := sess.Save(); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	if !sess.ContentUpdatedAt.After(first) {
+		t.Fatalf("ContentUpdatedAt did not advance on a second content save: %v -> %v", first, sess.ContentUpdatedAt)
+	}
+}
+
+// TestContentUpdatedAt_AdvancesOnACoarseClock covers what made the test above
+// flaky on Windows: two saves in one turn can read the same instant there,
+// because the platform clock's resolution is tens of milliseconds rather than
+// nanoseconds. Waiting it out would only trade a flake for a slow test, so the
+// stamp is monotonic instead — and this exercises that directly, by putting
+// ContentUpdatedAt where no clock reading can beat it.
+func TestContentUpdatedAt_AdvancesOnACoarseClock(t *testing.T) {
+	// A stamp no clock reading can beat stands in for the coarse-clock case.
+	// Asking for the same instant twice would be the faithful reproduction, but
+	// it is not reproducible here: this platform's clock is fine-grained enough
+	// that the second reading always differs, which is exactly why the failure
+	// only ever showed up on Windows. What both situations have in common is
+	// that time.Now() comes back no later than the stamp already held, and that
+	// is what this pins.
+	sess := NewSession("m", "")
+	ahead := time.Now().Add(time.Hour)
+	sess.ContentUpdatedAt = ahead
+
+	sess.stampContentUpdated()
+	if !sess.ContentUpdatedAt.After(ahead) {
+		t.Fatalf("stamp must advance even when now is not past it: %v -> %v", ahead, sess.ContentUpdatedAt)
+	}
+
+	// Twice over: each save must land after the one before it.
+	second := sess.ContentUpdatedAt
+	sess.stampContentUpdated()
+	if !sess.ContentUpdatedAt.After(second) {
+		t.Fatalf("consecutive stamps must keep advancing: %v -> %v", second, sess.ContentUpdatedAt)
+	}
+
+	// And the same for a stamp that came back from disk. Those carry no
+	// monotonic reading (JSON has only the wall clock), which is the comparison
+	// the stamp is stripped down to — this is the shape production hits after
+	// every reload.
+	loaded := time.Now().Add(time.Hour).Round(0)
+	sess.ContentUpdatedAt = loaded
+	sess.stampContentUpdated()
+	if !sess.ContentUpdatedAt.After(loaded) {
+		t.Fatalf("stamp must advance past a wall-clock-only value loaded from disk: %v -> %v", loaded, sess.ContentUpdatedAt)
+	}
+}
+
+// TestContentUpdatedAt_SurvivesAppendDeltaReload is the actual regression
+// case: an existing, already-saved session's second message goes through
+// appendDelta, not rewriteAll — appendDelta never rewrites the meta line, so
+// ContentUpdatedAt needs its own append-only record or a reload right after
+// (the binding acquire/release around every turn does exactly that) sees the
+// stale value the first rewriteAll wrote, not the appendDelta save that just
+// happened.
+func TestContentUpdatedAt_SurvivesAppendDeltaReload(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := NewSession("m", "")
+	sess.Messages = []Message{NewUserMessage("hello")}
+	if err := sess.Save(); err != nil { // first save: persisted==0, goes through rewriteAll
+		t.Fatalf("save: %v", err)
+	}
+
+	sess.Messages = append(sess.Messages, NewAssistantMessage("hi"))
+	if err := sess.Save(); err != nil { // second save: goes through appendDelta
+		t.Fatalf("second save: %v", err)
+	}
+	want := sess.ContentUpdatedAt
+	if want.IsZero() {
+		t.Fatal("ContentUpdatedAt not stamped by the appendDelta save")
+	}
+
+	reloaded, err := LoadSession(sess.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !reloaded.ContentUpdatedAt.Equal(want) {
+		t.Fatalf("ContentUpdatedAt after reload = %v, want %v (appendDelta's write was lost)", reloaded.ContentUpdatedAt, want)
+	}
+}
+
+// TestContentUpdatedAt_UnaffectedByBindingChurn is the regression test for the
+// phantom-unread-dot bug: releasing and reacquiring the session's entry
+// binding (the post-turn cleanup that runs after every message, whether or
+// not anything is queued behind it) rewrites the file — but must not move
+// ContentUpdatedAt, or the sidebar's unread watermark chases a timestamp that
+// has nothing to do with new content.
+func TestContentUpdatedAt_UnaffectedByBindingChurn(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := NewSession("m", "")
+	sess.Messages = []Message{NewUserMessage("hello")}
+	if err := sess.Save(); err != nil { // first save: rewriteAll
+		t.Fatalf("save: %v", err)
+	}
+	// A second message so the binding-churn saves below are reloading a
+	// session whose latest content write went through appendDelta — the
+	// real-world shape (an existing session's Nth turn), not just the
+	// meta-line-carries-everything first save.
+	sess.Messages = append(sess.Messages, NewAssistantMessage("hi"))
+	if err := sess.Save(); err != nil { // second save: appendDelta
+		t.Fatalf("second save: %v", err)
+	}
+	want := sess.ContentUpdatedAt
+	if want.IsZero() {
+		t.Fatal("ContentUpdatedAt not stamped by the initial content save")
+	}
+
+	// Mirrors acquireSessionBinding/releaseSessionBinding: reload from disk
+	// (persisted == len(Messages), no message change), Bind or Unbind (forces
+	// a rewrite via forceRewrite), Save.
+	for i := 0; i < 3; i++ {
+		reloaded, err := LoadSession(sess.ID)
+		if err != nil {
+			t.Fatalf("reload %d: %v", i, err)
+		}
+		if i%2 == 0 {
+			reloaded.Bind(EntryWeb, false)
+		} else {
+			reloaded.Unbind(EntryWeb)
+		}
+		if err := reloaded.Save(); err != nil {
+			t.Fatalf("binding save %d: %v", i, err)
+		}
+		if !reloaded.ContentUpdatedAt.Equal(want) {
+			t.Fatalf("binding-only save %d moved ContentUpdatedAt: got %v, want %v", i, reloaded.ContentUpdatedAt, want)
+		}
+	}
+
+	final, err := LoadSession(sess.ID)
+	if err != nil {
+		t.Fatalf("final reload: %v", err)
+	}
+	if !final.ContentUpdatedAt.Equal(want) {
+		t.Fatalf("ContentUpdatedAt on disk after binding churn = %v, want %v", final.ContentUpdatedAt, want)
+	}
+}
+
+// TestContentUpdatedAt_AdvancesOnSameLengthCompaction covers the one case a
+// plain message-count check can't see: SyncFrom folding history into a
+// same-length summary (compaction) still counts as new content.
+func TestContentUpdatedAt_AdvancesOnSameLengthCompaction(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := NewSession("m", "")
+	h := NewHistory()
+	for _, m := range []Message{NewUserMessage("one"), NewAssistantMessage("two"), NewUserMessage("three")} {
+		h.Append(m)
+	}
+	sess.SyncFrom(h)
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	first := sess.ContentUpdatedAt
+	if first.IsZero() {
+		t.Fatal("ContentUpdatedAt not stamped by the initial content save")
+	}
+
+	h.ReplaceAll([]Message{NewUserMessage("[summary]"), NewUserMessage("three"), NewAssistantMessage("four")})
+	sess.SyncFrom(h)
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save after rewrite: %v", err)
+	}
+	if !sess.ContentUpdatedAt.After(first) {
+		t.Fatalf("ContentUpdatedAt did not advance on a same-length compaction: %v -> %v", first, sess.ContentUpdatedAt)
+	}
+}
+
+// TestSetTitle_RewritesAfterPartialTail: SetTitle appends a raw title record;
+// after a crash left a partial tail it must rewrite instead, or the title
+// record fuses with the dangling bytes into one corrupt line.
+func TestSetTitle_RewritesAfterPartialTail(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	sess := NewSession("m", "")
+	sess.Messages = []Message{NewUserMessage("hello")}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	path, _ := sess.SavePath()
+	f, _ := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	f.WriteString(`{"type":"mess`)
+	f.Close()
+
+	got, err := LoadSession(sess.ID)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if err := got.SetTitle("My Title"); err != nil {
+		t.Fatalf("set title: %v", err)
+	}
+	re, err := LoadSession(sess.ID)
+	if err != nil {
+		t.Fatalf("reload after SetTitle: %v", err)
+	}
+	if re.Title != "My Title" || len(re.Messages) != 1 {
+		t.Fatalf("reloaded title=%q messages=%d, want \"My Title\"/1", re.Title, len(re.Messages))
+	}
+}
+
+// TestSetLastContextTokens_AppendsAndRoundTrips covers the path a real turn
+// takes: an already-persisted session gets its context-token count via an
+// APPENDED "context_tokens" record (O(1), not a full rewrite), the no-op guards
+// hold, and the value round-trips through a reload.
+func TestSetLastContextTokens_AppendsAndRoundTrips(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("hi"), NewAssistantMessage("hello")}
+	if err := s.Save(); err != nil { // persisted > 0, transcript on disk
+		t.Fatalf("Save: %v", err)
+	}
+
+	if err := s.SetLastContextTokens(4321); err != nil {
+		t.Fatalf("SetLastContextTokens: %v", err)
+	}
+
+	path, err := s.SavePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Must APPEND a context_tokens record, not rewrite the whole file.
+	if !strings.Contains(string(data), `"type":"context_tokens"`) {
+		t.Fatalf("expected an appended context_tokens record; file was:\n%s", data)
+	}
+
+	// No-op guards: an unchanged value and a non-positive value append nothing.
+	before := len(data)
+	if err := s.SetLastContextTokens(4321); err != nil { // unchanged
+		t.Fatal(err)
+	}
+	if err := s.SetLastContextTokens(0); err != nil { // non-positive
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != before {
+		t.Errorf("no-op SetLastContextTokens must not append: file grew %d -> %d bytes", before, len(after))
+	}
+
+	// Round-trips through a reload.
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if got.LastContextTokens != 4321 {
+		t.Errorf("reloaded LastContextTokens = %d, want 4321", got.LastContextTokens)
+	}
+}
+
+// TestSetComposedSystem_FreezesAppendsAndRoundTrips: the first call freezes
+// and appends a composed_system record; a later call for the SAME model
+// (already frozen) is a no-op that appends nothing; both an initial in-memory
+// freeze and a fresh LoadSession afterward (simulating a server restart) see
+// the frozen value — the actual cache-stability guarantee this mechanism
+// exists to provide.
+func TestSetComposedSystem_FreezesAppendsAndRoundTrips(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("hi"), NewAssistantMessage("hello")}
+	if err := s.Save(); err != nil { // persisted > 0, transcript on disk
+		t.Fatalf("Save: %v", err)
+	}
+
+	if err := s.SetComposedSystem("full prompt", "lean prompt", "model-a", "", ""); err != nil {
+		t.Fatalf("SetComposedSystem: %v", err)
+	}
+	if s.ComposedSystem != "full prompt" || s.ComposedLeanSystem != "lean prompt" || s.ComposedForModel != "model-a" {
+		t.Fatalf("SetComposedSystem did not set fields: got %q / %q / %q", s.ComposedSystem, s.ComposedLeanSystem, s.ComposedForModel)
+	}
+
+	path, err := s.SavePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"type":"composed_system"`) {
+		t.Fatalf("expected an appended composed_system record; file was:\n%s", data)
+	}
+
+	// Already-frozen no-op: a second call for the SAME model must not
+	// overwrite or append.
+	before := len(data)
+	if err := s.SetComposedSystem("different prompt", "different lean", "model-a", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if s.ComposedSystem != "full prompt" {
+		t.Errorf("already-frozen SetComposedSystem overwrote the value: got %q", s.ComposedSystem)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != before {
+		t.Errorf("no-op SetComposedSystem must not append: file grew %d -> %d bytes", before, len(after))
+	}
+
+	// Round-trips through a reload — simulates a server restart reloading the
+	// session from disk rather than reusing the in-memory Session.
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if got.ComposedSystem != "full prompt" || got.ComposedLeanSystem != "lean prompt" || got.ComposedForModel != "model-a" {
+		t.Errorf("reloaded composed system = %q / %q / %q, want %q / %q / %q", got.ComposedSystem, got.ComposedLeanSystem, got.ComposedForModel, "full prompt", "lean prompt", "model-a")
+	}
+}
+
+// TestSetComposedSystem_ModelSwitchForcesRefreeze: a call for a DIFFERENT
+// model than the one the session is frozen for must overwrite the freeze
+// (not no-op) and persist the new model — the fix for a mid-session model
+// switch (e.g. IM's /model) silently stranding the frozen prompt's MCP-tools
+// manifest out of sync with the per-turn tools array, which is always
+// computed fresh for the current model regardless of the freeze.
+func TestSetComposedSystem_ModelSwitchForcesRefreeze(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("hi"), NewAssistantMessage("hello")}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := s.SetComposedSystem("prompt for model-a", "lean for model-a", "model-a", "", ""); err != nil {
+		t.Fatalf("SetComposedSystem: %v", err)
+	}
+	if !s.IsComposedFor("model-a", "", "") {
+		t.Fatal("expected IsComposedFor(\"model-a\") after freezing for model-a")
+	}
+	if s.IsComposedFor("model-b", "", "") {
+		t.Fatal("IsComposedFor(\"model-b\") must be false when frozen for model-a")
+	}
+
+	if err := s.SetComposedSystem("prompt for model-b", "lean for model-b", "model-b", "", ""); err != nil {
+		t.Fatalf("SetComposedSystem for model-b: %v", err)
+	}
+	if s.ComposedSystem != "prompt for model-b" || s.ComposedForModel != "model-b" {
+		t.Fatalf("model switch did not re-freeze: got %q / %q", s.ComposedSystem, s.ComposedForModel)
+	}
+
+	// Round-trips: the second composed_system record (for model-b) replays
+	// correctly rather than the first (for model-a) winning.
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if got.ComposedSystem != "prompt for model-b" || got.ComposedLeanSystem != "lean for model-b" || got.ComposedForModel != "model-b" {
+		t.Errorf("reloaded composed system = %q / %q / %q, want %q / %q / %q", got.ComposedSystem, got.ComposedLeanSystem, got.ComposedForModel, "prompt for model-b", "lean for model-b", "model-b")
+	}
+}
+
+// TestSetComposedSystem_PersistedZeroRewritesWhenFileExists: a session with no
+// prior Save (persisted == 0) that already has a transcript file on disk (the
+// load-modify-discard case SetWorkingDir's sibling comment describes) must
+// rewrite the file with the frozen value rather than silently dropping it.
+func TestSetComposedSystem_PersistedZeroRewritesWhenFileExists(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("hi")}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// A second Session value pointed at the same on-disk file via a shared ID,
+	// but never itself Save()d — persisted is its zero value, 0, even though
+	// a transcript already exists at its path. Mirrors a handler that
+	// constructs/loads a Session without going through the normal Save path
+	// (LoadSession itself sets persisted = len(Messages), so it can't produce
+	// this state — see SetWorkingDir's sibling comment for the scenario).
+	shadow := NewSession(s.Model, s.System)
+	shadow.ID = s.ID
+
+	if err := shadow.SetComposedSystem("rewritten prompt", "rewritten lean", "m", "", ""); err != nil {
+		t.Fatalf("SetComposedSystem: %v", err)
+	}
+
+	again, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession after SetComposedSystem: %v", err)
+	}
+	if again.ComposedSystem != "rewritten prompt" || again.ComposedLeanSystem != "rewritten lean" {
+		t.Errorf("reloaded composed system = %q / %q, want %q / %q", again.ComposedSystem, again.ComposedLeanSystem, "rewritten prompt", "rewritten lean")
+	}
+}
+
+// TestClearComposedSystem_UnfreezesAndRoundTrips: ClearComposedSystem
+// un-freezes an already-frozen session (unlike SetComposedSystem, it is NOT a
+// no-op when there's something to clear) and appends its own composed_system
+// record; the cleared state round-trips through a reload, and the session can
+// be frozen again afterward — each step verified against a fresh LoadSession,
+// not just the in-memory value.
+func TestClearComposedSystem_UnfreezesAndRoundTrips(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("hi"), NewAssistantMessage("hello")}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := s.SetComposedSystem("full prompt", "lean prompt", "model-a", "", ""); err != nil {
+		t.Fatalf("SetComposedSystem: %v", err)
+	}
+
+	if err := s.ClearComposedSystem(); err != nil {
+		t.Fatalf("ClearComposedSystem: %v", err)
+	}
+	if s.ComposedSystem != "" || s.ComposedLeanSystem != "" || s.ComposedForModel != "" {
+		t.Errorf("ClearComposedSystem left fields set: %q / %q / %q", s.ComposedSystem, s.ComposedLeanSystem, s.ComposedForModel)
+	}
+	reloaded, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession after clear: %v", err)
+	}
+	if reloaded.ComposedSystem != "" || reloaded.ComposedLeanSystem != "" {
+		t.Errorf("reloaded after clear = %q / %q, want empty", reloaded.ComposedSystem, reloaded.ComposedLeanSystem)
+	}
+
+	// And it can be frozen again after clearing — round-trips too, confirming
+	// the third composed_system record (freeze, clear, re-freeze) replays
+	// correctly rather than getting lost among the earlier ones.
+	if err := reloaded.SetComposedSystem("second prompt", "second lean", "model-a", "", ""); err != nil {
+		t.Fatalf("SetComposedSystem after clear: %v", err)
+	}
+	if reloaded.ComposedSystem != "second prompt" {
+		t.Errorf("SetComposedSystem after clear = %q, want %q", reloaded.ComposedSystem, "second prompt")
+	}
+	refrozen, err := LoadSession(reloaded.ID)
+	if err != nil {
+		t.Fatalf("LoadSession after re-freeze: %v", err)
+	}
+	if refrozen.ComposedSystem != "second prompt" || refrozen.ComposedLeanSystem != "second lean" {
+		t.Errorf("reloaded after re-freeze = %q / %q, want %q / %q", refrozen.ComposedSystem, refrozen.ComposedLeanSystem, "second prompt", "second lean")
+	}
+}
+
+// TestSetComposedSystem_CwdChangeForcesRefreeze: the working directory is
+// baked into the prompt's env context, so retargeting a session's directory
+// (per-session, or by moving it into a project with a different one) must
+// re-freeze. Without this the tools move to the new directory while the model
+// keeps reading the old path out of its system prompt.
+func TestSetComposedSystem_CwdChangeForcesRefreeze(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("hi"), NewAssistantMessage("hello")}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := s.SetComposedSystem("prompt in /a", "lean in /a", "m", "/a", ""); err != nil {
+		t.Fatalf("SetComposedSystem: %v", err)
+	}
+	if !s.IsComposedFor("m", "/a", "") {
+		t.Fatal("expected the freeze to hold for its own cwd")
+	}
+	if s.IsComposedFor("m", "/b", "") {
+		t.Fatal("a freeze composed against /a must not be reused for /b")
+	}
+
+	if err := s.SetComposedSystem("prompt in /b", "lean in /b", "m", "/b", ""); err != nil {
+		t.Fatalf("SetComposedSystem after cwd change: %v", err)
+	}
+	if s.ComposedSystem != "prompt in /b" || s.ComposedForCWD != "/b" {
+		t.Fatalf("cwd change did not re-freeze: got %q / %q", s.ComposedSystem, s.ComposedForCWD)
+	}
+
+	reloaded, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if reloaded.ComposedForCWD != "/b" || reloaded.ComposedSystem != "prompt in /b" {
+		t.Fatalf("cwd freeze did not round-trip: got %q / %q", reloaded.ComposedForCWD, reloaded.ComposedSystem)
+	}
+	if !reloaded.IsComposedFor("m", "/b", "") {
+		t.Fatal("reloaded session should still be frozen for /b")
+	}
+}
+
+// TestClearComposedSystem_ClearsFreezeIdentity: /reload must drop the cwd stamp
+// too, or the next turn could match a stale identity.
+func TestClearComposedSystem_ClearsFreezeIdentity(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("hi"), NewAssistantMessage("hello")}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := s.SetComposedSystem("prompt", "lean", "m", "/a", ""); err != nil {
+		t.Fatalf("SetComposedSystem: %v", err)
+	}
+	if err := s.ClearComposedSystem(); err != nil {
+		t.Fatalf("ClearComposedSystem: %v", err)
+	}
+	if s.ComposedForCWD != "" {
+		t.Fatalf("clear left freeze identity behind: cwd=%q", s.ComposedForCWD)
+	}
+	if s.IsComposedFor("m", "/a", "") {
+		t.Fatal("a cleared session must not report as frozen")
+	}
+}
+
+// PersistContextUsage records the agent's current context-token count on the
+// session and round-trips it, and is a safe no-op with a nil session or no
+// count. Every transport (web, IM, CLI, scheduled) calls it at turn end so a
+// session opened in the Web UI shows accurate usage regardless of where it ran.
+func TestPersistContextUsage(t *testing.T) {
+	setTempHome(t)
+
+	a := New(&summarizeFake{}, "m")
+	// The helper's purpose is persisting the real provider-reported count; set it
+	// directly (in-package) so the assertion pins the exact value, not an estimate.
+	a.usageMu.Lock()
+	a.lastInputTokens = 12345
+	a.usageMu.Unlock()
+
+	sess := NewSession("m", "")
+	sess.Messages = []Message{NewUserMessage("hi")}
+	if err := sess.Save(); err != nil { // persisted, on disk
+		t.Fatalf("Save: %v", err)
+	}
+
+	if err := a.PersistContextUsage(sess); err != nil {
+		t.Fatalf("PersistContextUsage: %v", err)
+	}
+	if sess.LastContextTokens != 12345 {
+		t.Fatalf("LastContextTokens = %d, want 12345 (the real provider count)", sess.LastContextTokens)
+	}
+	reloaded, err := LoadSession(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.LastContextTokens != 12345 {
+		t.Errorf("reloaded LastContextTokens = %d, want 12345", reloaded.LastContextTokens)
+	}
+
+	// A nil session and an agent with no countable context are safe no-ops.
+	if err := a.PersistContextUsage(nil); err != nil {
+		t.Errorf("nil session should be a no-op, got %v", err)
+	}
+	empty := New(&summarizeFake{}, "m")
+	s2 := NewSession("m", "")
+	if err := empty.PersistContextUsage(s2); err != nil {
+		t.Errorf("no-count should be a no-op, got %v", err)
+	}
+	if s2.LastContextTokens != 0 {
+		t.Errorf("no-count must not set a token count, got %d", s2.LastContextTokens)
+	}
+}
+
+// TestBranchFrom verifies that BranchFrom copies meta fields and the first
+// count messages, sets BranchedFrom, and survives a Save/Load roundtrip.
+func TestBranchFrom(t *testing.T) {
+	setTempHome(t)
+
+	src := NewSession("claude-sonnet-4-20250514", "you are a helpful assistant")
+	src.WorkingDir = "/tmp"
+	src.PermissionMode = "auto"
+	src.ModelConfig = "claude-sonnet-4-20250514"
+	src.Messages = []Message{
+		NewUserMessage("hello"),
+		NewAssistantMessage("hi there"),
+		NewUserMessage("branch from here"),
+		NewAssistantMessage("this should not appear in branch"),
+	}
+	if err := src.Save(); err != nil {
+		t.Fatalf("src Save: %v", err)
+	}
+
+	branch := BranchFrom(src, 3) // copy first 3 messages (index 0..2, i.e. up to and including "branch from here")
+	if branch.BranchedFrom != src.ID {
+		t.Errorf("BranchedFrom = %q, want %q", branch.BranchedFrom, src.ID)
+	}
+	if branch.Model != src.Model {
+		t.Errorf("Model = %q, want %q", branch.Model, src.Model)
+	}
+	if branch.System != src.System {
+		t.Errorf("System mismatch")
+	}
+	if branch.WorkingDir != src.WorkingDir {
+		t.Errorf("WorkingDir = %q, want %q", branch.WorkingDir, src.WorkingDir)
+	}
+	if branch.PermissionMode != src.PermissionMode {
+		t.Errorf("PermissionMode = %q, want %q", branch.PermissionMode, src.PermissionMode)
+	}
+	if len(branch.Messages) != 3 {
+		t.Fatalf("Messages len = %d, want 3", len(branch.Messages))
+	}
+	if branch.Messages[2].Content != "branch from here" {
+		t.Errorf("last message = %q, want %q", branch.Messages[2].Content, "branch from here")
+	}
+
+	if err := branch.Save(); err != nil {
+		t.Fatalf("branch Save: %v", err)
+	}
+	reloaded, err := LoadSession(branch.ID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if reloaded.BranchedFrom != src.ID {
+		t.Errorf("reloaded BranchedFrom = %q, want %q", reloaded.BranchedFrom, src.ID)
+	}
+	if len(reloaded.Messages) != 3 {
+		t.Errorf("reloaded Messages len = %d, want 3", len(reloaded.Messages))
+	}
+}
+
+// TestBranchFrom_Clamp verifies that out-of-range indices are clamped.
+func TestBranchFrom_Clamp(t *testing.T) {
+	src := NewSession("m", "")
+	src.Messages = []Message{NewUserMessage("a"), NewAssistantMessage("b")}
+
+	// negative index → 0 messages
+	branch := BranchFrom(src, -1)
+	if len(branch.Messages) != 0 {
+		t.Errorf("negative idx: Messages len = %d, want 0", len(branch.Messages))
+	}
+
+	// index beyond length → all messages
+	branch = BranchFrom(src, 99)
+	if len(branch.Messages) != 2 {
+		t.Errorf("overflow idx: Messages len = %d, want 2", len(branch.Messages))
+	}
+}
+
+// TestSessionTruncateTo verifies that TruncateTo drops messages past n and
+// forces a full-file rewrite on the next Save.
+func TestSessionTruncateTo(t *testing.T) {
+	setTempHome(t)
+
+	s := NewSession("m", "")
+	s.Messages = []Message{
+		NewUserMessage("a"), NewAssistantMessage("b"),
+		NewUserMessage("c"), NewAssistantMessage("d"),
+	}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	s.TruncateTo(2)
+	if len(s.Messages) != 2 {
+		t.Fatalf("Messages len = %d, want 2", len(s.Messages))
+	}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save after truncate: %v", err)
+	}
+
+	reloaded, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if len(reloaded.Messages) != 2 {
+		t.Fatalf("reloaded Messages len = %d, want 2", len(reloaded.Messages))
+	}
+	if reloaded.Messages[0].Content != "a" || reloaded.Messages[1].Content != "b" {
+		t.Fatalf("unexpected content after truncate: %+v", reloaded.Messages)
+	}
+}

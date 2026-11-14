@@ -1,0 +1,142 @@
+name: macOS installer check
+
+# Build packaging/macos/octo-setup.pkg whenever a PR touches it, and exercise
+# it for real, so a broken installer surfaces here instead of at release
+# time — release.yml only builds+publishes this on a tag push.
+#
+# The real double-click flow resolves the currentUserHome domain against the
+# logged-in GUI user's session; a headless CI runner has no such session, so
+# `installer -target CurrentUserHomeDirectory` has nothing to resolve against
+# and (when forced via sudo) falls back to root's own home instead of the
+# runner account's — not representative, and not worth fighting. Instead this
+# validates the two halves separately: the package's domain declaration via
+# -dominfo (no sudo needed, no session needed), and the actual pre/postinstall
+# script logic by running the scripts extracted from the built package
+# directly against a scratch $HOME — exactly what they do at install time,
+# minus Installer.app's domain-resolution machinery.
+on:
+  pull_request:
+    paths:
+      - 'packaging/macos/**'
+      - 'cmd/octo-desktop/**'
+      - 'scripts/package-desktop-macos.sh'
+      - '.github/workflows/macos-installer-check.yml'
+  workflow_dispatch:
+
+# Least-privilege default: this job only checks out, builds, and installs
+# into a scratch directory — no release assets are touched.
+permissions:
+  contents: read
+
+jobs:
+  build-and-install:
+    name: build and install
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: cmd/octo-desktop/go.sum
+
+      - name: Build the CLI to embed in the app
+        run: |
+          mkdir -p staging
+          # The CLI the installer puts on PATH (embedded inside Octo.app by
+          # build.sh → package-desktop-macos.sh). The desktop GUI binary itself
+          # is built from source inside that script (CGO / WKWebView).
+          go build -o staging/octo ./cmd/octo # plain build; embedded rg is irrelevant to packaging
+          cp LICENSE.txt staging/LICENSE.txt
+
+      - name: Build installer
+        env:
+          AppVersion: 0.0.0-ci
+          SourceDir: ${{ github.workspace }}/staging
+          OutDir: ${{ github.workspace }}/staging
+        run: packaging/macos/build.sh
+
+      - name: Verify the package only offers the per-user domain
+        run: |
+          domains=$(installer -pkg staging/octo-setup.pkg -target CurrentUserHomeDirectory -dominfo)
+          echo "domains: $domains"
+          [ "$domains" = "CurrentUserHomeDirectory" ] || { echo "expected only CurrentUserHomeDirectory, got: $domains"; exit 1; }
+
+      - name: Extract scripts and payload from the built package
+        run: |
+          pkgutil --expand-full staging/octo-setup.pkg expanded
+          test -x expanded/octo-component.pkg/Scripts/preinstall
+          test -x expanded/octo-component.pkg/Scripts/postinstall
+          # Payload is the self-contained app bundle: the GUI binary + the
+          # embedded CLI the installer puts on PATH. The payload root is the
+          # directory that HOLDS Octo.app (install-location 'Applications'
+          # supplies the parent), so the bundle sits at Payload/Octo.app. If it
+          # were Payload/Applications/Octo.app it would install to
+          # ~/Applications/Applications/Octo.app — the double-nesting this guards.
+          test -d expanded/octo-component.pkg/Payload/Octo.app
+          test -x expanded/octo-component.pkg/Payload/Octo.app/Contents/MacOS/octo-desktop
+          test -x expanded/octo-component.pkg/Payload/Octo.app/Contents/Resources/octo
+
+      - name: Verify the package installs under the user's real home directory
+        run: |
+          install_loc=$(sed -n 's/.*install-location="\([^"]*\)".*/\1/p' expanded/octo-component.pkg/PackageInfo)
+          echo "install-location: $install_loc"
+          [ "$install_loc" = "Applications" ] || { echo "expected install-location 'Applications', got: $install_loc"; exit 1; }
+          case "$install_loc" in
+            *~*)
+              echo "install-location must not contain a literal '~': $install_loc"
+              exit 1
+              ;;
+          esac
+
+      - name: Run preinstall + postinstall against a scratch HOME
+        run: |
+          fake="$RUNNER_TEMP/fake-home"
+          mkdir -p "$fake"
+
+          HOME="$fake" expanded/octo-component.pkg/Scripts/preinstall
+
+          # Simulate Installer.app placing the payload's CONTENTS under the home
+          # domain's install-location ('Applications'), then run postinstall
+          # exactly as it would. Copying the payload contents — not a hand-picked
+          # Octo.app — mirrors the real mapping: a payload that nested
+          # Applications/Octo.app would land at ~/Applications/Applications/Octo.app
+          # and the postinstall's $HOME/Applications/Octo.app lookup would fail here.
+          mkdir -p "$fake/Applications"
+          cp -R expanded/octo-component.pkg/Payload/. "$fake/Applications/"
+
+          # postinstall ends by `open`-ing the app. In CI we must not actually
+          # launch the GUI: it would run the app's ensureBundledOcto and write
+          # the very PATH line we assert postinstall itself does NOT write. Stub
+          # `open` to a no-op so postinstall is exercised in isolation.
+          stub="$RUNNER_TEMP/stub-bin"
+          mkdir -p "$stub"
+          printf '#!/bin/sh\nexit 0\n' > "$stub/open"
+          chmod +x "$stub/open"
+
+          HOME="$fake" PATH="$stub:$PATH" expanded/octo-component.pkg/Scripts/postinstall
+
+          # The bundled CLI must be present and runnable inside the installed app.
+          bin="$fake/Applications/Octo.app/Contents/Resources/octo"
+          test -x "$bin" || { echo "octo CLI missing at $bin"; exit 1; }
+          HOME="$fake" "$bin" version
+          test -x "$fake/.octo/uninstall.sh" || { echo "uninstall.sh missing"; exit 1; }
+          # postinstall no longer touches PATH — the app seeds ~/.local/bin/octo
+          # and edits the shell rc on first launch (ensureBundledOcto), which is
+          # covered by the Go unit tests. A headless CI runner never launches the
+          # GUI, so there is nothing to assert about PATH here. Guard the split:
+          # postinstall must NOT write a PATH line itself.
+          for rc in .zshrc .zprofile .bash_profile .profile; do
+            if [ -f "$fake/$rc" ] && grep -qF 'added by the octo installer' "$fake/$rc"; then
+              echo "postinstall should not write PATH ($rc); the app does that on launch"; exit 1
+            fi
+          done
+          # The desktop app replaces the old serve-on-login flow: no LaunchAgent.
+          test ! -f "$fake/Library/LaunchAgents/dev.octo-agent.serve.plist" || { echo "unexpected leftover serve LaunchAgent"; exit 1; }
+
+      - name: Uninstall it
+        run: |
+          fake="$RUNNER_TEMP/fake-home"
+          HOME="$fake" "$fake/.octo/uninstall.sh"
+          test ! -d "$fake/Applications/Octo.app" || { echo "uninstall left the app behind"; exit 1; }

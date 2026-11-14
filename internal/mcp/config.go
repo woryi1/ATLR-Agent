@@ -1,0 +1,176 @@
+package mcp
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/open-octo/octo-agent/internal/datahome"
+)
+
+// Config is the parsed view of one mcp.json file. The wire format mirrors
+// Claude Code so users can copy-paste configs between the two:
+//
+//	{
+//	  "mcpServers": {
+//	    "filesystem": {
+//	      "command": "npx",
+//	      "args":    ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+//	      "env":     {"FOO": "bar"}
+//	    },
+//	    "remote-api": {
+//	      "url":     "https://example.com/mcp",
+//	      "headers": {"Authorization": "Bearer ..."}
+//	    }
+//	  }
+//	}
+//
+// A server entry is classified as stdio if Command is non-empty, HTTP if
+// URL is non-empty. Both set is an error.
+//
+// Windows note: npm-based stdio servers launch through a batch shim (npx.cmd,
+// not a bare npx). Go's exec resolves the .cmd via PATHEXT, but if a server
+// fails to start, wrap the launch in cmd /c — the reliable form on Windows:
+//
+//	"filesystem": {
+//	  "command": "cmd",
+//	  "args":    ["/c", "npx", "-y", "@modelcontextprotocol/server-filesystem", "C:\\path"]
+//	}
+type Config struct {
+	Servers map[string]ServerEntry `json:"mcpServers"`
+}
+
+// ServerEntry is the union of stdio + HTTP shapes. The transport-specific
+// fields are mutually exclusive — Validate enforces it.
+type ServerEntry struct {
+	// stdio fields
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+
+	// HTTP fields
+	URL     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+
+	// Auth strategy. HTTP-only field; ignored for stdio servers.
+	//
+	//	""        — no auth beyond what's in Headers (default)
+	//	"oauth"   — run Authorization Code + PKCE OAuth on first connect
+	//	            and on every 401 response; cached at
+	//	            ~/.octo/mcp-tokens/<server>.json
+	//
+	// Future values may add bearer or client_credentials; the strict
+	// string match in Validate keeps typos visible.
+	Auth string `json:"auth,omitempty"`
+
+	// Optional: disable a server without removing it from config.
+	Disabled bool `json:"disabled,omitempty"`
+
+	// Optional: allow absolute-path or non-whitelisted commands for this server.
+	// When false (default), the import API rejects absolute paths and commands
+	// outside the allowlist. When true, the user has explicitly opted in to
+	// run the command as-is — useful for self-installed tools (e.g. codegraph)
+	// whose absolute path is needed because they live outside the default PATH.
+	AllowArbitraryCommand bool `json:"allow_arbitrary_command,omitempty"`
+}
+
+// Kind reports which transport this entry uses. Returns "" when neither
+// (caller treats it as an invalid entry and skips it).
+func (e ServerEntry) Kind() string {
+	if e.Command != "" {
+		return "stdio"
+	}
+	if e.URL != "" {
+		return "http"
+	}
+	return ""
+}
+
+// Validate enforces the union invariant — exactly one of Command/URL set —
+// and surfaces a usable error message identifying the offender. Called by
+// Load before returning so callers get pre-validated entries.
+func (e ServerEntry) Validate(name string) error {
+	if e.Command == "" && e.URL == "" {
+		return fmt.Errorf("mcp server %q: must set either 'command' (stdio) or 'url' (http)", name)
+	}
+	if e.Command != "" && e.URL != "" {
+		return fmt.Errorf("mcp server %q: cannot set both 'command' and 'url'", name)
+	}
+	switch e.Auth {
+	case "", "oauth":
+	default:
+		return fmt.Errorf("mcp server %q: unknown auth %q (want \"oauth\" or omit)", name, e.Auth)
+	}
+	if e.Auth != "" && e.Command != "" {
+		return fmt.Errorf("mcp server %q: auth applies to http servers only", name)
+	}
+	if e.URL != "" && !isAllowedURLScheme(e.URL) {
+		return fmt.Errorf("mcp server %q: url must use http:// or https:// scheme", name)
+	}
+	return nil
+}
+
+// isAllowedURLScheme reports whether rawURL starts with an acceptable scheme.
+// MCP HTTP transports require a network endpoint; file:// and javascript: would
+// not make sense and could be used to bypass intended reachability controls.
+func isAllowedURLScheme(rawURL string) bool {
+	return strings.HasPrefix(rawURL, "http://") || strings.HasPrefix(rawURL, "https://")
+}
+
+// LoadConfig reads the user-global MCP server config at ~/.octo/mcp.json.
+//
+// Disabled entries are filtered out at load time. A missing file is not an
+// error — it produces a zero-server config.
+func LoadConfig() (*Config, error) {
+	merged := &Config{Servers: map[string]ServerEntry{}}
+
+	if userPath, err := datahome.Path("mcp.json"); err == nil {
+		if cfg, err := readConfigFile(userPath); err != nil {
+			return nil, err
+		} else if cfg != nil {
+			for name, e := range cfg.Servers {
+				merged.Servers[name] = e
+			}
+		}
+	}
+
+	// Filter disabled + validate the rest.
+	for name, e := range merged.Servers {
+		if e.Disabled {
+			delete(merged.Servers, name)
+			continue
+		}
+		if err := e.Validate(name); err != nil {
+			return nil, err
+		}
+	}
+	return merged, nil
+}
+
+// ServerNames returns the configured server names in stable sorted order,
+// useful for deterministic /mcp output.
+func (c *Config) ServerNames() []string {
+	names := make([]string, 0, len(c.Servers))
+	for n := range c.Servers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func readConfigFile(path string) (*Config, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("mcp: read %s: %w", path, err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return nil, fmt.Errorf("mcp: parse %s: %w", path, err)
+	}
+	return &cfg, nil
+}

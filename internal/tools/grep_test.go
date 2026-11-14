@@ -1,0 +1,305 @@
+package tools
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// requireRg skips the test if ripgrep isn't installed. We intentionally
+// don't reimplement rg in Go for tests — if a contributor has rg they get
+// real coverage; if not, the build still passes.
+func requireRg(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Skip("ripgrep (rg) not installed; skipping grep test")
+	}
+}
+
+func TestGrep_ContentMode(t *testing.T) {
+	requireRg(t)
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "a.go"), "package main\n\nfunc Hello() {}\n")
+	writeTestFile(t, filepath.Join(dir, "b.go"), "package main\n\nfunc World() {}\n")
+
+	out, err := GrepTool{}.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "func ",
+		"path":    dir,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.Text, "func Hello") || !strings.Contains(out.Text, "func World") {
+		t.Errorf("expected both functions in output:\n%s", out.Text)
+	}
+}
+
+func TestGrep_FilesWithMatches(t *testing.T) {
+	requireRg(t)
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "a.txt"), "needle\n")
+	writeTestFile(t, filepath.Join(dir, "b.txt"), "haystack\n")
+
+	out, err := GrepTool{}.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "needle",
+		"path":    dir,
+		"mode":    "files_with_matches",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.Text, "a.txt") {
+		t.Errorf("expected a.txt in output:\n%s", out.Text)
+	}
+	if strings.Contains(out.Text, "b.txt") {
+		t.Errorf("b.txt has no match — shouldn't appear:\n%s", out.Text)
+	}
+}
+
+func TestGrep_NoMatches(t *testing.T) {
+	requireRg(t)
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "a.txt"), "hello\n")
+
+	out, err := GrepTool{}.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "definitely-not-there-xyz",
+		"path":    dir,
+	})
+	if err != nil {
+		t.Fatalf("Execute should not error on zero matches: %v", err)
+	}
+	if !strings.Contains(out.Text, "no matches") {
+		t.Errorf("expected 'no matches' message: %q", out.Text)
+	}
+}
+
+func TestGrep_CaseInsensitive(t *testing.T) {
+	requireRg(t)
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "a.txt"), "HELLO world\n")
+
+	out, err := GrepTool{}.Execute(context.Background(), "grep", map[string]any{
+		"pattern":          "hello",
+		"path":             dir,
+		"case_insensitive": true,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.Text, "HELLO") {
+		t.Errorf("case-insensitive should match: %q", out.Text)
+	}
+}
+
+func TestGrep_IncludeGlob(t *testing.T) {
+	requireRg(t)
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "a.go"), "match here\n")
+	writeTestFile(t, filepath.Join(dir, "b.txt"), "match here\n")
+
+	out, err := GrepTool{}.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "match",
+		"path":    dir,
+		"include": "*.go",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.Text, "a.go") {
+		t.Errorf("a.go should match:\n%s", out.Text)
+	}
+	if strings.Contains(out.Text, "b.txt") {
+		t.Errorf("b.txt should be excluded by include glob:\n%s", out.Text)
+	}
+}
+
+func TestGrep_UnknownMode_Errors(t *testing.T) {
+	requireRg(t)
+	_, err := GrepTool{}.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "x",
+		"mode":    "bogus",
+	})
+	if err == nil || !strings.Contains(err.Error(), "unknown mode") {
+		t.Errorf("expected unknown-mode error, got %v", err)
+	}
+}
+
+func TestGrep_RequiresPattern(t *testing.T) {
+	requireRg(t)
+	_, err := GrepTool{}.Execute(context.Background(), "grep", map[string]any{})
+	if err == nil {
+		t.Fatal("missing pattern should error")
+	}
+}
+
+func TestGrep_CapsTotalLines(t *testing.T) {
+	requireRg(t)
+	// A pattern that hits far more than GrepMaxLines lines must be
+	// truncated with a marker naming the total — otherwise a broad search
+	// floods context and the model can't tell it saw only part of the set.
+	dir := t.TempDir()
+	var b strings.Builder
+	for i := 0; i < GrepMaxLines+50; i++ {
+		b.WriteString("needle\n")
+	}
+	writeTestFile(t, filepath.Join(dir, "many.txt"), b.String())
+
+	out, err := GrepTool{}.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "needle",
+		"path":    dir,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.Text, "truncated to first 200 of") {
+		t.Errorf("expected truncation marker with total, got:\n%s", out.Text[:min(len(out.Text), 300)])
+	}
+	// The kept body is exactly GrepMaxLines content lines; the marker adds
+	// a blank line + one line. Content lines must not exceed the cap.
+	body := strings.SplitN(out.Text, "\n\n[truncated", 2)[0]
+	if got := len(strings.Split(body, "\n")); got != GrepMaxLines {
+		t.Errorf("expected %d content lines before marker, got %d", GrepMaxLines, got)
+	}
+}
+
+func TestGrep_NoMarkerUnderCap(t *testing.T) {
+	requireRg(t)
+	// A result at or under the cap must not claim truncation.
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "few.txt"), "needle\nneedle\nneedle\n")
+
+	out, err := GrepTool{}.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "needle",
+		"path":    dir,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if strings.Contains(out.Text, "truncated") {
+		t.Errorf("under-cap result should not be marked truncated:\n%s", out.Text)
+	}
+}
+
+func TestGrep_TruncatesLongMatchingLines(t *testing.T) {
+	requireRg(t)
+	// Simulate a minified-bundle hit: one line of 1000 a's containing
+	// the pattern. With --max-columns 500 --max-columns-preview, rg shows
+	// the first 500 bytes and appends "[... omitted end of long line]".
+	// This prevents the LLM from seeing only an unhelpful omission marker
+	// and retrying the same search in a loop.
+	dir := t.TempDir()
+	longLine := strings.Repeat("a", 1000) + "NEEDLE" + strings.Repeat("b", 1000)
+	writeTestFile(t, filepath.Join(dir, "minified.js"), longLine+"\n")
+
+	out, err := GrepTool{}.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "NEEDLE",
+		"path":    dir,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	// The full long run of 'a' must NOT appear in output — only the preview.
+	if strings.Contains(out.Text, strings.Repeat("a", 600)) {
+		sample := out.Text
+		if len(sample) > 200 {
+			sample = sample[:200]
+		}
+		t.Errorf("long line leaked through; head of output:\n%s", sample)
+	}
+	// Should contain the preview truncation marker, not the old full omission.
+	if !strings.Contains(out.Text, "omitted end of long line") {
+		t.Errorf("expected preview truncation marker; output:\n%s", out.Text)
+	}
+	// The old unhelpful marker should no longer appear.
+	if strings.Contains(out.Text, "Omitted long matching line") {
+		t.Errorf("old full-omission marker should not appear; output:\n%s", out.Text)
+	}
+}
+
+func TestGrep_IncludesStderrOnError(t *testing.T) {
+	requireRg(t)
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "readable", "ok.go"), "needle\n")
+	writeTestFile(t, filepath.Join(dir, "unreadable", "secret.go"), "needle\n")
+
+	unreadable := filepath.Join(dir, "unreadable")
+	if err := os.Chmod(unreadable, 0o000); err != nil {
+		t.Fatalf("chmod unreadable: %v", err)
+	}
+	defer os.Chmod(unreadable, 0o755) // ensure cleanup can remove the tree
+
+	// Permission restrictions may not be enforced (e.g. root on Unix, some Windows
+	// configurations). If we can still list the directory, the test premise fails.
+	if f, err := os.Open(unreadable); err == nil {
+		f.Close()
+		t.Skip("chmod 000 did not prevent directory listing; skipping permission test")
+	}
+
+	_, err := GrepTool{}.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "needle",
+		"path":    dir,
+	})
+	if err == nil {
+		t.Fatal("expected error when rg cannot scan an unreadable directory")
+	}
+	if !strings.Contains(err.Error(), "Permission denied") && !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("error should include rg's stderr message, got: %v", err)
+	}
+}
+
+// TestGrep_NoPathUsesWorkingDir guards the regression where a grep with no
+// explicit `path` ran in the octo process CWD instead of the session's
+// stamped working directory — so on a long-lived serve/desktop hub it scanned
+// the daemon's launch dir (often $HOME) and hung. The sentinel pattern can
+// only match the file we planted under the stamped dir, never the process CWD
+// (the package source tree), so a match proves rg was rooted correctly.
+// TestGrep_NoFilesSearchedHint covers the "No files were searched" error
+// path. rg only emits that message when it is given NO explicit path — it
+// then searches the session working directory — and emptiness/filters leave
+// it zero files. That is exactly the failure mode when the model forgets
+// `path`. The wrapped error must tell the model how to recover instead of
+// forwarding rg's raw message, which models used to answer by giving up on
+// the grep tool and falling back to terminal+grep.
+func TestGrep_NoFilesSearchedHint(t *testing.T) {
+	requireRg(t)
+	dir := t.TempDir() // empty: rg finds zero files to search here
+
+	ctx := WithWorkingDir(context.Background(), dir)
+	_, err := GrepTool{}.Execute(ctx, "grep", map[string]any{
+		"pattern": "needle",
+	})
+	if err == nil {
+		t.Fatal("expected error when rg searches no files")
+	}
+	if !strings.Contains(err.Error(), "explicit absolute `path`") {
+		t.Errorf("error should hint at passing an explicit path, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "No files were searched") {
+		t.Errorf("error should retain rg's original message, got: %v", err)
+	}
+}
+
+func TestGrep_NoPathUsesWorkingDir(t *testing.T) {
+	requireRg(t)
+	dir := t.TempDir()
+	// Assemble the sentinel from fragments so the full string never appears
+	// verbatim in any source file. `go test` runs with the package dir as its
+	// process CWD, so a literal sentinel would also live in this test file and
+	// rg would match it there even with the bug present — masking the regression.
+	sentinel := "grepWorkingDir" + "Sentinel" + "42"
+	writeTestFile(t, filepath.Join(dir, "a.go"), "package main\n\n// "+sentinel+"\n")
+
+	ctx := WithWorkingDir(context.Background(), dir)
+	out, err := GrepTool{}.Execute(ctx, "grep", map[string]any{
+		"pattern": sentinel,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.Text, sentinel) {
+		t.Errorf("grep without path should search the stamped working dir; got:\n%s", out.Text)
+	}
+}

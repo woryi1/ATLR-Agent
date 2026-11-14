@@ -1,0 +1,1099 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/config"
+	"github.com/open-octo/octo-agent/internal/mcp"
+)
+
+// TestRunChat_NoArgs_NoStdin_Errors verifies the headless routing: with no
+// positional message and nothing on a non-tty stdin, there's no prompt to run,
+// so octo errors instead of blocking. (A real terminal would drive the TUI;
+// that path can't be unit-tested without a pty.)
+func TestRunChat_NoArgs_NoStdin_Errors(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("OCTO_PROVIDER", "anthropic") // the anthropic default is gone; say so
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp) // Windows compat
+	var stdout, stderr bytes.Buffer
+	code := runChat(nil, strings.NewReader(""), &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2; stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "no prompt") {
+		t.Errorf("stderr should explain there's no prompt; got: %q", stderr.String())
+	}
+}
+
+// TestResolveResumedModel pins the sender/model resolution for `octo -c`: a
+// resumed session's saved model must re-resolve to its own config entry —
+// rebuilding the sender when it targets a different endpoint than the current
+// config default (otherwise the deepseek sender would send k3-256k → HTTP
+// 400), reusing it when the endpoint matches, and rejecting models that have
+// left the config.
+func TestResolveResumedModel(t *testing.T) {
+	openaiEP := config.Endpoint{
+		ID:       "ep-openai",
+		Provider: "openai",
+		Models:   []config.EndpointModel{{Model: "gpt-4o"}},
+	}
+	deepseekEP := config.Endpoint{
+		ID:       "ep-deepseek",
+		Provider: "deepseek",
+		BaseURL:  "https://api.deepseek.com",
+		Models:   []config.EndpointModel{{Model: "deepseek-v4-flash"}, {Model: "deepseek-v4-pro"}},
+	}
+	kimiEP := config.Endpoint{
+		ID:       "ep-kimi",
+		Provider: "kimi",
+		Models:   []config.EndpointModel{{Model: "k3-256k"}},
+	}
+	relayEP := config.Endpoint{
+		ID:       "ep-deepseek-relay",
+		Provider: "deepseek",
+		BaseURL:  "https://relay.example.com",
+		Models:   []config.EndpointModel{{Model: "deepseek-v4-flash"}},
+	}
+	cfg := config.Config{
+		Endpoints: []config.Endpoint{openaiEP, deepseekEP, kimiEP, relayEP},
+		Default:   "ep-openai::gpt-4o",
+	}
+	openaiEntry := config.ModelEntry{Provider: "openai", Model: "gpt-4o"}
+	deepseekEntry := config.ModelEntry{Provider: "deepseek", Model: "deepseek-v4-pro", BaseURL: "https://api.deepseek.com"}
+
+	tests := []struct {
+		name        string
+		sessionRef  string
+		startProv   string
+		startEntry  config.ModelEntry
+		wantProv    string
+		wantModel   string
+		wantBaseURL string
+		wantRebuild bool
+		wantOK      bool
+	}{
+		{
+			name:        "session model on another endpoint rebuilds the sender",
+			sessionRef:  "deepseek-v4-pro",
+			startProv:   "openai",
+			startEntry:  openaiEntry,
+			wantProv:    "deepseek",
+			wantModel:   "deepseek-v4-pro",
+			wantRebuild: true,
+			wantOK:      true,
+		},
+		{
+			name:        "same endpoint, different model keeps the sender",
+			sessionRef:  "deepseek-v4-pro",
+			startProv:   "deepseek",
+			startEntry:  deepseekEntry,
+			wantProv:    "deepseek",
+			wantModel:   "deepseek-v4-pro",
+			wantRebuild: false,
+			wantOK:      true,
+		},
+		{
+			name:        "same provider, different base URL rebuilds the sender",
+			sessionRef:  "deepseek-v4-flash",
+			startProv:   "deepseek",
+			startEntry:  config.ModelEntry{Provider: "deepseek", Model: "deepseek-v4-flash", BaseURL: "https://relay.example.com"},
+			wantProv:    "deepseek",
+			wantModel:   "deepseek-v4-flash",
+			wantBaseURL: "https://api.deepseek.com",
+			wantRebuild: true,
+			wantOK:      true,
+		},
+		{
+			name:        "composite ref resolves to the bound endpoint",
+			sessionRef:  "ep-deepseek::deepseek-v4-pro",
+			startProv:   "openai",
+			startEntry:  openaiEntry,
+			wantProv:    "deepseek",
+			wantModel:   "deepseek-v4-pro",
+			wantRebuild: true,
+			wantOK:      true,
+		},
+		{
+			name:       "model deleted from config is rejected",
+			sessionRef: "claude-opus-4-7",
+			startProv:  "openai",
+			startEntry: openaiEntry,
+			wantOK:     false,
+		},
+		{
+			name:        "empty session ref passes the startup resolution through",
+			sessionRef:  "",
+			startProv:   "deepseek",
+			startEntry:  deepseekEntry,
+			wantProv:    "deepseek",
+			wantModel:   "deepseek-v4-pro",
+			wantRebuild: false,
+			wantOK:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, m, e, rebuild, ok := resolveResumedModel(tt.sessionRef, tt.startProv, tt.startEntry, cfg)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if p != tt.wantProv || m != tt.wantModel {
+				t.Errorf("resolved (%q, %q), want (%q, %q)", p, m, tt.wantProv, tt.wantModel)
+			}
+			if rebuild != tt.wantRebuild {
+				t.Errorf("rebuild = %v, want %v", rebuild, tt.wantRebuild)
+			}
+			if e.Model != tt.wantModel {
+				t.Errorf("entry.Model = %q, want %q", e.Model, tt.wantModel)
+			}
+			if tt.wantBaseURL != "" && e.BaseURL != tt.wantBaseURL {
+				t.Errorf("entry.BaseURL = %q, want %q", e.BaseURL, tt.wantBaseURL)
+			}
+		})
+	}
+}
+
+func TestRunChat_MissingAPIKey(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("OCTO_PROVIDER", "anthropic") // the anthropic default is gone; say so
+	t.Setenv("OPENAI_API_KEY", "")
+	// Isolate config so a persisted key doesn't make the test falsely pass.
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	var stdout, stderr bytes.Buffer
+	code := runChat([]string{"hello"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	// New (UX-3) actionable error: identifies the missing env var AND points
+	// the user at the signup URL so the first-run experience isn't a dead-end.
+	out := stderr.String()
+	for _, want := range []string{
+		"ANTHROPIC_API_KEY",
+		"console.anthropic.com",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stderr should mention %q; got:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunChat_InvalidPermissionMode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runChat([]string{"--permission-mode", "strikt", "hello"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2 (usage error)", code)
+	}
+	if !strings.Contains(stderr.String(), "permission-mode") {
+		t.Errorf("stderr should explain the bad flag; got: %q", stderr.String())
+	}
+}
+
+func TestRunChat_HonoursAnthropicBaseURL(t *testing.T) {
+	// Stand up a fake Anthropic-compatible endpoint and verify runChat
+	// actually POSTs there when ANTHROPIC_BASE_URL is set. Same shape the
+	// user will use with DeepSeek / Kimi / OpenRouter-Anthropic-shim.
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_, _ = w.Write([]byte(`{
+			"id":"m","type":"message","role":"assistant","model":"x",
+			"content":[{"type":"text","text":"hi"}],
+			"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}
+		}`))
+	}))
+	defer srv.Close()
+
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("ANTHROPIC_API_KEY", "k")
+	t.Setenv("OCTO_PROVIDER", "anthropic") // the anthropic default is gone; say so
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	// --stream=false because the fake server above returns a plain JSON body,
+	// not an SSE stream. Streaming end-to-end is covered by
+	// TestRunChat_Anthropic_StreamingEndToEnd below.
+	code := runChat([]string{"--model", "x", "--stream=false", "hello"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "hi") {
+		t.Errorf("stdout should contain reply; got: %q", stdout.String())
+	}
+	if gotPath != "/v1/messages" {
+		t.Errorf("path = %q, want /v1/messages", gotPath)
+	}
+}
+
+// TestRunChat_OneShot_SubAgentRunsInline locks the one-shot transport
+// contract for sub-agents: the headless one-shot exits when its single turn
+// ends, so a backgrounded child has no follow-up turn for its completion to
+// land in — it would be orphaned and its result silently lost. The model no
+// longer picks the dispatch mode, so the whole contract rests on the one-shot
+// marking its manager synchronous: the child runs inline and its reply comes
+// back in the tool_result.
+func TestRunChat_OneShot_SubAgentRunsInline(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		requests = append(requests, string(body))
+		n := len(requests)
+		mu.Unlock()
+		switch {
+		case strings.Contains(string(body), `"tool_result"`):
+			// Parent follow-up turn — the sub_agent tool_result came back.
+			_, _ = w.Write([]byte(`{
+				"id":"m","type":"message","role":"assistant","model":"x",
+				"content":[{"type":"text","text":"SUMMARY DONE"}],
+				"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}
+			}`))
+		case n == 1:
+			// Parent turn 1: dispatch a sub-agent.
+			_, _ = w.Write([]byte(`{
+				"id":"m","type":"message","role":"assistant","model":"x",
+				"content":[{"type":"tool_use","id":"tu_1","name":"sub_agent",
+					"input":{"description":"probe trash","prompt":"say done","subagent_type":"explore"}}],
+				"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}
+			}`))
+		default:
+			// The child's conversation. The parent runs buffered
+			// (--stream=false) but a sub-agent always runs through
+			// RunStream, so answer in whichever shape the request asked for.
+			if strings.Contains(string(body), `"stream":true`) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("" +
+					`data: {"type":"message_start","message":{"id":"m","model":"x","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+					`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"CHILD DONE"}}` + "\n\n" +
+					`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":2}}` + "\n\n"))
+				return
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"m","type":"message","role":"assistant","model":"x",
+				"content":[{"type":"text","text":"CHILD DONE"}],
+				"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}
+			}`))
+		}
+	}))
+	defer srv.Close()
+
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("ANTHROPIC_API_KEY", "k")
+	t.Setenv("OCTO_PROVIDER", "anthropic") // the anthropic default is gone; say so
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := runChat([]string{"--model", "x", "--stream=false", "--no-memory", "hello"},
+		strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+
+	// The tool_result the parent saw must carry the child's actual reply, not
+	// an async "Started sub-agent" stub. Pull the
+	// tool_result content out of the captured request body rather than
+	// string-matching the whole request: the sub_agent tool's own description
+	// (always present in the tools catalog) contains async wording.
+	mu.Lock()
+	defer mu.Unlock()
+	var toolResultContent string
+	for _, req := range requests {
+		var body struct {
+			Messages []struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal([]byte(req), &body); err != nil {
+			continue
+		}
+		for _, msg := range body.Messages {
+			var blocks []struct {
+				Type    string `json:"type"`
+				Content string `json:"content"`
+			}
+			if err := json.Unmarshal(msg.Content, &blocks); err != nil {
+				continue
+			}
+			for _, b := range blocks {
+				if b.Type == "tool_result" {
+					toolResultContent = b.Content
+				}
+			}
+		}
+	}
+	if toolResultContent == "" {
+		t.Fatalf("no follow-up request with a tool_result reached the endpoint; requests=%d", len(requests))
+	}
+	if !strings.Contains(toolResultContent, "CHILD DONE") {
+		t.Errorf("tool_result should contain the child's reply; got: %q", toolResultContent)
+	}
+	if strings.Contains(toolResultContent, "Started sub-agent") {
+		t.Errorf("one-shot must not take the async path; got: %q", toolResultContent)
+	}
+}
+
+// TestRunChat_PromptFile_SingleTurn verifies --prompt-file delivers a
+// multi-line prompt as ONE user turn (newlines intact) rather than splitting it
+// into one turn per line — the bug that crippled the mswe-eval harness.
+func TestRunChat_PromptFile_SingleTurn(t *testing.T) {
+	var requests int
+	var lastUserContent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Messages []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.Unmarshal(body, &req)
+		for _, m := range req.Messages {
+			if m.Role != "user" {
+				continue
+			}
+			// Content is either a plain JSON string or a [{type:text,text}] array.
+			var s string
+			if json.Unmarshal(m.Content, &s) == nil {
+				lastUserContent = s
+				continue
+			}
+			var blocks []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			if json.Unmarshal(m.Content, &blocks) == nil {
+				for _, b := range blocks {
+					if b.Type == "text" {
+						lastUserContent = b.Text
+					}
+				}
+			}
+		}
+		_, _ = w.Write([]byte(`{"id":"m","type":"message","role":"assistant","model":"x",
+			"content":[{"type":"text","text":"ok"}],
+			"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("ANTHROPIC_API_KEY", "k")
+	t.Setenv("OCTO_PROVIDER", "anthropic") // the anthropic default is gone; say so
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	prompt := "Fix the bug.\n\n--- ISSUE ---\nStep 1\nStep 2\nStep 3"
+	pf := filepath.Join(t.TempDir(), "prompt.txt")
+	if err := os.WriteFile(pf, []byte(prompt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	// Empty stdin → after the seeded turn, EOF ends the session. --no-tools /
+	// --no-memory keep it a single clean user message (no tool loop, no nudge).
+	code := runChat([]string{"--prompt-file", pf, "--model", "x", "--no-tools", "--no-memory", "--stream=false"},
+		strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if requests != 1 {
+		t.Errorf("endpoint saw %d requests, want exactly 1 (the multi-line prompt must be ONE turn)", requests)
+	}
+	// The interface note rides ahead of the user's text; the prompt itself must
+	// arrive whole.
+	if strings.TrimSpace(agent.StripSystemReminders(lastUserContent)) != prompt {
+		t.Errorf("user message = %q, want the full multi-line prompt %q", lastUserContent, prompt)
+	}
+}
+
+// TestRunChat_TakeOverFlagUsage checks --take-over is rejected without -c
+// and accepted when paired with it. The actual TUI resume path requires a tty,
+// so the second case fails earlier at session resolution, not at flag parsing.
+func TestRunChat_TakeOverFlagUsage(t *testing.T) {
+	t.Run("without continue", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := runChat([]string{"--take-over"}, strings.NewReader(""), &stdout, &stderr)
+		if code != 2 {
+			t.Errorf("exit code = %d, want 2", code)
+		}
+		if !strings.Contains(stderr.String(), "--take-over requires -c") {
+			t.Errorf("stderr should reject --take-over without -c, got: %q", stderr.String())
+		}
+	})
+
+	t.Run("with continue accepted", func(t *testing.T) {
+		// Isolate HOME so a local ~/.octo/sessions cannot accidentally match
+		// the nonexistent ID and change the exit path.
+		tmp := t.TempDir()
+		t.Setenv("HOME", tmp)
+		t.Setenv("USERPROFILE", tmp)
+
+		var stdout, stderr bytes.Buffer
+		code := runChat([]string{"--take-over", "-c", "nonexistent-id"}, strings.NewReader(""), &stdout, &stderr)
+		// --take-over is accepted with -c; resolve runs before the TUI gate, so
+		// we expect a no-such-session error rather than flag validation.
+		if code != 2 {
+			t.Errorf("exit code = %d, want 2 (session resolve failure)", code)
+		}
+		if strings.Contains(stderr.String(), "--take-over requires -c") {
+			t.Errorf("flag should be accepted with -c, got: %q", stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "matches \"nonexistent-id\"") {
+			t.Errorf("expected session resolve error, got: %q", stderr.String())
+		}
+	})
+}
+
+func TestResolveMaxTurns(t *testing.T) {
+	cases := []struct {
+		name        string
+		flagVal     int
+		seeded      bool
+		interactive bool
+		want        int
+	}{
+		{"interactive default → agent's own (0)", 0, false, true, 0},
+		{"piped stdin, no human → unattended", 0, false, false, unattendedMaxTurns},
+		{"prompt-file seed → unattended even on a tty", 0, true, true, unattendedMaxTurns},
+		{"explicit flag wins (interactive)", 35, false, true, 35},
+		{"explicit flag wins (unattended)", 35, false, false, 35},
+		{"explicit flag wins over seed", 12, true, true, 12},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := resolveMaxTurns(c.flagVal, c.seeded, c.interactive); got != c.want {
+				t.Errorf("resolveMaxTurns(%d, %v, %v) = %d, want %d", c.flagVal, c.seeded, c.interactive, got, c.want)
+			}
+		})
+	}
+}
+
+func TestResolveShowReasoning(t *testing.T) {
+	tru, fls := true, false
+	cases := []struct {
+		name    string
+		flagSet bool
+		flagVal bool
+		cfg     config.Config
+		want    bool
+	}{
+		{"default off", false, true, config.Config{}, false},
+		{"config off", false, true, config.Config{ShowReasoning: &fls}, false},
+		{"config on", false, true, config.Config{ShowReasoning: &tru}, true},
+		{"flag off beats config on", true, false, config.Config{ShowReasoning: &tru}, false},
+		{"flag on beats config off", true, true, config.Config{ShowReasoning: &fls}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := resolveShowReasoning(c.flagSet, c.flagVal, c.cfg); got != c.want {
+				t.Errorf("resolveShowReasoning(%v, %v, %+v) = %v, want %v", c.flagSet, c.flagVal, c.cfg, got, c.want)
+			}
+		})
+	}
+}
+
+func TestResolveCoauthor(t *testing.T) {
+	tru, fls := true, false
+	cases := []struct {
+		name        string
+		noCoauthor  bool
+		env         string
+		cfgCoauthor *bool
+		want        bool
+	}{
+		{"default true", false, "", nil, true},
+		{"config false", false, "", &fls, false},
+		{"config true", false, "", &tru, true},
+		{"flag beats config true", true, "", &tru, false},
+		{"flag beats env on", true, "1", nil, false},
+		{"env beats config", false, "0", &tru, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if c.env != "" {
+				t.Setenv("OCTO_COAUTHOR", c.env)
+			} else {
+				t.Setenv("OCTO_COAUTHOR", "")
+			}
+			cfg := config.Config{Coauthor: c.cfgCoauthor}
+			if got := resolveCoauthor(c.noCoauthor, cfg); got != c.want {
+				t.Errorf("resolveCoauthor(%v, %+v) with env=%q = %v, want %v", c.noCoauthor, cfg, c.env, got, c.want)
+			}
+		})
+	}
+}
+
+func TestResolveReasoningEffort(t *testing.T) {
+	if got := resolveReasoningEffort(true, "high", config.Config{ReasoningEffort: "low"}); got != "high" {
+		t.Errorf("flag should win: got %q", got)
+	}
+	if got := resolveReasoningEffort(false, "", config.Config{ReasoningEffort: "medium"}); got != "medium" {
+		t.Errorf("config fallback: got %q", got)
+	}
+	if got := resolveReasoningEffort(false, "", config.Config{}); got != "" {
+		t.Errorf("default off: got %q", got)
+	}
+	if got := resolveReasoningEffort(true, "off", config.Config{ReasoningEffort: "high"}); got != "" {
+		t.Errorf("explicit --reasoning-effort off should override config: got %q", got)
+	}
+	if got := resolveReasoningEffort(true, "OFF", config.Config{ReasoningEffort: "high"}); got != "" {
+		t.Errorf("--reasoning-effort off should be case-insensitive: got %q", got)
+	}
+}
+
+func TestValidReasoningEffort(t *testing.T) {
+	for _, ok := range []string{"", "low", "medium", "high", "xhigh", "max"} {
+		if !validReasoningEffort(ok) {
+			t.Errorf("validReasoningEffort(%q) = false, want true", ok)
+		}
+	}
+	for _, bad := range []string{"none", "minimal", "LOW", "1"} {
+		if validReasoningEffort(bad) {
+			t.Errorf("validReasoningEffort(%q) = true, want false", bad)
+		}
+	}
+}
+
+func TestAnthropicThinkingBudget(t *testing.T) {
+	cases := map[string]int{"": 0, "low": 4096, "medium": 16384, "high": 32768, "xhigh": 48000, "max": 64000}
+	for effort, want := range cases {
+		if got := anthropicThinkingBudget(effort); got != want {
+			t.Errorf("anthropicThinkingBudget(%q) = %d, want %d", effort, got, want)
+		}
+	}
+}
+
+func TestRunChat_OpenAI_EndToEnd(t *testing.T) {
+	// Stand up a fake OpenAI-compatible endpoint and verify --provider openai
+	// routes there with Bearer auth and lands at /v1/chat/completions.
+	var gotAuthHeader, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthHeader = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl-x","object":"chat.completion","model":"gpt-4o-mini",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"howdy"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`))
+	}))
+	defer srv.Close()
+
+	// Isolate HOME so the tools-on session reads an empty mcp.json instead of
+	// the developer's real ~/.octo/mcp.json — connecting to live MCP servers
+	// would block the headless turn indefinitely (no connect timeout).
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_API_KEY", "") // ensure we're testing the openai branch
+
+	var stdout, stderr bytes.Buffer
+	// --stream=false: same rationale as the Anthropic test above; this
+	// fake serves plain JSON, not SSE.
+	code := runChat([]string{"--provider", "openai", "--stream=false", "hello"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "howdy") {
+		t.Errorf("stdout should contain reply; got: %q", stdout.String())
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Errorf("path = %q, want /v1/chat/completions", gotPath)
+	}
+	if gotAuthHeader != "Bearer test-key" {
+		t.Errorf("Authorization = %q, want 'Bearer test-key'", gotAuthHeader)
+	}
+}
+
+// fakeMCPHTTPServer speaks the minimal JSON-RPC-over-HTTP surface octo's MCP
+// client needs (initialize, tools/list, empty resources/prompts) and
+// advertises a single "ping" tool. Mirrors internal/app/mcp_manage_test.go's
+// helper of the same name (unexported, so duplicated rather than shared
+// across packages).
+func fakeMCPHTTPServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var in mcp.Message
+		_ = json.Unmarshal(body, &in)
+		if in.ID == nil {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var result any
+		switch in.Method {
+		case "initialize":
+			result = mcp.InitializeResult{
+				ProtocolVersion: mcp.ProtocolVersion,
+				Capabilities:    mcp.ServerCapabilities{Tools: &mcp.ToolsCapability{}},
+				ServerInfo:      mcp.Implementation{Name: "fake", Version: "0"},
+			}
+		case "tools/list":
+			result = map[string]any{"tools": []mcp.Tool{{Name: "ping", Description: "ping", InputSchema: json.RawMessage(`{"type":"object"}`)}}}
+		case "resources/list":
+			result = map[string]any{"resources": []mcp.Resource{}}
+		case "prompts/list":
+			result = map[string]any{"prompts": []mcp.Prompt{}}
+		default:
+			result = map[string]any{}
+		}
+		raw, _ := json.Marshal(result)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(mcp.Message{JSONRPC: "2.0", ID: in.ID, Result: raw})
+	}))
+}
+
+// TestRunChat_Headless_MCPManifestReflectsLiveRegistry is the regression
+// guard for the Tool Search v2 ordering bug: tools.MCPManifestFor was
+// originally called (in runChat) before the MCP registry connects, so the
+// "# Available MCP tools" layer silently stayed empty in the system prompt
+// even once the bridge activated — reproducing, in the CLI's primary
+// headless path, the exact #1243 problem (the model can't see a connected
+// tool's name) this redesign exists to fix. This drives the real headless
+// one-shot path end to end — fake MCP server (one tool) + Tool Search forced
+// "on" + a fake OpenAI-compatible endpoint capturing the literal request body
+// sent to the model — rather than injecting a fake catalog directly.
+func TestRunChat_Headless_MCPManifestReflectsLiveRegistry(t *testing.T) {
+	mcpSrv := fakeMCPHTTPServer(t)
+	defer mcpSrv.Close()
+
+	var gotBody string
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl-x","object":"chat.completion","model":"gpt-4o-mini",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`))
+	}))
+	defer llmSrv.Close()
+
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", llmSrv.URL)
+	t.Setenv("ANTHROPIC_API_KEY", "")
+
+	if err := os.MkdirAll(filepath.Join(tmp, ".octo"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mcpJSON := `{"mcpServers": {"fake": {"url": "` + mcpSrv.URL + `"}}}`
+	if err := os.WriteFile(filepath.Join(tmp, ".octo", "mcp.json"), []byte(mcpJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Force the bridge on regardless of catalog size — a single-tool catalog
+	// would otherwise sit well under the auto activation threshold, and this
+	// test needs the bridge (and its manifest layer) to activate deterministically.
+	cfgYAML := "tools:\n  tool_search:\n    enabled: on\n"
+	if err := os.WriteFile(filepath.Join(tmp, ".octo", "config.yml"), []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runChat([]string{"--provider", "openai", "--stream=false", "hello"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(gotBody, "# Available MCP tools") {
+		t.Errorf("request sent to the model is missing the MCP tools manifest; body:\n%s", gotBody)
+	}
+	if !strings.Contains(gotBody, "mcp__fake__ping") {
+		t.Errorf("request sent to the model is missing the connected tool's name; body:\n%s", gotBody)
+	}
+	// The bridge tool itself must also be present — this is a Tool Search
+	// scenario, not the legacy full-schema-upload path.
+	if !strings.Contains(gotBody, "mcp_describe") {
+		t.Errorf("request sent to the model is missing the mcp_describe bridge tool; body:\n%s", gotBody)
+	}
+}
+
+func TestRunChat_OpenAI_MissingAPIKey(t *testing.T) {
+	// Isolate $HOME: the developer's real ~/.octo/config.yml may hold a stored
+	// key (or a base URL pointing somewhere live), which would turn this
+	// missing-key test into a real network call.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("OPENAI_API_KEY", "")
+	var stdout, stderr bytes.Buffer
+	code := runChat([]string{"--provider", "openai", "hello"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	// New (UX-3) actionable error: points the user at the OpenAI signup URL.
+	out := stderr.String()
+	for _, want := range []string{
+		"OPENAI_API_KEY",
+		"platform.openai.com",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stderr should mention %q; got:\n%s", want, out)
+		}
+	}
+}
+
+// TestRunChat_UnknownResumeID exercises the UX-3 hint that follows a failed
+// session resume: the resolver reports that nothing in this directory matches,
+// and the chat wrapper adds a pointer to `octo sessions` so the user knows
+// where to look for valid IDs.
+func TestRunChat_UnknownResumeID(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	var stdout, stderr bytes.Buffer
+	code := runChat([]string{"-c", "no-such-thing"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("exit = %d, want 2", code)
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `matches "no-such-thing"`) {
+		t.Errorf("stderr should report no match; got:\n%s", out)
+	}
+	if !strings.Contains(out, "octo sessions") {
+		t.Errorf("stderr should hint at `octo sessions`; got:\n%s", out)
+	}
+}
+
+func TestRunChat_UnknownProvider(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runChat([]string{"--provider", "bogus", "hello"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "unknown provider") {
+		t.Errorf("stderr should mention unknown provider; got: %q", stderr.String())
+	}
+}
+
+func TestRunChat_Anthropic_StreamingEndToEnd(t *testing.T) {
+	// Full chain: runChat → agent.TurnStream → providerSender.StreamMessages
+	// → anthropic.SendStream → SSE parse → callback → stdout.
+	sse := "" +
+		`data: {"type":"message_start","message":{"id":"m","model":"claude-haiku-4-5-20251001","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi "}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"there"}}` + "\n\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":2}}` + "\n\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept"); got != "text/event-stream" {
+			t.Errorf("Accept = %q, want text/event-stream", got)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse))
+	}))
+	defer srv.Close()
+
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("ANTHROPIC_API_KEY", "k")
+	t.Setenv("OCTO_PROVIDER", "anthropic") // the anthropic default is gone; say so
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := runChat([]string{"hello"}, strings.NewReader(""), &stdout, &stderr) // streaming on by default
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "hi there") {
+		t.Errorf("stdout should contain streamed reply; got: %q", out)
+	}
+}
+
+func TestRunChat_OpenAI_StreamingEndToEnd(t *testing.T) {
+	sse := "" +
+		`data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant"}}]}` + "\n\n" +
+		`data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"howdy "}}]}` + "\n\n" +
+		`data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"partner"}}]}` + "\n\n" +
+		`data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse))
+	}))
+	defer srv.Close()
+
+	// See TestRunChat_OpenAI_EndToEnd: isolate HOME so the tools-on session
+	// doesn't connect to the developer's real MCP servers and hang.
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("OPENAI_API_KEY", "k")
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_API_KEY", "")
+
+	var stdout, stderr bytes.Buffer
+	code := runChat([]string{"--provider", "openai", "hi"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "howdy partner") {
+		t.Errorf("stdout should contain streamed reply; got: %q", stdout.String())
+	}
+}
+
+// TestRunChat_ResumedToolSession_DefaultOnNoWarning confirms the common case
+// is footgun-free now that tools are on by default: resuming a tool-using
+// session needs no flag and prints no warning, because the tools array goes
+// out with the request as it did originally.
+func TestRunChat_ResumedToolSession_DefaultOnNoWarning(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+
+	// Seed a session whose history includes a tool_use block (mirrors what
+	// a real tool-enabled session looks like on disk).
+	sess := agent.NewSession("test-model", "")
+	sess.Messages = []agent.Message{
+		{Role: agent.RoleUser, Content: "list files"},
+		{Role: agent.RoleAssistant, Blocks: []agent.ContentBlock{
+			agent.NewToolUseBlock("call_1", "terminal", map[string]any{"command": "ls"}),
+		}},
+	}
+	// -c only resolves sessions belonging to the current directory, so the
+	// seeded session has to record this one (see session_scope.go).
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := sess.SetWorkingDir(dir); err != nil {
+		t.Fatalf("seed working dir: %v", err)
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+
+	// Resume with no tool flag at all. Provide immediate EOF so the REPL exits.
+	var stdout, stderr bytes.Buffer
+	// Resume is interactive-only; headless -c errors (exit 2). The point of
+	// this test is the absence of the tools-off warning, which is unaffected.
+	code := runChat([]string{"-c", sess.ID}, strings.NewReader(""), &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("headless -c should error (exit 2); got %d, stderr=%q", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "may make the model emit tool calls as text") {
+		t.Errorf("tools-on resume should not warn; got stderr:\n%s", stderr.String())
+	}
+}
+
+// TestRunChat_ResumedToolSession_NoToolsWarns confirms that explicitly
+// resuming a tool-using session with --no-tools respects the choice but
+// warns once about the garbled-XML risk.
+func TestRunChat_ResumedToolSession_NoToolsWarns(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+
+	sess := agent.NewSession("test-model", "")
+	sess.Messages = []agent.Message{
+		{Role: agent.RoleUser, Content: "list files"},
+		{Role: agent.RoleAssistant, Blocks: []agent.ContentBlock{
+			agent.NewToolUseBlock("call_1", "terminal", map[string]any{"command": "ls"}),
+		}},
+	}
+	// -c only resolves sessions belonging to the current directory, so the
+	// seeded session has to record this one (see session_scope.go).
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := sess.SetWorkingDir(dir); err != nil {
+		t.Fatalf("seed working dir: %v", err)
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	// The --no-tools warning fires before the interactive-only resume guard, so
+	// it still reaches stderr even though the headless -c then errors (exit 2).
+	code := runChat([]string{"-c", sess.ID, "--no-tools"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("headless -c should error (exit 2); got %d, stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "may make the model emit tool calls as text") {
+		t.Errorf("expected --no-tools warning on a tool session; got stderr:\n%s", stderr.String())
+	}
+}
+
+// TestRunChat_ResumedPlainSession_NoWarning confirms a session that never
+// used tools triggers no --no-tools warning — we don't nag every resume.
+func TestRunChat_ResumedPlainSession_NoWarning(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+
+	sess := agent.NewSession("test-model", "")
+	sess.Messages = []agent.Message{
+		{Role: agent.RoleUser, Content: "hi"},
+		{Role: agent.RoleAssistant, Content: "hello"},
+	}
+	// -c only resolves sessions belonging to the current directory, so the
+	// seeded session has to record this one (see session_scope.go).
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := sess.SetWorkingDir(dir); err != nil {
+		t.Fatalf("seed working dir: %v", err)
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runChat([]string{"-c", sess.ID, "--no-tools"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("headless -c should error (exit 2); got %d, stderr=%q", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "may make the model emit tool calls as text") {
+		t.Errorf("plain session should not warn; got stderr:\n%s", stderr.String())
+	}
+}
+
+// TestResumeModelRef pins the resume ref selection: a session that recorded a
+// mid-session /model switch (ModelConfig, possibly a composite
+// "<endpoint>::<model>" binding) resumes on that binding; a plain session
+// falls back to its bare wire model.
+func TestResumeModelRef(t *testing.T) {
+	sess := agent.NewSession("deepseek-v4-flash", "")
+	if got := resumeModelRef(sess); got != "deepseek-v4-flash" {
+		t.Errorf("bare session ref = %q, want deepseek-v4-flash", got)
+	}
+	if err := sess.SetModelConfig("ep-b::deepseek-v4-flash", "deepseek-v4-flash"); err != nil {
+		t.Fatalf("SetModelConfig: %v", err)
+	}
+	if got := resumeModelRef(sess); got != "ep-b::deepseek-v4-flash" {
+		t.Errorf("bound session ref = %q, want ep-b::deepseek-v4-flash", got)
+	}
+}
+
+// The documented precedence — flag > env > config — plus the guard on the unit
+// mistake. A rejected layer falls through to the next one rather than
+// disabling the feature: an operator who fat-fingers the flag still gets the
+// window their config file asks for.
+func TestResolveFallbackContextWindow(t *testing.T) {
+	cfg := config.Config{FallbackContextWindow: 40_000}
+	var buf bytes.Buffer
+
+	t.Setenv("OCTO_FALLBACK_CONTEXT_WINDOW", "32000")
+	if got := resolveFallbackContextWindow(24_000, cfg, &buf); got != 24_000 {
+		t.Errorf("flag = %d, want 24000 (flag beats env and config)", got)
+	}
+	if got := resolveFallbackContextWindow(0, cfg, &buf); got != 32_000 {
+		t.Errorf("env = %d, want 32000 (env beats config)", got)
+	}
+
+	t.Setenv("OCTO_FALLBACK_CONTEXT_WINDOW", "")
+	if got := resolveFallbackContextWindow(0, cfg, &buf); got != 40_000 {
+		t.Errorf("config = %d, want 40000", got)
+	}
+	if got := resolveFallbackContextWindow(0, config.Config{}, &buf); got != 0 {
+		t.Errorf("nothing configured = %d, want 0 (leaves the built-in default)", got)
+	}
+
+	// 32 means 32k to a human and 32 tokens to the code. Rejected, with the
+	// units spelled out, and the next layer still applies.
+	buf.Reset()
+	if got := resolveFallbackContextWindow(32, cfg, &buf); got != 40_000 {
+		t.Errorf("flag in k = %d, want 40000 (falls through to config)", got)
+	}
+	if !strings.Contains(buf.String(), "32000, not 32") {
+		t.Errorf("warning %q does not explain the units", buf.String())
+	}
+
+	t.Setenv("OCTO_FALLBACK_CONTEXT_WINDOW", "lots")
+	buf.Reset()
+	if got := resolveFallbackContextWindow(0, cfg, &buf); got != 40_000 {
+		t.Errorf("non-numeric env = %d, want 40000 (falls through to config)", got)
+	}
+	if !strings.Contains(buf.String(), "not a number") {
+		t.Errorf("warning %q does not name the problem", buf.String())
+	}
+}
+
+// TestRunChat_UnconfiguredProvider_DoesNotMaskOtherErrors pins the ordering the
+// removed anthropic fallback used to provide for free. Resolution now fails on
+// a blank install, and that failure is reported where a sender is built — after
+// the checks that can say something more useful. Without the deferral, every
+// one of these would answer "no provider configured" instead.
+func TestRunChat_UnconfiguredProvider_DoesNotMaskOtherErrors(t *testing.T) {
+	// Only the checks that run BEFORE the sender is built can take precedence —
+	// building it is what needs the provider. "no prompt" and session resolution
+	// come after, so on a blank install those still report the provider first,
+	// which is fair: it is the more fundamental thing to fix.
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"unknown agent", []string{"--agent", "nonexistent", "hello"}, "not found"},
+		{"-c with no TTY to pick from", []string{"-c"}, "needs a terminal"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			t.Setenv("USERPROFILE", tmp)
+			// Deliberately unconfigured: no provider named anywhere.
+			t.Setenv("OCTO_PROVIDER", "")
+			t.Setenv("ANTHROPIC_API_KEY", "")
+
+			var stdout, stderr bytes.Buffer
+			runChat(tc.args, strings.NewReader(""), &stdout, &stderr)
+			if got := stderr.String(); !strings.Contains(got, tc.want) {
+				t.Errorf("stderr should mention %q, got: %q", tc.want, got)
+			}
+		})
+	}
+}
+
+// A blank install with no terminal to run the wizard on gets the setup hint,
+// not "unknown provider \"\"".
+func TestRunChat_UnconfiguredProvider_NonTTYHint(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("OCTO_PROVIDER", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+
+	var stdout, stderr bytes.Buffer
+	code := runChat([]string{"hello"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2; stderr=%q", code, stderr.String())
+	}
+	if got := stderr.String(); !strings.Contains(got, "no provider configured") {
+		t.Errorf("stderr should point at setup, got: %q", got)
+	}
+	if got := stderr.String(); strings.Contains(got, `unknown provider`) {
+		t.Errorf("a blank install is not a typo'd provider, got: %q", got)
+	}
+}

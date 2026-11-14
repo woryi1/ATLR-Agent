@@ -1,0 +1,889 @@
+package agent
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"unicode/utf8"
+)
+
+// defaultCompactKeepFraction is the share of the model's context window that
+// compaction keeps verbatim as the recent tail (everything older is folded into
+// the summary) when Agent.CompactKeepFraction is unset. Chosen so a compaction
+// from the 75% trigger lands well below it, leaving wide headroom before the
+// next one.
+const defaultCompactKeepFraction = 0.30
+
+// minFoldPercent is the anti-thrash floor: maybeCompact skips the summarize call
+// unless the fold would reclaim at least this share of the current context. It
+// stops the "fold a sliver, re-trigger next turn" loop when the bulk is wedged
+// inside the kept tail (a single huge agentic turn) — reclamation, not a
+// summarize, is what shrinks that case.
+const minFoldPercent = 15
+
+// compactThresholdFraction is the share of the model's context window at which
+// auto-compaction (CompactThreshold == 0) triggers, leaving headroom for the
+// kept tail, the summary side-call, and the next turn's output.
+const compactThresholdFraction = 0.75
+
+// defaultContextWindow is the built-in fallback window (in tokens) for models
+// not named in lookupContextWindow, used when no fallback has been configured.
+// Conservative for a cloud model, but a self-hosted server is often started
+// with far less than this — see SetFallbackContextWindow.
+const defaultContextWindow = 128_000
+
+var (
+	fallbackWindowMu sync.RWMutex
+	fallbackWindow   int // 0 = use defaultContextWindow
+)
+
+// SetFallbackContextWindow installs the context window assumed for models whose
+// name matches no entry in the built-in table — a self-hosted or renamed model,
+// where the built-in 128k is a guess that the serving process may not honor.
+// n <= 0 restores the built-in default.
+//
+// Deliberately scoped to the fallback: a model that DOES match keeps the
+// table's value, so configuring this can never mask a known model's real
+// window. Installed at startup from --fallback-context-window /
+// OCTO_FALLBACK_CONTEXT_WINDOW / config.yml, and re-installed when the config
+// changes — mirroring tools.SetToolSearchConfig.
+func SetFallbackContextWindow(n int) {
+	if n < 0 {
+		n = 0
+	}
+	fallbackWindowMu.Lock()
+	fallbackWindow = n
+	fallbackWindowMu.Unlock()
+}
+
+// FallbackContextWindow reports the window currently assumed for unknown
+// models — the configured value, else the built-in default.
+func FallbackContextWindow() int {
+	fallbackWindowMu.RLock()
+	defer fallbackWindowMu.RUnlock()
+	if fallbackWindow > 0 {
+		return fallbackWindow
+	}
+	return defaultContextWindow
+}
+
+// ContextWindow exposes contextWindow to other packages (e.g. the tools layer's
+// Tool Search threshold) without duplicating the model→window table.
+func ContextWindow(model string) int { return contextWindow(model) }
+
+// ContextWindowKnown is ContextWindow plus whether the model matched an entry
+// in the table at all. The registry-coverage test uses it to catch a model
+// added to app.Registry without a window here — a miss is silent otherwise,
+// since the fallback is a plausible-looking 128k.
+func ContextWindowKnown(model string) (int, bool) {
+	if w := lookupContextWindow(model); w > 0 {
+		return w, true
+	}
+	return FallbackContextWindow(), false
+}
+
+// contextWindow is lookupContextWindow with the fallback applied.
+func contextWindow(model string) int {
+	if w := lookupContextWindow(model); w > 0 {
+		return w
+	}
+	return FallbackContextWindow()
+}
+
+// EstimateTokens exposes estimateMessages to other packages (e.g. the web
+// server's cold-start context-percent estimate for a resumed session with no
+// live Agent yet) so they share the exact same heuristic as compaction and
+// ContextUsage instead of maintaining a second implementation.
+func EstimateTokens(msgs []Message) int { return estimateMessages(msgs) }
+
+// EstimateTextTokens exposes estimateText for the same reason — the web
+// server folds a resumed session's frozen system prompt into its cold-start
+// context-percent estimate, which the transcript-only count omits.
+func EstimateTextTokens(s string) int { return estimateText(s) }
+
+// lookupContextWindow returns the approximate context-window size (in tokens)
+// for a model, or 0 when the model matches no entry. Values are deliberately
+// conservative; matched case-insensitively by substring so dated/aliased names
+// ("claude-haiku-4-5-2025…") still resolve. Raise a model's entry when a larger
+// window is confirmed.
+func lookupContextWindow(model string) int {
+	m := strings.ToLower(model)
+	switch {
+	// ── Anthropic Claude ──
+	// The 5.x line is 1M by default per Anthropic's models overview
+	// (platform.claude.com/docs/en/about-claude/models/overview, 2026-10-12).
+	case strings.Contains(m, "claude-fable-5") || strings.Contains(m, "claude-mythos-5"):
+		return 1_000_000
+	case strings.Contains(m, "claude-opus-5") || strings.Contains(m, "claude-haiku-5"):
+		return 1_000_000
+	case strings.Contains(m, "claude-opus-4.8") || strings.Contains(m, "claude-opus-4"):
+		return 1_000_000
+	case strings.Contains(m, "claude-sonnet-5"):
+		return 1_000_000
+	case strings.Contains(m, "claude-sonnet-4-5") || strings.Contains(m, "claude-sonnet-4"):
+		return 256_000
+	case strings.Contains(m, "claude-haiku-4") || strings.Contains(m, "claude-haiku-4-5"):
+		return 256_000
+	case strings.Contains(m, "claude-4"):
+		return 256_000
+	case strings.Contains(m, "claude-3-5"):
+		return 200_000
+	case strings.Contains(m, "claude-3"):
+		return 200_000
+	case strings.Contains(m, "claude"):
+		return 256_000
+
+	// ── OpenAI GPT / O-series ──
+	case strings.Contains(m, "gpt-6") || strings.Contains(m, "gpt6"):
+		return 1_000_000
+	case strings.Contains(m, "gpt-5.6") || strings.Contains(m, "gpt5.6"):
+		return 1_000_000
+	case strings.Contains(m, "gpt-5.5") || strings.Contains(m, "gpt5.5"):
+		return 1_000_000
+	case strings.Contains(m, "gpt-5") || strings.Contains(m, "gpt5"):
+		return 256_000
+	case strings.Contains(m, "gpt-4.1") || strings.Contains(m, "gpt4.1"):
+		return 128_000
+	case strings.Contains(m, "gpt-4o"):
+		return 128_000
+	case strings.Contains(m, "gpt-4"):
+		return 128_000
+	case strings.Contains(m, "o3") || strings.Contains(m, "o1") || strings.Contains(m, "o4"):
+		return 200_000
+
+	// ── Google Gemini ──
+	case strings.Contains(m, "gemini-3.5") || strings.Contains(m, "gemini3.5"):
+		return 1_000_000
+	case strings.Contains(m, "gemini-3.1") || strings.Contains(m, "gemini3.1"):
+		return 1_000_000
+	case strings.Contains(m, "gemini-3") || strings.Contains(m, "gemini3"):
+		return 1_000_000
+	case strings.Contains(m, "gemini-2.5") || strings.Contains(m, "gemini2.5"):
+		return 1_000_000
+	case strings.Contains(m, "gemini-2") || strings.Contains(m, "gemini2"):
+		return 1_000_000
+	case strings.Contains(m, "gemini-1.5") || strings.Contains(m, "gemini1.5"):
+		return 1_000_000
+	case strings.Contains(m, "gemini"):
+		return 1_000_000
+
+	// ── DeepSeek ──
+	case strings.Contains(m, "deepseek-flash") || strings.Contains(m, "deepseekflash"):
+		return 1_000_000
+	case strings.Contains(m, "deepseek-v4-pro") || strings.Contains(m, "deepseekv4-pro"):
+		return 1_000_000
+	case strings.Contains(m, "deepseek-v4-flash") || strings.Contains(m, "deepseekv4-flash"):
+		return 1_000_000
+	case strings.Contains(m, "deepseek-v4") || strings.Contains(m, "deepseekv4"):
+		return 1_000_000
+	case strings.Contains(m, "deepseek-v3") || strings.Contains(m, "deepseekv3"):
+		return 64_000
+	case strings.Contains(m, "deepseek"):
+		return 64_000
+
+	// ── Moonshot Kimi ──
+	case strings.Contains(m, "kimi-for-coding-highspeed"):
+		return 256_000
+	case strings.Contains(m, "k3-256k"):
+		return 256_000
+	case strings.Contains(m, "k3"):
+		return 1_000_000
+	case strings.Contains(m, "kimi-k2") || strings.Contains(m, "kimik2") || strings.Contains(m, "k2"):
+		return 256_000
+	case strings.Contains(m, "kimi-math"):
+		return 128_000
+	case strings.Contains(m, "kimi"):
+		return 200_000
+
+	// ── Alibaba Qwen ──
+	case strings.Contains(m, "qwen3.8") || strings.Contains(m, "qwen-3.8"):
+		return 1_000_000
+	case strings.Contains(m, "qwen3.7") || strings.Contains(m, "qwen-3.7"):
+		return 1_000_000
+	case strings.Contains(m, "qwen3-max") || strings.Contains(m, "qwen-3-max"):
+		return 256_000
+	case strings.Contains(m, "qwen3.5") || strings.Contains(m, "qwen-3.5"):
+		return 128_000
+	case strings.Contains(m, "qwen-plus") || strings.Contains(m, "qwen3-plus"):
+		return 128_000
+	case strings.Contains(m, "qwen-turbo") || strings.Contains(m, "qwen3-turbo"):
+		return 128_000
+	case strings.Contains(m, "qwen3") || strings.Contains(m, "qwen-3"):
+		return 128_000
+	case strings.Contains(m, "qwen2.5") || strings.Contains(m, "qwen-2.5"):
+		return 128_000
+	case strings.Contains(m, "qwen2") || strings.Contains(m, "qwen-2"):
+		return 128_000
+	case strings.Contains(m, "qwen"):
+		return 32_000
+
+	// ── Meta Muse Spark ──
+	// 1,048,576 per Meta's model docs (ai.developer.meta.com/docs/models) and
+	// models.dev; rounded down to stay conservative.
+	case strings.Contains(m, "muse-spark"):
+		return 1_000_000
+
+	// ── Meta Llama ──
+	case strings.Contains(m, "llama-3.3") || strings.Contains(m, "llama3.3"):
+		return 128_000
+	case strings.Contains(m, "llama-3.2") || strings.Contains(m, "llama3.2"):
+		return 128_000
+	case strings.Contains(m, "llama-3.1") || strings.Contains(m, "llama3.1"):
+		return 128_000
+	case strings.Contains(m, "llama-3") || strings.Contains(m, "llama3"):
+		return 8_000
+	case strings.Contains(m, "llama"):
+		return 4_000
+
+	// ── Mistral ── (vendor removed from the registry, but a custom/openai entry
+	// can still run mistral-* models, so keep the window mapping)
+	case strings.Contains(m, "mistral-large") || strings.Contains(m, "mistral-small"):
+		return 128_000
+	case strings.Contains(m, "mistral"):
+		return 32_000
+
+	// ── MiniMax ──
+	case strings.Contains(m, "minimax-m3"):
+		return 1_000_000
+	case strings.Contains(m, "minimax-m2"):
+		return 256_000
+	case strings.Contains(m, "minimax"):
+		return 128_000
+
+	// ── GLM (Zhipu) ──
+	case strings.Contains(m, "glm-5.3") || strings.Contains(m, "glm5.3"):
+		return 1_000_000
+	case strings.Contains(m, "glm-5.2") || strings.Contains(m, "glm5.2"):
+		return 1_000_000
+	case strings.Contains(m, "glm-4-air") || strings.Contains(m, "glm-4.5-air"):
+		return 128_000
+	case strings.Contains(m, "glm-4-flash") || strings.Contains(m, "glm-4.5-flash"):
+		return 128_000
+	case strings.Contains(m, "glm-4.5") || strings.Contains(m, "glm4.5"):
+		return 128_000
+	case strings.Contains(m, "glm-4") || strings.Contains(m, "glm4"):
+		return 128_000
+	case strings.Contains(m, "glm"):
+		return 64_000
+
+	// ── XAI Grok ──
+	// Context windows per xAI's model catalogue (docs.x.ai, 2026-07-09, and
+	// 2026-10-12 for 4.6/4.7): grok-4.5 / 4.6 / 4.7 = 500k, grok-4.20 /
+	// grok-4.3 = 1M, grok-build-0.1 = 256k.
+	case strings.Contains(m, "grok-4.7") || strings.Contains(m, "grok4.7"):
+		return 500_000
+	case strings.Contains(m, "grok-4.6") || strings.Contains(m, "grok4.6"):
+		return 500_000
+	case strings.Contains(m, "grok-4.5") || strings.Contains(m, "grok4.5"):
+		return 500_000
+	case strings.Contains(m, "grok-4.20") || strings.Contains(m, "grok4.20"):
+		return 1_000_000
+	case strings.Contains(m, "grok-4.3") || strings.Contains(m, "grok4.3"):
+		return 1_000_000
+	case strings.Contains(m, "grok-4") || strings.Contains(m, "grok4"):
+		return 256_000
+	case strings.Contains(m, "grok-build") || strings.Contains(m, "grokbuild"):
+		return 256_000
+	case strings.Contains(m, "grok"):
+		return 64_000
+
+	// ── MiMo (Xiaomi) ──
+	case strings.Contains(m, "mimo-v2.5") || strings.Contains(m, "mimov2.5"):
+		return 1_000_000
+	case strings.Contains(m, "mimo"):
+		return 128_000
+
+	// ── LongCat (Meituan) ──
+	case strings.Contains(m, "longcat"):
+		return 1_000_000
+
+	// ── Tencent ──
+	case strings.Contains(m, "hy3"):
+		return 256_000
+
+	// ── NVIDIA ──
+	case strings.Contains(m, "nemotron-3-ultra") || strings.Contains(m, "nemotron3-ultra"):
+		return 1_000_000
+	case strings.Contains(m, "nemotron"):
+		return 128_000
+
+	// ── Cohere ──
+	case strings.Contains(m, "command-r-plus") || strings.Contains(m, "command-r"):
+		return 128_000
+	case strings.Contains(m, "command"):
+		return 4_000
+
+	// ── 01.AI Yi ──
+	case strings.Contains(m, "yi-large") || strings.Contains(m, "yi-medium"):
+		return 32_000
+	case strings.Contains(m, "yi"):
+		return 16_000
+
+	default:
+		return 0
+	}
+}
+
+// compactTriggerTokens resolves the effective auto-compaction trigger from
+// CompactThreshold:
+//
+//	< 0  → disabled (0)
+//	== 0 → auto: a fraction of the model's context window (settable via
+//	       CompactAutoFraction, default compactThresholdFraction)
+//	> 0  → that explicit token count
+func (a *Agent) compactTriggerTokens() int {
+	switch {
+	case a.CompactThreshold < 0:
+		return 0
+	case a.CompactThreshold == 0:
+		frac := a.CompactAutoFraction
+		if frac <= 0 {
+			frac = compactThresholdFraction
+		}
+		if frac > 1 {
+			frac = 1
+		}
+		return int(float64(a.ContextWindow()) * frac)
+	default:
+		return a.CompactThreshold
+	}
+}
+
+// historyTokens returns the best available token count for msgs: the larger of
+// what the provider counted and what the estimate sees.
+//
+// Neither number is sufficient alone. The provider's count is exact but measures
+// the prompt we last SENT — it knows nothing of what has been appended since: a
+// whole tool batch's results, a steer message, an injected background notice.
+// The estimate covers history as it stands now but runs low, since CJK text and
+// JSON tool input both under-count against a real tokenizer. Preferring the
+// provider count outright (what this did) let mid-turn growth hide behind a
+// stale number until the next provider call re-measured it — a turn could append
+// 100k of tool output and still look like whatever the last prompt cost.
+//
+// The estimate side must count what the reported side counts, or the comparison
+// is between two different things: the reported figure is the WHOLE prompt, and
+// the system prompt plus tool schemas ride every call for 10k+ tokens. Leaving
+// them out would mean mid-turn growth had to exceed that overhead before it
+// could ever win the max — which is most of the blind spot, still blind. Same
+// arithmetic as ContextUsage's estimate fallback.
+//
+// msgs must be the full history; every caller passes a complete snapshot.
+func (a *Agent) historyTokens(msgs []Message) int {
+	a.usageMu.Lock()
+	reported := a.lastInputTokens
+	overhead := a.toolDefTokens
+	a.usageMu.Unlock()
+	if est := estimateMessages(msgs) + estimateText(a.System) + overhead; est > reported {
+		return est
+	}
+	return reported
+}
+
+// summarizeMaxTokens caps the summary length. A summary is meant to be a
+// compact carry-forward of decisions/paths/open tasks, not a transcript.
+const summarizeMaxTokens = 1024
+
+// compressionPrompt is the instruction inserted into the conversation for
+// insert-then-compress. The LLM sees the full history (cached) plus this
+// instruction, and returns a summary. Aligned with Ruby's COMPRESSION_PROMPT.
+const compressionPrompt = `═══════════════════════════════════════════════════════════════
+CRITICAL: TASK CHANGE - MEMORY COMPRESSION MODE
+═══════════════════════════════════════════════════════════════
+The conversation above has ENDED. You are now in MEMORY COMPRESSION MODE.
+
+CRITICAL INSTRUCTIONS - READ CAREFULLY:
+1. This is NOT a continuation of the conversation
+2. DO NOT respond to any requests in the conversation above
+3. DO NOT call ANY tools or functions
+4. DO NOT use tool_calls in your response
+5. Your response MUST be PURE TEXT ONLY
+
+YOUR ONLY TASK: Create a comprehensive summary of the conversation above.
+
+REQUIRED RESPONSE FORMAT:
+First output a <topics> line listing 3-6 key topic phrases (comma-separated, concise).
+Then output the full summary wrapped in <summary> tags.
+
+Example format:
+<topics>Rails setup, database config, deploy pipeline, Tailwind CSS</topics>
+<summary>
+...full summary text...
+</summary>
+
+Focus on:
+- User's explicit requests and intents
+- Key technical concepts and code changes
+- Files examined and modified
+- Errors encountered and fixes applied
+- Current work status and pending tasks
+
+Begin your response NOW. Remember: PURE TEXT only, starting with <topics> then <summary>.`
+
+// maybeCompact summarizes the older portion of history when the total context
+// size crosses CompactThreshold. It prefers the real token count reported by
+// the provider (lastInputTokens) and falls back to a heuristic estimate when no
+// real data is available yet. It runs only at a safe boundary — between turns,
+// splitting on a plain user message — so tool_use/tool_result pairs are never
+// severed. A nil return means either "compaction disabled / not needed" or
+// "compacted successfully"; an error means the summarization side-call failed
+// (the caller logs and proceeds with uncompacted history rather than aborting
+// the turn).
+//
+// handler may be nil (the non-streaming Run path); when set, maybeCompact
+// emits EventCompactStarted/Progress/Done around the summarization so the UI
+// can show a live "compacting conversation history" indicator. Once Started
+// has fired, Done always fires too — even on failure — so observers never get
+// stuck showing the indicator.
+func (a *Agent) maybeCompact(ctx context.Context, handler EventHandler) error {
+	trigger := a.compactTriggerTokens()
+	if trigger <= 0 {
+		return nil
+	}
+
+	msgs := a.History.Snapshot()
+	before := a.historyTokens(msgs)
+	if before < trigger {
+		return nil
+	}
+
+	// Cheap tier first: reclaim stale tool-result bulk with no LLM call. Often
+	// this alone drops the context under the trigger (especially the single
+	// huge agentic turn the summarize path can't fold), saving a summarize.
+	if reclaimed := a.reclaimStaleToolResults(); reclaimed > 0 {
+		a.resetContextTrigger() // the real lastInputTokens count is now stale
+		msgs = a.History.Snapshot()
+		if afterReclaim := estimateMessages(msgs); afterReclaim < trigger {
+			if handler != nil {
+				handler(AgentEvent{Kind: EventCompactDone, Compact: &CompactStats{
+					BeforeTokens: before, AfterTokens: afterReclaim, ReclaimedTokens: reclaimed,
+				}})
+			}
+			return nil
+		}
+		before = estimateMessages(msgs)
+	}
+
+	split := safeSplitIndexByBudget(msgs, a.compactKeepBudget())
+	if split <= 0 {
+		return nil // not enough complete turns to safely compact yet
+	}
+
+	// Anti-thrash: skip the summarize when the fold would reclaim only a sliver
+	// (the bulk is wedged inside the kept tail — a single huge agentic turn).
+	// Reclamation, not a summarize, shrinks that case; burning an LLM call here
+	// would just re-trigger next turn. Measured in the estimate space so both
+	// sides of the ratio use the same units.
+	estBefore := estimateMessages(msgs)
+	if estFolded := estimateMessages(msgs[:split]); estBefore > 0 && estFolded*100 < estBefore*minFoldPercent {
+		return nil
+	}
+
+	a.firePreCompact()
+	if handler != nil {
+		handler(AgentEvent{Kind: EventCompactStarted, Compact: &CompactStats{
+			BeforeTokens: before,
+			FoldedMsgs:   split,
+			KeptTurns:    countKeptUserTurns(msgs, split),
+			MaxTokens:    summarizeMaxTokens,
+		}})
+	}
+
+	summary, err := a.summarize(ctx, msgs[:split], handler)
+	if err != nil {
+		emitCompactDone(handler, before, before, split) // no-op: clear the indicator
+		return fmt.Errorf("agent: compact: %w", err)
+	}
+	if summary == "" {
+		emitCompactDone(handler, before, before, split) // nothing usable came back
+		return nil                                      // leave history alone
+	}
+
+	// Archive the verbatim originals before discarding them, so the model can
+	// recall details the lossy summary dropped (best-effort; "" when disabled).
+	body := "[Earlier conversation summary]\n\n" + summary
+	if ref := a.archiveChunk(msgs[:split]); ref != "" {
+		body += fmt.Sprintf("\n\n[Full originals of the summarized turns archived at %s — use the read tool to recall details.]", ref)
+	}
+
+	// Rebuild: one summary user-message, then the kept recent turns verbatim.
+	a.History.Reset()
+	a.History.Append(NewUserMessage(body))
+	for _, m := range msgs[split:] {
+		a.History.Append(m)
+	}
+	// Reset the trigger so we don't re-compact until the context grows again.
+	a.resetContextTrigger()
+
+	emitCompactDone(handler, before, estimateMessages(a.History.Snapshot()), split)
+	return nil
+}
+
+// ForceCompact compacts the conversation now, regardless of the auto-trigger
+// threshold — it backs the explicit /compact command. Like maybeCompact it
+// reclaims stale tool results first (cheap, no LLM call) and then summarizes
+// the oldest complete turns, but it does not gate on the context being "full"
+// nor skip a small fold (anti-thrash): the user asked for it. It still no-ops
+// when there aren't enough complete turns to fold safely. The returned stats
+// report what changed (BeforeTokens == AfterTokens and FoldedMsgs == 0 means
+// nothing was compacted).
+func (a *Agent) ForceCompact(ctx context.Context, handler EventHandler) (CompactStats, error) {
+	ctx = a.withUpstreamSession(ctx)
+	msgs := a.History.Snapshot()
+	origBefore := a.historyTokens(msgs)
+	before := origBefore
+	stats := CompactStats{BeforeTokens: origBefore, AfterTokens: origBefore}
+
+	// Cheap tier first: reclaim stale tool-result bulk with no LLM call.
+	if reclaimed := a.reclaimStaleToolResults(); reclaimed > 0 {
+		a.resetContextTrigger()
+		msgs = a.History.Snapshot()
+		stats.ReclaimedTokens = reclaimed
+		before = estimateMessages(msgs)
+		stats.AfterTokens = before
+	}
+
+	split := safeSplitIndexByBudget(msgs, a.compactKeepBudget())
+	if split <= 0 {
+		// Not enough complete turns to fold. If reclamation shrank things,
+		// surface that as a done event so the UI can announce it.
+		if stats.ReclaimedTokens > 0 && handler != nil {
+			handler(AgentEvent{Kind: EventCompactDone, Compact: &CompactStats{
+				BeforeTokens:    origBefore,
+				AfterTokens:     stats.AfterTokens,
+				ReclaimedTokens: stats.ReclaimedTokens,
+			}})
+		}
+		return stats, nil
+	}
+
+	a.firePreCompact()
+	if handler != nil {
+		handler(AgentEvent{Kind: EventCompactStarted, Compact: &CompactStats{
+			BeforeTokens: before,
+			FoldedMsgs:   split,
+			KeptTurns:    countKeptUserTurns(msgs, split),
+			MaxTokens:    summarizeMaxTokens,
+		}})
+	}
+
+	summary, err := a.summarize(ctx, msgs[:split], handler)
+	if err != nil {
+		emitCompactDone(handler, before, before, split) // no-op: clear the indicator
+		return stats, fmt.Errorf("agent: compact: %w", err)
+	}
+	if summary == "" {
+		emitCompactDone(handler, before, before, split) // nothing usable came back
+		return stats, nil
+	}
+
+	// Archive the verbatim originals before discarding them, so the model can
+	// recall details the lossy summary dropped (best-effort; "" when disabled).
+	body := "[Earlier conversation summary]\n\n" + summary
+	if ref := a.archiveChunk(msgs[:split]); ref != "" {
+		body += fmt.Sprintf("\n\n[Full originals of the summarized turns archived at %s — use the read tool to recall details.]", ref)
+	}
+
+	// Rebuild: one summary user-message, then the kept recent turns verbatim.
+	a.History.Reset()
+	a.History.Append(NewUserMessage(body))
+	for _, m := range msgs[split:] {
+		a.History.Append(m)
+	}
+	a.resetContextTrigger()
+
+	after := estimateMessages(a.History.Snapshot())
+	stats.AfterTokens = after
+	stats.FoldedMsgs = split
+	emitCompactDone(handler, before, after, split)
+	return stats, nil
+}
+
+// emitCompactDone fires EventCompactDone if a handler is attached. before ==
+// after signals a no-op compaction (the full history was kept).
+func emitCompactDone(handler EventHandler, before, after, folded int) {
+	if handler == nil {
+		return
+	}
+	handler(AgentEvent{Kind: EventCompactDone, Compact: &CompactStats{
+		BeforeTokens: before,
+		AfterTokens:  after,
+		FoldedMsgs:   folded,
+	}})
+}
+
+// summarize asks a sender to condense the given messages into a summary.
+// When LiteSender/LiteModel are set, the call runs on the lite model first
+// and retries once on the primary sender if it errors — a misconfigured lite
+// entry must not break compaction. The caller is responsible for rebuilding
+// history with the summary.
+func (a *Agent) summarize(ctx context.Context, msgs []Message, handler EventHandler) (string, error) {
+	// Described images fold as their descriptions: neither the lite model nor
+	// (under vision_helper) the primary is guaranteed to accept image blocks,
+	// and a 400 here would leave compaction permanently failing while the
+	// context only grows. Undescribed blocks pass through as before.
+	msgs = textifyDescribedImages(msgs)
+	if a.LiteSender != nil && a.LiteModel != "" {
+		summary, err := a.summarizeOn(ctx, a.LiteSender, a.LiteModel, a.LiteContextWindow(), msgs, handler)
+		if err == nil {
+			return summary, nil
+		}
+	}
+	return a.summarizeOn(ctx, a.GetSender(), a.Model, a.ContextWindow(), msgs, handler)
+}
+
+// summarizeOn runs one summarisation call on the given sender/model pair.
+// It uses the insert-then-compress strategy: the compression instruction is
+// appended to the messages slice (which ends on an assistant message, so
+// alternation holds), and the LLM returns a summary.
+//
+// Overflow protection: if the token count of msgs exceeds the model's context
+// window, messages are popped from the head until it fits. This prevents the
+// compression call itself from 400-ing. The count prefers the provider's real
+// lastInputTokens and falls back to a heuristic estimate.
+//
+// When the sender implements StreamingSender and a handler is attached, the
+// summary is streamed so the caller can surface EventCompactProgress as it
+// arrives; otherwise it falls back to the buffered SendMessages.
+func (a *Agent) summarizeOn(ctx context.Context, sender Sender, model string, window int, msgs []Message, handler EventHandler) (string, error) {
+	// ── Overflow protection ──────────────────────────────────────────────
+	// If msgs alone exceeds the window, pop from head until it fits.
+	// This handles the case where the history is already over the limit
+	// (e.g. a single huge tool_result tipped it over). The window is the
+	// summarising model's — the lite model may be smaller than the primary.
+	if window <= 0 {
+		window = contextWindow(model)
+	}
+	for {
+		// Measure THIS slice, not the whole live history. historyTokens returns
+		// the provider-reported lastInputTokens (full prior prompt) whenever it
+		// is set, which here is the primary model's ~75%-of-window count — using
+		// it would ignore msgs entirely and pop the chunk down to 2 messages when
+		// the summarising (lite) model's window is smaller than the primary's.
+		est := estimateMessages(msgs)
+		if est < window {
+			break
+		}
+		if len(msgs) <= 2 {
+			// Can't pop any more; proceed anyway and let the caller handle 400
+			break
+		}
+		msgs = msgs[1:] // pop from head (preserve system msg at index 0)
+	}
+
+	// ── Insert-then-compress ─────────────────────────────────────────────
+	req := make([]Message, 0, len(msgs)+1)
+	req = append(req, msgs...)
+	req = append(req, NewUserMessage(compressionPrompt))
+
+	// Stream the summary when we can, so the UI can show a live "generated ~N
+	// tokens" indicator. The deltas surface as EventCompactProgress — NOT
+	// EventTextDelta — so consumers never mistake the summary for the
+	// assistant's reply. Falls back to a buffered call otherwise.
+	var reply Reply
+	var err error
+	if ss, ok := sender.(StreamingSender); ok && handler != nil {
+		var acc strings.Builder
+		reply, err = ss.StreamMessages(ctx, model, "", req, summarizeMaxTokens, func(delta string) {
+			if delta == "" {
+				return
+			}
+			acc.WriteString(delta)
+			handler(AgentEvent{Kind: EventCompactProgress, Chunk: delta, Compact: &CompactStats{
+				SummaryTokens: estimateText(acc.String()),
+				MaxTokens:     summarizeMaxTokens,
+			}})
+		}, nil) // nil onThinking: summarization reasoning is never surfaced
+	} else {
+		reply, err = sender.SendMessages(ctx, model, "", req, summarizeMaxTokens)
+	}
+	if err != nil {
+		return "", err
+	}
+
+	// Defensive: if the LLM returned tool_calls instead of text (it shouldn't,
+	// but some models hallucinate), treat it as a failed compression.
+	if reply.StopReason == "tool_use" {
+		return "", fmt.Errorf("agent: compact: LLM returned tool_calls instead of summary")
+	}
+
+	// Summary tokens count toward the session budget like any other call,
+	// cache hits included so the turn's cache utilization stays accurate.
+	a.addUsage(reply.InputTokens, reply.OutputTokens, reply.CacheReadTokens, reply.CacheWriteTokens)
+	return reply.Content, nil
+}
+
+// compactKeepBudget is the token budget for the verbatim recent tail that
+// compaction keeps. It is CompactKeepFraction of the model's window (default
+// 0.30), but never more than half the trigger — so a fold reliably brings the
+// context under the trigger with headroom, even when an explicit (small)
+// CompactThreshold is set.
+func (a *Agent) compactKeepBudget() int {
+	frac := a.CompactKeepFraction
+	if frac <= 0 {
+		frac = defaultCompactKeepFraction
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	budget := int(float64(a.ContextWindow()) * frac)
+	if trig := a.compactTriggerTokens(); trig > 0 && budget > trig/2 {
+		budget = trig / 2
+	}
+	return budget
+}
+
+// safeSplitIndexByBudget returns the history index at which compaction splits:
+// messages before it are summarized, messages from it onward are kept verbatim.
+// The split always lands on a plain user turn (RoleUser with no tool_result
+// blocks), so a tool_use and its tool_result are never separated and the kept
+// tail always begins on a real user message.
+//
+// It keeps the largest suffix of user turns whose estimated token count stays
+// within keepBudget, and always keeps at least the most recent user turn (even
+// when that single turn alone exceeds the budget — we never split inside a
+// turn). Returns 0 when there aren't at least two user turns, or when nothing
+// older than the kept tail exists to fold.
+func safeSplitIndexByBudget(msgs []Message, keepBudget int) int {
+	var userTurns []int
+	for i, m := range msgs {
+		if IsPlainUserMessage(m) {
+			userTurns = append(userTurns, i)
+		}
+	}
+	if len(userTurns) <= 1 {
+		return 0 // need ≥2 user turns: one (or more) to fold, one to keep
+	}
+	// At minimum keep the most recent user turn; then walk older boundaries
+	// while the kept tail still fits the budget.
+	keptFrom := userTurns[len(userTurns)-1]
+	for k := len(userTurns) - 2; k >= 0; k-- {
+		if estimateMessages(msgs[userTurns[k]:]) > keepBudget {
+			break
+		}
+		keptFrom = userTurns[k]
+	}
+	return keptFrom
+}
+
+// countKeptUserTurns returns how many plain user turns sit at or after split —
+// i.e. how many recent turns compaction kept verbatim. For event stats only.
+func countKeptUserTurns(msgs []Message, split int) int {
+	n := 0
+	for i := split; i < len(msgs); i++ {
+		if IsPlainUserMessage(msgs[i]) {
+			n++
+		}
+	}
+	return n
+}
+
+// IsPlainUserMessage reports whether m is a real user turn: role user with no
+// tool_result blocks (tool results ride on synthetic user-role messages).
+// History may only be cut just before such a message — anywhere else splits an
+// assistant tool_use from the tool_result answering it. Compaction's split
+// point and the server's branch endpoint both enforce this invariant.
+func IsPlainUserMessage(m Message) bool {
+	return m.Role == RoleUser && !hasToolResult(m)
+}
+
+// IsSettledAssistantMessage reports whether m closes a turn: role assistant
+// with no tool_use block still awaiting a result. A history prefix ending at
+// such a message is a valid resume point — the same invariant IsPlainUserMessage
+// expresses from the other side of the cut, and what the server's branch
+// endpoint checks on the prefix it copies.
+func IsSettledAssistantMessage(m Message) bool {
+	return m.Role == RoleAssistant && !hasToolUse(m)
+}
+
+// hasToolResult reports whether m carries any tool_result block (i.e. it's a
+// synthetic user message returning tool output, not a real user turn).
+func hasToolResult(m Message) bool {
+	for _, b := range m.Blocks {
+		if b.Type == "tool_result" {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldCompactMidTurn reports whether compaction should run at one of the
+// turn's interior boundaries: before a provider call (where the previous
+// batch's results and any injected steer have landed) or before dispatching a
+// tool batch (where the reply just told us what the prompt really cost). Both
+// are points where history ends on a complete message.
+//
+// It uses the one and only compaction trigger (compactTriggerTokens) — the same
+// point between-turns compaction fires — so a single threshold governs the whole
+// session and context can't quietly climb past it mid-turn and sit there.
+func (a *Agent) shouldCompactMidTurn() bool {
+	trigger := a.compactTriggerTokens()
+	if trigger <= 0 {
+		return false
+	}
+	return a.historyTokens(a.History.Snapshot()) > trigger
+}
+
+// ── Token estimation (fast heuristic) ──────────────────────────────────────
+
+// estimateMessages returns a fast heuristic token count for a message slice.
+// Used for overflow protection before compression calls.
+func estimateMessages(msgs []Message) int {
+	total := 0
+	for _, m := range msgs {
+		total += estimateMessage(m)
+	}
+	return total
+}
+
+// estimateMessage counts tokens for a single message.
+// Heuristic: ~4 chars/token for ASCII/code, ~1.5 chars/token for CJK.
+func estimateMessage(m Message) int {
+	tokens := 4 // role overhead
+	tokens += estimateText(m.Content)
+	for _, b := range m.Blocks {
+		switch b.Type {
+		case "text":
+			tokens += estimateText(b.Text)
+		case "tool_use":
+			tokens += estimateText(b.Name)
+			tokens += estimateMap(b.Input)
+		case "tool_result":
+			tokens += estimateText(b.Result)
+		case "thinking":
+			tokens += estimateText(b.Thinking)
+		}
+	}
+	return tokens
+}
+
+func estimateText(s string) int {
+	if s == "" {
+		return 0
+	}
+	asciiCount := 0
+	multiCount := 0
+	for _, r := range s {
+		if r < 128 {
+			asciiCount++
+		} else {
+			multiCount += utf8.RuneLen(r)
+		}
+	}
+	return (asciiCount / 4) + int(float64(multiCount)/1.5+0.5)
+}
+
+func estimateMap(m map[string]any) int {
+	if len(m) == 0 {
+		return 0
+	}
+	var b strings.Builder
+	for k, v := range m {
+		b.WriteString(k)
+		b.WriteString(":")
+		b.WriteString(fmt.Sprintf("%v", v))
+		b.WriteString(",")
+	}
+	return estimateText(b.String())
+}

@@ -1,0 +1,1881 @@
+package agent
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/datahome"
+)
+
+// Session is a named conversation that persists to disk as a JSONL transcript
+// (one record per line) under ~/.octo/sessions/<id>.jsonl. The first line is a
+// meta record; each subsequent line is one message. This lets a turn be saved
+// by APPENDING only its new messages rather than rewriting the whole file —
+// the per-turn cost is O(new messages), not O(total history).
+//
+// "Last updated" is taken from the file's mtime rather than a stored field, so
+// the append path never has to rewrite an earlier line.
+type Session struct {
+	ID        string    `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	Model     string    `json:"model"`
+	System    string    `json:"system,omitempty"`
+	// ComposedSystem/ComposedLeanSystem are the fully-composed system prompt
+	// (base + env + skills + mcp + memory + profile/user/project + System),
+	// frozen by SetComposedSystem the first time a turn builds this session
+	// and reused by every later turn — see SetComposedSystem's doc comment
+	// for why. Empty for a session that hasn't taken its first turn yet, and
+	// for every session predating this field (it freezes on its next turn).
+	//
+	// ComposedForModel is the model the freeze was composed against. The MCP
+	// tools manifest baked into the prompt (see tools.MCPManifestFor) depends
+	// on the model's context window — the same MCP tool set can render a
+	// manifest under a small-window model but not a large one, or vice versa.
+	// A mid-session model switch (session.SetModelConfig, IM's /model) would
+	// silently strand the frozen prompt's manifest out of sync with the
+	// per-turn tools array (which is always computed fresh for the current
+	// model — see registry.go's defaultToolsFor), so SetComposedSystem
+	// re-freezes instead of no-op-ing when the model at call time differs
+	// from this field.
+	//
+	// ComposedForCWD is the same idea for the other input that can change
+	// under a live session: the working directory is baked into the prompt's
+	// env context ("- Working directory: …"), so retargeting a session's
+	// directory — or moving it into a project with a different one — must
+	// re-freeze or the model keeps reading a path its tools no longer run in.
+	// Empty for sessions frozen before the field existed, which simply
+	// re-freezes them once on their next turn.
+	//
+	// ComposedForSourceDirs is the third such input: a hash of the owning
+	// project's mounted source folders (and output-dir marker), which the env
+	// context bakes into the prompt. Mounting or unmounting a folder must
+	// re-freeze on the next turn. Empty for task sessions (no project) AND for
+	// sessions written before the field existed — deliberately the same value,
+	// so pre-existing sessions do not re-freeze once for nothing.
+	ComposedSystem        string `json:"composed_system,omitempty"`
+	ComposedLeanSystem    string `json:"composed_lean_system,omitempty"`
+	ComposedForModel      string `json:"composed_for_model,omitempty"`
+	ComposedForCWD        string `json:"composed_for_cwd,omitempty"`
+	ComposedForSourceDirs string `json:"composed_for_source_dirs,omitempty"`
+	Title                 string `json:"title,omitempty"`
+	Source                string `json:"source,omitempty"` // how the session was created: "" (manual) | "cron" | "channel" | "setup"
+	// AgentID is the ID of the agent profile (agentprofile.Profile) that owns
+	// this session. Empty means the default agent — also the value for every
+	// session predating multi-agent, so legacy files need no migration.
+	AgentID string `json:"agent_id,omitempty"`
+	// ModelConfig is the model string of the config entry this session is bound
+	// to. Empty means "the default entry at turn time" — also the value for
+	// every session predating per-session model binding. (Sessions written
+	// before models were keyed by model may carry a legacy entry name here; it
+	// simply fails to match and falls back to the default sender.)
+	ModelConfig string `json:"model_config,omitempty"`
+	// WorkingDir is the session's own working directory: the cwd its tools run
+	// in, the root its project hooks/skills are discovered from, and the path
+	// shown in its env context. Empty means "the server's launch directory at
+	// turn time" — also the value for every session predating per-session
+	// working dirs. Set via the Web UI's PATCH …/working_dir and persisted so a
+	// resumed session lands back in the same place.
+	WorkingDir string `json:"working_dir,omitempty"`
+	// PermissionMode is this session's own permission mode ("interactive" |
+	// "auto" | "strict"), snapshotted from the global default at creation
+	// time and independent of it afterward — changing the global default
+	// (Settings → default model) only seeds NEW sessions; changing a
+	// session's own mode (the Web UI's composer toggle) never touches the
+	// global default or other sessions. Empty means "the global default at
+	// turn time" — also the value for every session predating per-session
+	// modes. Set via the Web UI's PATCH …/permission_mode and persisted so a
+	// resumed session keeps the mode it was left in.
+	PermissionMode string `json:"permission_mode,omitempty"`
+	// ReasoningEffort is this session's own reasoning intensity ("low" |
+	// "medium" | "high" | "xhigh" | "max"; empty means off). Snapshotted from
+	// the owning project's saved value (or the global config when the session
+	// belongs to no project) at creation time, and persisted so reopening the
+	// session restores the level it was left on instead of falling back to
+	// the current global default. Empty is also the value for every session
+	// predating this field, which keeps resolving against the global config.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// LastContextTokens is the real input-token count of the most recent model
+	// request in this session — how full the context window was as of the last
+	// turn. Persisted so an idle or resumed session (no live Agent in memory)
+	// reports its true context usage instead of a transcript estimate that omits
+	// the system-prompt/tools overhead. 0 for sessions predating this field or
+	// that never completed a turn with a real token count. Updated once per turn
+	// via SetLastContextTokens.
+	LastContextTokens int `json:"last_context_tokens,omitempty"`
+	// ContentUpdatedAt is when the transcript itself last changed (a message
+	// appended, truncated, or rewritten) — deliberately distinct from the
+	// session file's OS mtime, which also moves on every binding/lease
+	// bookkeeping write (acquire/release around a turn, the idle-steer
+	// check that runs even when nothing is queued). Those churn the file
+	// seconds — or, per the post-turn cleanup, milliseconds — after the
+	// reply the client just marked "seen" against, which used to make the
+	// sidebar's unread watermark compare against a moving target that had
+	// nothing to do with new content. toSessionItem reports this instead of
+	// a raw file stat; Save only advances it when the message count actually
+	// changes. Zero for sessions predating this field until their next real
+	// content write — toSessionItem falls back to the file mtime then.
+	ContentUpdatedAt time.Time `json:"content_updated_at,omitempty"`
+	Messages         []Message `json:"messages"`
+
+	// Dir overrides the default ~/.octo/sessions location. Empty means use the
+	// default. Not serialized — it's a runtime override.
+	Dir string `json:"-"`
+
+	// persisted is how many messages are already on disk. Save appends
+	// Messages[persisted:]; it's not serialized.
+	persisted int
+
+	// forceRewrite is set when SyncFrom observes that the source History was
+	// rewritten (compaction, repair, popLast): the on-disk prefix may no
+	// longer match Messages, so the next Save must rewrite the whole file.
+	// Cleared by a successful rewriteAll. Not serialized. Also set, for
+	// unrelated reasons, by Bind/Unbind/MarkHookStarted and a dropped-tail
+	// load — none of those imply new content, which is why Save doesn't use
+	// this flag to decide whether to advance ContentUpdatedAt.
+	forceRewrite bool
+
+	// rewriteIsContent is set alongside forceRewrite specifically for the
+	// SyncFrom compaction/repair/popLast case above: a same-length history
+	// rewrite changes what the messages say without changing len(Messages),
+	// the signal Save otherwise uses to detect new content. Cleared with
+	// forceRewrite by a successful rewriteAll. Not serialized.
+	rewriteIsContent bool
+
+	// mu guards runtime binding state (BoundEntry, InFlight) and is not
+	// serialized. Session methods that mutate bound state are goroutine-safe;
+	// Messages remain the caller's responsibility to serialise per-turn.
+	mu sync.Mutex
+
+	// BoundEntry is the entry (cli | tui | web | api | channel | cron | setup)
+	// that currently owns the session. Empty means unbound. Persisted so a
+	// resumed session remembers where it was created / last used.
+	BoundEntry string `json:"bound_entry,omitempty"`
+
+	// BoundAt records when BoundEntry was last set, used for diagnostics when
+	// another entry tries to take over.
+	BoundAt time.Time `json:"bound_at,omitempty"`
+
+	// LeaseEntry/LeaseExpires implement a cross-process "in-flight" lock. A
+	// turn writes a short-lived lease before starting and clears it on finish;
+	// another process loading the session can see the lease and refuse to steal
+	// the binding while it is still valid. The lease is stored as an append-only
+	// "lease" record so it can be updated without rewriting the whole file.
+	LeaseEntry   string    `json:"-"`
+	LeaseExpires time.Time `json:"-"`
+
+	// InFlight counts active turns on this session within the current process.
+	// It is not persisted; use LeaseEntry/LeaseExpires for cross-process checks.
+	InFlight int `json:"-"`
+
+	// HookStarted records that the SessionStart hook has fired for this session.
+	// Persisted in the meta line and shared across all three transports, so a
+	// re-attach resumes (SessionStart source=resume) rather than starting over.
+	// Set via MarkHookStarted.
+	HookStarted bool `json:"hook_started,omitempty"`
+
+	// BranchedFrom records the session id this session was branched from.
+	// Empty means the session was created normally. Set via BranchFrom and
+	// persisted in the meta line so the UI can render a "branched from" label.
+	BranchedFrom string `json:"branched_from,omitempty"`
+
+	// Goal is the session's persistent objective (at most one). Guarded by mu —
+	// the turn goroutine accounts usage into it while user commands mutate it
+	// from other goroutines. Mutate only through the goal methods (goal.go);
+	// they keep the status invariants and persist via append-only "goal"
+	// records plus the meta header on rewrites.
+	Goal *Goal `json:"goal,omitempty"`
+
+	// goalWallClockAt is the baseline for wall-clock goal accounting: set when
+	// the goal (re)activates, advanced by exactly the seconds accounted. Zero
+	// while no goal is accruing time. Guarded by mu; not serialized — a
+	// resumed session restarts the clock so downtime is never billed.
+	goalWallClockAt time.Time
+
+	// Goal-continuation runtime (guarded by mu, not serialized; see
+	// GoalContinuation). goalContPending marks that a continuation prompt was
+	// handed out and its turn hasn't been audited yet; goalContTokensAt is
+	// the TokensUsed reading at hand-out, so the audit can tell whether that
+	// turn made any token progress. goalContSuppressed is the zero-progress
+	// guard: set when a continuation turn accounted nothing, cleared by real
+	// token progress or any goal mutation.
+	goalContPending    bool
+	goalContTokensAt   int64
+	goalContSuppressed bool
+
+	// goalBudgetSteer holds the rendered budget-limit steering prompt from
+	// the accounting tick that crossed the budget, until the agent loop
+	// consumes and injects it. At most one per goal activation — the crossing
+	// itself happens at most once.
+	goalBudgetSteer string
+
+	// goalObjectiveSteer holds the rendered objective-updated steering prompt
+	// staged by EditGoalObjective, until the agent loop consumes and injects
+	// it (same drain point as goalBudgetSteer). EditGoalObjective is called
+	// from outside the agent loop (web/IM/TUI), so the mutation and the
+	// in-flight turn that should see it run on different goroutines/objects;
+	// staging it here and draining it from the next accounting tick is what
+	// bridges that gap.
+	goalObjectiveSteer string
+
+	// goalSkipNextTokenDelta makes the next accounting tick bill zero tokens.
+	// Set when a goal is created mid-turn: the agent-side token baseline
+	// still points at the turn start, and billing the whole context input of
+	// the creating round to a seconds-old goal would instantly exhaust small
+	// budgets. Cleared unconsumed at the next turn start.
+	goalSkipNextTokenDelta bool
+}
+
+// Common entry names. Use these constants at call sites so typos are caught.
+const (
+	EntryCLI     = "cli"
+	EntryTUI     = "tui"
+	EntryWeb     = "web"
+	EntryAPI     = "api"
+	EntryChannel = "channel"
+	EntryCron    = "cron"
+	EntrySetup   = "setup"
+)
+
+// IsBound reports whether the session is bound to any entry.
+func (s *Session) IsBound() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.BoundEntry != ""
+}
+
+// BoundTo reports whether the session is currently bound to entry.
+func (s *Session) BoundTo(entry string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.BoundEntry == entry
+}
+
+// ErrSessionBoundToOther is returned when an entry tries to use a session
+// owned by another entry without permission to steal.
+var ErrSessionBoundToOther = fmt.Errorf("session is bound to another entry")
+
+// BindResult reports what happened in a Bind call.
+type BindResult int
+
+const (
+	// Bound indicates the session is now bound to the caller.
+	Bound BindResult = iota
+	// AlreadyBound indicates the caller already owns the binding.
+	AlreadyBound
+	// Stolen indicates the binding was taken from another entry.
+	Stolen
+	// Rejected indicates another entry owns the session and steal was false.
+	Rejected
+)
+
+// Bind binds the session to entry in memory. It does NOT persist the change;
+// callers must Save() before another process can see it. This makes the session
+// file the single source of truth for cross-process binding.
+func (s *Session) Bind(entry string, steal bool) (BindResult, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.BoundEntry == "" {
+		s.BoundEntry = entry
+		s.BoundAt = time.Now()
+		s.forceRewrite = true
+		return Bound, fmt.Sprintf("session bound to %s", entry), nil
+	}
+	if s.BoundEntry == entry {
+		s.BoundAt = time.Now()
+		s.forceRewrite = true
+		return AlreadyBound, fmt.Sprintf("session already bound to %s", entry), nil
+	}
+	if !steal {
+		return Rejected, "", fmt.Errorf("%w: bound to %s since %s; close it or request takeover", ErrSessionBoundToOther, s.BoundEntry, s.BoundAt.Format(time.RFC3339))
+	}
+	if holder, active := s.leaseActiveLocked(); active && holder != entry {
+		return Rejected, "", fmt.Errorf("%w: bound to %s and a turn lease is active until %s; cannot take over while busy", ErrSessionBoundToOther, s.BoundEntry, s.LeaseExpires.Format(time.RFC3339))
+	}
+	prev := s.BoundEntry
+	s.BoundEntry = entry
+	s.BoundAt = time.Now()
+	s.forceRewrite = true
+	return Stolen, fmt.Sprintf("session taken over from %s by %s", prev, entry), nil
+}
+
+// Unbind releases the session from entry in memory. No-op if not bound to entry.
+// Callers must Save() to publish the change.
+func (s *Session) Unbind(entry string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.BoundEntry != entry {
+		return false
+	}
+	s.BoundEntry = ""
+	s.BoundAt = time.Time{}
+	s.forceRewrite = true
+	return true
+}
+
+// TruncateTo keeps only the first n messages and forces the next Save to
+// rewrite the whole file (the on-disk prefix no longer matches). Mirrors
+// History.TruncateTo. Used by the edit-message flow, which rewrites a message
+// in place and drops everything after it.
+func (s *Session) TruncateTo(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n < len(s.Messages) {
+		s.Messages = s.Messages[:n]
+		s.forceRewrite = true
+	}
+}
+
+// IncFlight increments the in-flight turn count. Caller must already hold the
+// binding; the increment is a no-op if the session is unbound.
+func (s *Session) IncFlight() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.InFlight++
+}
+
+// DecFlight decrements the in-flight turn count, guarding against underflow.
+func (s *Session) DecFlight() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.InFlight > 0 {
+		s.InFlight--
+	}
+}
+
+// SetBoundEntry writes the binding fields directly. Used by persistent stores
+// after reloading the authoritative record from disk.
+func (s *Session) SetBoundEntry(entry string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.BoundEntry = entry
+	s.BoundAt = at
+}
+
+// leaseActiveLocked reports whether an unexpired lease is held by someone else
+// (or the caller). Caller must hold s.mu.
+func (s *Session) leaseActiveLocked() (string, bool) {
+	if s.LeaseEntry == "" || s.LeaseExpires.IsZero() {
+		return "", false
+	}
+	if time.Now().After(s.LeaseExpires) {
+		return "", false
+	}
+	return s.LeaseEntry, true
+}
+
+// LeaseActive reports whether the session has an unexpired turn lease and who
+// holds it.
+func (s *Session) LeaseActive() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.leaseActiveLocked()
+}
+
+// WriteLease appends a lease record claiming this session for entry until
+// expires. It does not change the in-memory BoundEntry. The lease is visible
+// to other processes on the next LoadSession.
+func (s *Session) WriteLease(entry string, expires time.Time) error {
+	if entry == "" {
+		return fmt.Errorf("lease entry cannot be empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendLeaseRecordLocked(entry, expires)
+}
+
+// ClearLease appends an empty lease record, clearing the cross-process
+// in-flight marker.
+func (s *Session) ClearLease() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendLeaseRecordLocked("", time.Time{})
+}
+
+// appendLeaseRecordLocked writes a lease record to the transcript. Caller must
+// hold s.mu.
+func (s *Session) appendLeaseRecordLocked(entry string, expires time.Time) error {
+	path, err := s.SavePath()
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	rec := sessionRecord{Type: "lease", LeaseEntry: entry, LeaseExpires: expires}
+	enc := json.NewEncoder(f)
+	if err := enc.Encode(rec); err != nil {
+		return err
+	}
+	s.LeaseEntry = entry
+	s.LeaseExpires = expires
+	return nil
+}
+
+// NewSession creates a Session with an ID derived from the current time plus
+// a random suffix: YYYYMMDD-HHMMSS-xxxxxxxx. The timestamp keeps IDs roughly
+// sortable and human-readable; the 32-bit suffix removes same-second
+// collisions (see B3).
+func NewSession(model, system string) *Session {
+	now := time.Now()
+	return &Session{
+		ID:        now.Format("20060102-150405") + "-" + randomSuffix(now),
+		CreatedAt: now,
+		Model:     model,
+		System:    system,
+		Title:     "*Octo Agent",
+	}
+}
+
+// randomSuffix returns 8 hex chars (32 bits) from crypto/rand, falling back to
+// the nanosecond fraction if the system RNG is unavailable.
+func randomSuffix(now time.Time) string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%08x", uint32(now.Nanosecond()))
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// BranchFrom creates a new session branched from s, copying its meta fields
+// (model, system prompt, working dir, permission mode) and the first count
+// messages (Messages[0:count]). The new session's BranchedFrom is set to s.ID
+// so the UI can render a lineage label. The caller is responsible for Save()ing
+// the returned session. count is clamped to [0, len(s.Messages)].
+func BranchFrom(s *Session, count int) *Session {
+	if count < 0 {
+		count = 0
+	}
+	if count > len(s.Messages) {
+		count = len(s.Messages)
+	}
+	branch := NewSession(s.Model, s.System)
+	branch.WorkingDir = s.WorkingDir
+	branch.PermissionMode = s.PermissionMode
+	branch.ReasoningEffort = s.ReasoningEffort
+	branch.ModelConfig = s.ModelConfig
+	branch.AgentID = s.AgentID
+	branch.BranchedFrom = s.ID
+	if count > 0 {
+		branch.Messages = make([]Message, count)
+		copy(branch.Messages, s.Messages[:count])
+	}
+	return branch
+}
+
+// TurnCount returns the number of complete user+assistant turn pairs.
+func (s *Session) TurnCount() int {
+	return len(s.Messages) / 2
+}
+
+// EffectiveAgentID returns the owning agent profile's ID: "default" for the
+// default agent and for every session predating the AgentID field (kept as a
+// literal here so the agent package stays free of an agentprofile import).
+func (s *Session) EffectiveAgentID() string {
+	if s.AgentID == "" {
+		return "default"
+	}
+	return s.AgentID
+}
+
+// UsedTools reports whether any assistant message in the session emitted
+// at least one tool_use block. Used by the chat resume path to decide
+// whether to auto-enable --tools — without that, a resumed session whose
+// history contains tool_use blocks would be sent to the model with no
+// tools array, and the model (seeing prior tool calls in the conversation
+// but unable to make new structured ones) falls back to emitting tool
+// calls as text. That looks like garbled XML to the user.
+func (s *Session) UsedTools() bool {
+	for _, m := range s.Messages {
+		for _, b := range m.Blocks {
+			if b.Type == "tool_use" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// EndsMidTurn reports whether the persisted transcript stops in the middle of
+// a turn: the last message is a user message still awaiting a reply (the
+// initiating input, a tool_result batch, or a mid-turn steer), or an
+// assistant tool_use whose results never landed. A turn that finished — or
+// was interrupted by the user — always ends on a plain assistant text message
+// (finishInterrupted guarantees this), so a mid-turn tail means the process
+// died with the turn in flight: crash, kill, power loss. Callers use it to
+// warn the model that tool side effects from that turn may be unrecorded.
+func (s *Session) EndsMidTurn() bool {
+	if len(s.Messages) == 0 {
+		return false
+	}
+	last := s.Messages[len(s.Messages)-1]
+	switch last.Role {
+	case RoleUser:
+		return true
+	case RoleAssistant:
+		for _, b := range last.Blocks {
+			if b.Type == "tool_use" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// SessionsDir returns (and creates if needed) the directory transcripts live
+// in. Exported for callers that need to observe the directory itself rather
+// than load what is in it — the server's store watch counts entries there to
+// notice sessions another process created, which loading them all would be a
+// wasteful way to learn.
+func SessionsDir() (string, error) { return sessionsDir() }
+
+// AgentEventsSuffix names the per-session sub-agent/workflow event sidecar the
+// server writes beside a transcript (<id>.agent-events.jsonl). It lives here
+// rather than in the server package because every scan of the sessions
+// directory has to tell the two apart: the sidecar ends in ".jsonl" too, so a
+// bare extension test lists it as a session of its own — one with no meta
+// record, hence no title, which surfaces as a ghost "*Octo Agent" row.
+const AgentEventsSuffix = ".agent-events.jsonl"
+
+// IsTranscriptName reports whether a sessions-directory entry is a session
+// transcript rather than a sidecar that merely shares the extension.
+func IsTranscriptName(name string) bool {
+	return strings.HasSuffix(name, ".jsonl") && !strings.HasSuffix(name, AgentEventsSuffix)
+}
+
+// sessionsDir returns (and creates if needed) ~/.octo/sessions.
+func sessionsDir() (string, error) {
+	dir, err := datahome.Path("sessions")
+	if err != nil {
+		return "", fmt.Errorf("session: home dir: %w", err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("session: mkdir %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+// SavePath returns the JSONL path where this session would be saved.
+func (s *Session) SavePath() (string, error) {
+	dir := s.Dir
+	if dir == "" {
+		var err error
+		dir, err = sessionsDir()
+		if err != nil {
+			return "", err
+		}
+	}
+	return filepath.Join(dir, s.ID+".jsonl"), nil
+}
+
+// ChunkDir returns the per-session directory where compaction archives the
+// verbatim originals of folded turns (chunk-NNN.md), so the model can recall
+// them with the read tool. Honors the Dir override like SavePath.
+func (s *Session) ChunkDir() (string, error) {
+	dir := s.Dir
+	if dir == "" {
+		var err error
+		dir, err = sessionsDir()
+		if err != nil {
+			return "", err
+		}
+	}
+	return filepath.Join(dir, s.ID+".chunks"), nil
+}
+
+// sessionRecord is one JSONL line. Type discriminates the meta header, a
+// message record, a title record, and a lease record. The title/lease are
+// appended on their own lines (rather than rewriting the meta header) so the
+// append-only path is preserved. LoadSession takes the last record of each
+// type as authoritative; rewriteAll folds them back into the meta header when
+// compacting.
+type sessionRecord struct {
+	Type                  string    `json:"type"` // "meta" | "message" | "title" | "model_config" | "agent_id" | "working_dir" | "permission_mode" | "reasoning_effort" | "context_tokens" | "content_updated_at" | "composed_system" | "lease" | "goal"
+	ID                    string    `json:"id,omitempty"`
+	CreatedAt             time.Time `json:"created_at,omitempty"`
+	Model                 string    `json:"model,omitempty"`
+	System                string    `json:"system,omitempty"`
+	ComposedSystem        string    `json:"composed_system,omitempty"`
+	ComposedLeanSystem    string    `json:"composed_lean_system,omitempty"`
+	ComposedForModel      string    `json:"composed_for_model,omitempty"`
+	ComposedForCWD        string    `json:"composed_for_cwd,omitempty"`
+	ComposedForSourceDirs string    `json:"composed_for_source_dirs,omitempty"`
+	Title                 string    `json:"title,omitempty"`
+	Source                string    `json:"source,omitempty"`
+	ModelConfig           string    `json:"model_config,omitempty"`
+	AgentID               string    `json:"agent_id,omitempty"`
+	WorkingDir            string    `json:"working_dir,omitempty"`
+	PermissionMode        string    `json:"permission_mode,omitempty"`
+	ReasoningEffort       string    `json:"reasoning_effort,omitempty"`
+	BoundEntry            string    `json:"bound_entry,omitempty"`
+	BoundAt               time.Time `json:"bound_at,omitempty"`
+	LeaseEntry            string    `json:"lease_entry,omitempty"`
+	LeaseExpires          time.Time `json:"lease_expires,omitempty"`
+	HookStarted           bool      `json:"hook_started,omitempty"`
+	BranchedFrom          string    `json:"branched_from,omitempty"`
+	LastContextTokens     int       `json:"last_context_tokens,omitempty"`
+	ContentUpdatedAt      time.Time `json:"content_updated_at,omitempty"`
+	Message               *Message  `json:"message,omitempty"`
+	Goal                  *Goal     `json:"goal,omitempty"`
+}
+
+func (s *Session) metaRecord() sessionRecord {
+	// Snapshot the goal under mu: unlike the other meta fields (turn-goroutine
+	// serialized), *s.Goal is mutated in place by accounting while user
+	// commands may trigger a rewrite from another goroutine. Callers must not
+	// hold mu (only rewriteAll calls this, and never under the lock).
+	s.mu.Lock()
+	var goal *Goal
+	if s.Goal != nil {
+		g := *s.Goal
+		goal = &g
+	}
+	s.mu.Unlock()
+	return sessionRecord{Type: "meta", ID: s.ID, CreatedAt: s.CreatedAt, Model: s.Model, System: s.System, ComposedSystem: s.ComposedSystem, ComposedLeanSystem: s.ComposedLeanSystem, ComposedForModel: s.ComposedForModel, ComposedForCWD: s.ComposedForCWD, ComposedForSourceDirs: s.ComposedForSourceDirs, Title: s.Title, Source: s.Source, ModelConfig: s.ModelConfig, AgentID: s.AgentID, WorkingDir: s.WorkingDir, PermissionMode: s.PermissionMode, ReasoningEffort: s.ReasoningEffort, LastContextTokens: s.LastContextTokens, ContentUpdatedAt: s.ContentUpdatedAt, BoundEntry: s.BoundEntry, BoundAt: s.BoundAt, HookStarted: s.HookStarted, BranchedFrom: s.BranchedFrom, Goal: goal}
+}
+
+// MarkHookStarted records that SessionStart has fired for this session, so a
+// later attach (new process, or a resumed session) resumes rather than starting
+// over. The flag lives in the meta line, so it forces the next Save to rewrite
+// the file — a one-time O(n) cost per session. Idempotent; safe to call every
+// turn. Persistence rides the session layer's existing post-turn Save.
+func (s *Session) MarkHookStarted() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.HookStarted {
+		return
+	}
+	s.HookStarted = true
+	s.forceRewrite = true
+}
+
+func messageRecord(m Message) sessionRecord {
+	mm := m
+	return sessionRecord{Type: "message", Message: &mm}
+}
+
+// Save persists the session. The common case appends only the messages added
+// since the last Save. The file is rewritten from scratch (an infrequent O(n)
+// event) when the on-disk prefix can't be trusted: a history rewrite observed
+// by SyncFrom (forceRewrite), or an in-memory list shorter than what's on disk
+// — the length check is kept as a belt-and-braces fallback for callers that
+// assign Messages directly instead of going through SyncFrom. With no new
+// messages and a trusted prefix, Save is a no-op, so per-event callers (the
+// server persists mid-turn progress on every agent event) don't touch the
+// file at all between rounds.
+func (s *Session) Save() error {
+	// Whether the message list itself is changing — as opposed to a rewrite
+	// forced by binding/lease/meta bookkeeping (Bind/Unbind, MarkHookStarted,
+	// SetWorkingDir, ...) on an otherwise-unchanged transcript. rewriteIsContent
+	// covers the one case a length check alone can't see: a same-length
+	// compaction/repair rewrite from SyncFrom. Only a real content change
+	// advances ContentUpdatedAt; see its doc comment.
+	contentChanged := len(s.Messages) != s.persisted || s.rewriteIsContent
+	if s.forceRewrite || s.persisted == 0 || len(s.Messages) < s.persisted {
+		if contentChanged {
+			s.stampContentUpdated()
+		}
+		return s.rewriteAll()
+	}
+	if len(s.Messages) == s.persisted {
+		return nil
+	}
+	s.stampContentUpdated()
+	return s.appendDelta()
+}
+
+// stampContentUpdated moves ContentUpdatedAt to now, but never to an instant an
+// earlier save already used.
+//
+// The field answers "has the transcript changed since I last looked", so two
+// saves must never carry the same instant. time.Now() does not guarantee that:
+// its resolution is the platform's, and on Windows it is coarse enough (tens of
+// milliseconds) that two saves within one turn read the same one — which is how
+// TestContentUpdatedAt_AdvancesOnRealContent came to flake there.
+//
+// Round(0) strips the monotonic reading so the comparison runs against the wall
+// clock, which is the value actually persisted and read back. Without it two
+// stamps taken in one process compare monotonically, and a wall clock stepped
+// backwards (NTP, a VM resuming) would still write a stamp smaller than the
+// save before it.
+//
+// A nanosecond is enough for Go's own ordering. It is deliberately not enough
+// to be visible in the web UI, which parses these through Date.parse and sees
+// milliseconds — the compensation exists to keep the invariant true in here,
+// not to move anything on screen.
+func (s *Session) stampContentUpdated() {
+	now := time.Now().Round(0)
+	if !now.After(s.ContentUpdatedAt) {
+		now = s.ContentUpdatedAt.Add(time.Nanosecond)
+	}
+	s.ContentUpdatedAt = now
+}
+
+// rewriteAll truncates the file and writes the meta record followed by every
+// message. Used for the first save and after a history rewrite (compaction).
+func (s *Session) rewriteAll() error {
+	path, err := s.SavePath()
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("session: open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	enc := json.NewEncoder(w)
+	if err := enc.Encode(s.metaRecord()); err != nil {
+		return fmt.Errorf("session: write meta: %w", err)
+	}
+	for _, m := range s.Messages {
+		if err := enc.Encode(messageRecord(m)); err != nil {
+			return fmt.Errorf("session: write message: %w", err)
+		}
+	}
+	// A turn lease lives only as an append-only "lease" record; truncating the
+	// file here would erase it (widening the cross-process binding-steal window
+	// mid-turn — e.g. when the first-turn MarkHookStarted forces this rewrite).
+	// Re-emit an active lease after the meta+messages so it survives the rewrite.
+	s.mu.Lock()
+	leaseEntry, leaseExpires := s.LeaseEntry, s.LeaseExpires
+	s.mu.Unlock()
+	if leaseEntry != "" && !leaseExpires.IsZero() && time.Now().Before(leaseExpires) {
+		if err := enc.Encode(sessionRecord{Type: "lease", LeaseEntry: leaseEntry, LeaseExpires: leaseExpires}); err != nil {
+			return fmt.Errorf("session: write lease: %w", err)
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("session: flush %s: %w", path, err)
+	}
+	s.persisted = len(s.Messages)
+	s.forceRewrite = false
+	s.rewriteIsContent = false
+	return nil
+}
+
+// appendDelta appends only the messages added since the last save.
+func (s *Session) appendDelta() error {
+	path, err := s.SavePath()
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("session: open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	enc := json.NewEncoder(w)
+	for _, m := range s.Messages[s.persisted:] {
+		if err := enc.Encode(messageRecord(m)); err != nil {
+			return fmt.Errorf("session: append message: %w", err)
+		}
+	}
+	// appendDelta never rewrites the meta line, so ContentUpdatedAt (set by
+	// Save just before this call) needs its own append-only record — the
+	// same "last one wins" pattern as title/lease/context_tokens — or a
+	// reload between now and this session's next full rewriteAll (the
+	// binding acquire/release around every turn does exactly that) would see
+	// a stale or zero value and reintroduce the phantom-unread-dot bug this
+	// field exists to fix.
+	if err := enc.Encode(sessionRecord{Type: "content_updated_at", ContentUpdatedAt: s.ContentUpdatedAt}); err != nil {
+		return fmt.Errorf("session: append content_updated_at: %w", err)
+	}
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("session: flush %s: %w", path, err)
+	}
+	s.persisted = len(s.Messages)
+	return nil
+}
+
+// SetTitle records a short human-readable title for the session. It updates the
+// in-memory field and, if the transcript already exists on disk, appends a title
+// record so the title survives without rewriting the file. A fresh session whose
+// file isn't written yet just carries the title until the first Save folds it
+// into the meta header. Calling with an empty or unchanged title is a no-op.
+func (s *Session) SetTitle(title string) error {
+	title = strings.TrimSpace(title)
+	if title == "" || title == s.Title {
+		return nil
+	}
+	s.Title = title
+	if s.persisted == 0 {
+		// Nothing on disk yet; the next Save writes the title via metaRecord.
+		return nil
+	}
+	if s.forceRewrite {
+		// The file ends in an incomplete tail (crash mid-append) or its prefix
+		// is stale (history rewrite): a raw append would corrupt it. Rewrite
+		// instead — rewriteAll folds the title into the meta header.
+		return s.rewriteAll()
+	}
+	path, err := s.SavePath()
+	if err != nil {
+		return err
+	}
+	// No O_CREATE: persisted > 0 means the transcript should already exist.
+	// If it doesn't (session deleted meanwhile, or the path resolves
+	// differently than when it was saved — e.g. an async title goroutine
+	// outliving a test's HOME override), creating a file holding nothing but
+	// a title record would leave an orphan "session" in list views. Fail
+	// instead; a later turn retries title generation.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("session: open %s: %w", path, err)
+	}
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(sessionRecord{Type: "title", Title: title}); err != nil {
+		return fmt.Errorf("session: append title: %w", err)
+	}
+	return nil
+}
+
+// SetModelConfig binds the session to a config entry, identified by its model
+// string (empty = the default entry at turn time), and records that model so
+// the session displays and resumes on the right model. Like SetTitle, it
+// appends a record when the transcript is already on disk so the binding
+// survives without rewriting the file; a switch to the values already in place
+// is a no-op.
+func (s *Session) SetModelConfig(name, model string) error {
+	if name == s.ModelConfig && (model == "" || model == s.Model) {
+		return nil
+	}
+	s.ModelConfig = name
+	if model != "" {
+		s.Model = model
+	}
+	if s.persisted == 0 {
+		// persisted == 0 means no MESSAGES on disk, not no file: a fresh
+		// session saved before its first turn is a meta-only transcript, and
+		// a load-modify-discard caller (the model-switch handler) would lose
+		// the binding if we waited for "the next Save" on an object about to
+		// be thrown away. Rewrite the existing file; a session with no file
+		// yet just carries the binding until its first Save.
+		if path, perr := s.SavePath(); perr == nil {
+			if _, statErr := os.Stat(path); statErr == nil {
+				return s.rewriteAll()
+			}
+		}
+		return nil
+	}
+	if s.forceRewrite {
+		// Stale or truncated on-disk prefix — fold into a full rewrite, same
+		// reasoning as SetTitle.
+		return s.rewriteAll()
+	}
+	path, err := s.SavePath()
+	if err != nil {
+		return err
+	}
+	// No O_CREATE — see SetTitle: never materialise an orphan transcript.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("session: open %s: %w", path, err)
+	}
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(sessionRecord{Type: "model_config", ModelConfig: name, Model: s.Model}); err != nil {
+		return fmt.Errorf("session: append model_config: %w", err)
+	}
+	return nil
+}
+
+// SetWorkingDir records the session's working directory. Same persistence
+// mechanics as SetModelConfig: append a record when the transcript is already
+// on disk so the change survives without rewriting the file, rewrite when the
+// on-disk prefix is stale, and carry the value in memory for a not-yet-saved
+// session until its first Save folds it into the meta header. Setting the dir
+// already in place is a no-op.
+func (s *Session) SetWorkingDir(dir string) error {
+	if dir == s.WorkingDir {
+		return nil
+	}
+	s.WorkingDir = dir
+	if s.persisted == 0 {
+		// See SetModelConfig: a meta-only transcript must be rewritten now, since
+		// the load-modify-discard handler won't get a "next Save"; a session with
+		// no file yet just carries the value until its first Save.
+		if path, perr := s.SavePath(); perr == nil {
+			if _, statErr := os.Stat(path); statErr == nil {
+				return s.rewriteAll()
+			}
+		}
+		return nil
+	}
+	if s.forceRewrite {
+		return s.rewriteAll()
+	}
+	path, err := s.SavePath()
+	if err != nil {
+		return err
+	}
+	// No O_CREATE — see SetTitle: never materialise an orphan transcript.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("session: open %s: %w", path, err)
+	}
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(sessionRecord{Type: "working_dir", WorkingDir: dir}); err != nil {
+		return fmt.Errorf("session: append working_dir: %w", err)
+	}
+	return nil
+}
+
+// SetAgentID rebinds the session to a different agent profile. Only called
+// while the session still has zero turns (enforced by the caller, the
+// agent_profile PATCH handler) — AgentID is otherwise fixed for the life of
+// the session once a turn has run against it. Same persistence mechanics as
+// SetWorkingDir: append a record when the transcript is already on disk so
+// the change survives without rewriting the file, rewrite when the on-disk
+// prefix is stale, and carry the value in memory for a not-yet-saved session
+// until its first Save folds it into the meta header. Setting the id already
+// in place is a no-op.
+func (s *Session) SetAgentID(id string) error {
+	if id == s.AgentID {
+		return nil
+	}
+	s.AgentID = id
+	if s.persisted == 0 {
+		// See SetWorkingDir: a meta-only transcript must be rewritten now, since
+		// the load-modify-discard handler won't get a "next Save"; a session with
+		// no file yet just carries the value until its first Save.
+		if path, perr := s.SavePath(); perr == nil {
+			if _, statErr := os.Stat(path); statErr == nil {
+				return s.rewriteAll()
+			}
+		}
+		return nil
+	}
+	if s.forceRewrite {
+		return s.rewriteAll()
+	}
+	path, err := s.SavePath()
+	if err != nil {
+		return err
+	}
+	// No O_CREATE — see SetTitle: never materialise an orphan transcript.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("session: open %s: %w", path, err)
+	}
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(sessionRecord{Type: "agent_id", AgentID: id}); err != nil {
+		return fmt.Errorf("session: append agent_id: %w", err)
+	}
+	return nil
+}
+
+// SetPermissionMode records the session's own permission mode. Same
+// persistence mechanics as SetWorkingDir: append a record when the
+// transcript is already on disk so the change survives without rewriting
+// the file, rewrite when the on-disk prefix is stale, and carry the value
+// in memory for a not-yet-saved session until its first Save folds it into
+// the meta header. Setting the mode already in place is a no-op.
+func (s *Session) SetPermissionMode(mode string) error {
+	if mode == s.PermissionMode {
+		return nil
+	}
+	s.PermissionMode = mode
+	if s.persisted == 0 {
+		// See SetWorkingDir: a meta-only transcript must be rewritten now, since
+		// the load-modify-discard handler won't get a "next Save"; a session with
+		// no file yet just carries the value until its first Save.
+		if path, perr := s.SavePath(); perr == nil {
+			if _, statErr := os.Stat(path); statErr == nil {
+				return s.rewriteAll()
+			}
+		}
+		return nil
+	}
+	if s.forceRewrite {
+		return s.rewriteAll()
+	}
+	path, err := s.SavePath()
+	if err != nil {
+		return err
+	}
+	// No O_CREATE — see SetTitle: never materialise an orphan transcript.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("session: open %s: %w", path, err)
+	}
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(sessionRecord{Type: "permission_mode", PermissionMode: mode}); err != nil {
+		return fmt.Errorf("session: append permission_mode: %w", err)
+	}
+	return nil
+}
+
+// SetReasoningEffort records the session's own reasoning intensity. Same
+// append-or-rewrite persistence mechanics as SetPermissionMode — the level is
+// read back by sessionStatusFields when the session is reopened, so it has to
+// reach the transcript even when no message follows.
+func (s *Session) SetReasoningEffort(effort string) error {
+	if effort == s.ReasoningEffort {
+		return nil
+	}
+	s.ReasoningEffort = effort
+	if s.persisted == 0 {
+		// See SetWorkingDir: a meta-only transcript must be rewritten now, since
+		// the load-modify-discard handler won't get a "next Save"; a session with
+		// no file yet just carries the value until its first Save.
+		if path, perr := s.SavePath(); perr == nil {
+			if _, statErr := os.Stat(path); statErr == nil {
+				return s.rewriteAll()
+			}
+		}
+		return nil
+	}
+	if s.forceRewrite {
+		return s.rewriteAll()
+	}
+	path, err := s.SavePath()
+	if err != nil {
+		return err
+	}
+	// No O_CREATE — see SetTitle: never materialise an orphan transcript.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("session: open %s: %w", path, err)
+	}
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(sessionRecord{Type: "reasoning_effort", ReasoningEffort: effort}); err != nil {
+		return fmt.Errorf("session: append reasoning_effort: %w", err)
+	}
+	return nil
+}
+
+// SetComposedSystem freezes the fully-composed system prompt (base + env +
+// skills + mcp + memory + profile/user/project + System) the first time a
+// turn builds this session, so every later turn reuses the identical string
+// instead of recomposing it from layers that can legitimately change mid-
+// session — the live memory file an agent's own tools just wrote, a skill
+// toggle, a profile edit. Recomposing on any of those would vary the text and
+// invalidate the provider's prompt-cache prefix on that turn (and every turn
+// after, since the changed layer stays changed). This mirrors the CLI/TUI,
+// which compose once per process and never touch System again: a skill or
+// profile edit now takes effect in a new session, not a running one.
+//
+// model and cwd are the freeze's identity — see ComposedForModel and
+// ComposedForCWD for why each matters. A no-op only when already frozen for
+// THIS exact pair; a call with either different (a mid-session model switch, a
+// retargeted working directory) overwrites the freeze instead, since both are
+// baked into the prompt while the per-turn tools array and tool cwd are always
+// computed fresh — a stale freeze would silently drift out of sync with them.
+// Same append-or-rewrite persistence mechanics as SetPermissionMode.
+func (s *Session) SetComposedSystem(system, lean, model, cwd, sourceDirs string) error {
+	if s.IsComposedFor(model, cwd, sourceDirs) {
+		return nil
+	}
+	s.ComposedSystem, s.ComposedLeanSystem, s.ComposedForModel = system, lean, model
+	s.ComposedForCWD, s.ComposedForSourceDirs = cwd, sourceDirs
+	if s.persisted == 0 {
+		// See SetWorkingDir: a meta-only transcript must be rewritten now, since
+		// the load-modify-discard handler won't get a "next Save"; a session with
+		// no file yet just carries the value until its first Save.
+		if path, perr := s.SavePath(); perr == nil {
+			if _, statErr := os.Stat(path); statErr == nil {
+				return s.rewriteAll()
+			}
+		}
+		return nil
+	}
+	if s.forceRewrite {
+		return s.rewriteAll()
+	}
+	path, err := s.SavePath()
+	if err != nil {
+		return err
+	}
+	// No O_CREATE — see SetTitle: never materialise an orphan transcript.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("session: open %s: %w", path, err)
+	}
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(sessionRecord{Type: "composed_system", ComposedSystem: system, ComposedLeanSystem: lean, ComposedForModel: model, ComposedForCWD: cwd, ComposedForSourceDirs: sourceDirs}); err != nil {
+		return fmt.Errorf("session: append composed_system: %w", err)
+	}
+	return nil
+}
+
+// IsComposedFor reports whether the session's system prompt is already frozen
+// for this model / working directory pair — the condition SetComposedSystem
+// itself uses to decide overwrite-vs-no-op, exposed so callers (buildAgent,
+// runChannelTurns) can skip the memory/skills/MCP recompute entirely when the
+// freeze would just be reused rather than replaced.
+func (s *Session) IsComposedFor(model, cwd, sourceDirs string) bool {
+	return s.ComposedSystem != "" &&
+		s.ComposedForModel == model &&
+		s.ComposedForCWD == cwd &&
+		s.ComposedForSourceDirs == sourceDirs
+}
+
+// ClearComposedSystem un-freezes the composed system prompt so the next turn
+// that builds this session (buildAgent / runChannelTurns) recomposes it from
+// the live layers — e.g. after a skill install/toggle the user wants this
+// session to pick up without starting a new one. Backs the /reload command.
+// Unlike SetComposedSystem this is NOT a no-op when already set: it exists
+// specifically to undo a previous freeze. Same append-or-rewrite persistence
+// mechanics; the appended record's omitted (empty) fields mean "not frozen"
+// on replay, same as a session that has never taken a turn.
+func (s *Session) ClearComposedSystem() error {
+	if s.ComposedSystem == "" && s.ComposedLeanSystem == "" {
+		return nil
+	}
+	s.ComposedSystem, s.ComposedLeanSystem, s.ComposedForModel = "", "", ""
+	s.ComposedForCWD, s.ComposedForSourceDirs = "", ""
+	if s.persisted == 0 {
+		if path, perr := s.SavePath(); perr == nil {
+			if _, statErr := os.Stat(path); statErr == nil {
+				return s.rewriteAll()
+			}
+		}
+		return nil
+	}
+	if s.forceRewrite {
+		return s.rewriteAll()
+	}
+	path, err := s.SavePath()
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("session: open %s: %w", path, err)
+	}
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(sessionRecord{Type: "composed_system"}); err != nil {
+		return fmt.Errorf("session: append composed_system(clear): %w", err)
+	}
+	return nil
+}
+
+// SetLastContextTokens records the context-window fill (real input-token count)
+// as of the just-finished turn, so an idle/resumed session reports its true
+// usage without a live Agent. Same append-or-rewrite persistence mechanics as
+// SetPermissionMode; called once per turn, so an unchanged count is a no-op
+// (avoids a redundant append when the context didn't grow).
+func (s *Session) SetLastContextTokens(n int) error {
+	if n <= 0 || n == s.LastContextTokens {
+		return nil
+	}
+	s.LastContextTokens = n
+	if s.persisted == 0 {
+		// See SetPermissionMode: a meta-only transcript must be rewritten now; a
+		// session with no file yet just carries the value until its first Save.
+		if path, perr := s.SavePath(); perr == nil {
+			if _, statErr := os.Stat(path); statErr == nil {
+				return s.rewriteAll()
+			}
+		}
+		return nil
+	}
+	if s.forceRewrite {
+		return s.rewriteAll()
+	}
+	path, err := s.SavePath()
+	if err != nil {
+		return err
+	}
+	// No O_CREATE — see SetTitle: never materialise an orphan transcript.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("session: open %s: %w", path, err)
+	}
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(sessionRecord{Type: "context_tokens", LastContextTokens: n}); err != nil {
+		return fmt.Errorf("session: append context_tokens: %w", err)
+	}
+	return nil
+}
+
+// DisplayTitle returns the label shown for the session in list views: the
+// generated Title when present, otherwise a snippet of the first user message
+// (so pre-title sessions and not-yet-titled ones are still recognisable), and
+// finally "*Octo Agent" when there's nothing to show.
+func (s *Session) DisplayTitle() string {
+	if t := strings.TrimSpace(s.Title); t != "" && t != "*Octo Agent" {
+		return t
+	}
+	if snippet := FirstUserSnippet(s.Messages); snippet != "" {
+		return snippet
+	}
+	return "*Octo Agent"
+}
+
+// FallbackTitleIfPlaceholder replaces the "*Octo Agent" placeholder with the
+// first-message snippet when available. Returns the new title, or "" when
+// the title isn't the placeholder or there's no message content to use.
+// Both the TUI and the web server call this when async title generation fails.
+func (s *Session) FallbackTitleIfPlaceholder() string {
+	if s.Title != "*Octo Agent" {
+		return ""
+	}
+	if snippet := FirstUserSnippet(s.Messages); snippet != "" {
+		_ = s.SetTitle(snippet)
+		return snippet
+	}
+	return ""
+}
+
+// firstUserText returns the stripped full text of the first user message in
+// msgs that carries any text (skipping injected <system-reminder> blocks and
+// tool-result turns), or "" when none does. Title generation sends this —
+// and only this — to the model.
+func firstUserText(msgs []Message) string {
+	for _, m := range msgs {
+		if m.Role != RoleUser {
+			continue
+		}
+		text := m.Content
+		if text == "" {
+			for _, b := range m.Blocks {
+				if b.Type == "text" {
+					text = b.Text
+					break
+				}
+			}
+		}
+		if text = strings.TrimSpace(StripSystemReminders(text)); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+// sessionPlaceholderRe matches the web frontend's auto-assigned "Session N"
+// default name on freshly created web sessions.
+var sessionPlaceholderRe = regexp.MustCompile(`^Session \d+$`)
+
+// IsAutoNamePlaceholder reports whether a session title is absent or still an
+// auto-assigned placeholder — "*Octo Agent" (agent.NewSession's default) or
+// the frontend's "Session N" — both get replaced by a generated title after
+// the first completed turn. A name the user typed themselves is kept. This is
+// THE placeholder predicate: the generation gate, the turn-end adoption, and
+// every list overlay must agree on it or a title is generated but never
+// adopted (or vice versa).
+func IsAutoNamePlaceholder(title string) bool {
+	t := strings.TrimSpace(title)
+	return t == "" || t == "*Octo Agent" || sessionPlaceholderRe.MatchString(t)
+}
+
+// snippetBudget caps a one-line preview in half-width columns: wide (CJK)
+// runes count 2, others 1. 50 columns is 25 full-width characters or roughly
+// eight English words — display width is the one ruler that makes Chinese,
+// English, and mixed text land at the same visual length in the sidebar.
+const snippetBudget = 50
+
+// FirstUserSnippet extracts a one-line preview from the first user message,
+// skipping injected <system-reminder> blocks and tool-result turns, and
+// truncating to a list-friendly width.
+func FirstUserSnippet(msgs []Message) string {
+	// Collapse to the first non-empty line.
+	for _, line := range strings.Split(firstUserText(msgs), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		return truncateSnippet(line)
+	}
+	return ""
+}
+
+// truncateSnippet shortens a one-line preview to snippetBudget half-width
+// columns. A cut landing inside a Latin word backs off to the word's start
+// so English never breaks mid-word; an unbroken overlong token (a URL or
+// path) hard-cuts at the budget instead of snapping away to nothing. The
+// ellipsis is added only when content was actually dropped.
+func truncateSnippet(s string) string {
+	width := 0
+	for i, r := range s {
+		w := 1
+		if isWideRune(r) {
+			w = 2
+		}
+		if width+w > snippetBudget {
+			return cutSnippet(s, i)
+		}
+		width += w
+	}
+	return s
+}
+
+// cutSnippet renders the cut for truncateSnippet: kept is s[:cut] snapped
+// back to a word boundary when the cut splits a Latin word, plus an ellipsis.
+func cutSnippet(s string, cut int) string {
+	kept := s[:cut]
+	if isWordByte(s[cut]) && cut > 0 && isWordByte(s[cut-1]) {
+		// Mid-word cut: back off to just after the last non-word byte, i.e.
+		// the start of the word being split. No such byte means the whole
+		// prefix is one unbroken token — keep the hard cut rather than
+		// snapping to an empty string.
+		if start := strings.LastIndexFunc(kept, func(r rune) bool { return !isWordRune(r) }); start >= 0 {
+			kept = kept[:start+1]
+		}
+	}
+	return strings.TrimSpace(kept) + "…"
+}
+
+// isWordByte reports whether b is an ASCII letter or digit — the bytes a
+// Latin word is made of. Multi-byte runes never match (their bytes are all
+// ≥ 0x80), so a CJK character is a word boundary all by itself.
+func isWordByte(b byte) bool {
+	return b < 0x80 && isWordRune(rune(b))
+}
+
+func isWordRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
+}
+
+// isWideRune reports whether r occupies two columns — CJK ideographs,
+// Japanese kana, Hangul syllables, fullwidth forms, and CJK punctuation.
+func isWideRune(r rune) bool {
+	switch {
+	case r >= 0x4E00 && r <= 0x9FFF, // CJK Unified Ideographs
+		r >= 0x3400 && r <= 0x4DBF, // CJK Extension A
+		r >= 0x3040 && r <= 0x30FF, // Hiragana + Katakana
+		r >= 0xAC00 && r <= 0xD7AF, // Hangul Syllables
+		r >= 0xFF00 && r <= 0xFF60, // Fullwidth Forms
+		r >= 0x3000 && r <= 0x303F: // CJK Symbols and Punctuation
+		return true
+	}
+	return false
+}
+
+// StripSystemReminders removes the runtime-injected model-facing spans from
+// user text: <system-reminder> (background-process completion notes, recalled
+// memories, …) and <goal_context> (goal continuation and steering prompts).
+// Neither is user speech — strip them anywhere user text is rendered (session
+// previews, the web transcript, steer bubbles) so they don't leak into the
+// UI. A message that was pure injected context strips to empty, which every
+// caller already treats as "render nothing".
+func StripSystemReminders(s string) string {
+	s = stripSpans(s, "<system-reminder>", "</system-reminder>")
+	return stripSpans(s, goalContextOpen, goalContextClose)
+}
+
+func stripSpans(s, open, close string) string {
+	for {
+		start := strings.Index(s, open)
+		if start < 0 {
+			break
+		}
+		end := strings.Index(s, close)
+		if end < 0 || end < start {
+			s = s[:start]
+			break
+		}
+		s = s[:start] + s[end+len(close):]
+	}
+	return s
+}
+
+// StripRemindersForDisplay removes <system-reminder> spans from a tool result
+// before it reaches a UI surface (event stream, web history replay). The spans
+// stay in the persisted blocks — the model must still read them — but a hook
+// like the memory save-nudge must not render in tool cards. Text without
+// reminders is returned byte-identical, so ordinary tool output is untouched.
+func StripRemindersForDisplay(s string) string {
+	stripped := StripSystemReminders(s)
+	if stripped == s {
+		return s
+	}
+	return strings.TrimRight(stripped, " \t\n")
+}
+
+var (
+	// The path capture is greedy (`.` never crosses a newline, and notes are
+	// newline-separated) so an on-disk path containing a "]" isn't truncated.
+	attachmentNoteRe = regexp.MustCompile(`\[Attached file: (.+)\]`)
+	// uploadTSPrefix matches the "<unixnano>_" prefix the web upload handler
+	// adds to saved filenames, so the chip/label shows the original filename.
+	// Requiring 10+ digits avoids clipping a legitimate "2024_report.pdf".
+	uploadTSPrefix = regexp.MustCompile(`^\d{10,}_`)
+)
+
+// AttachmentNote formats the note appended to a user message's text to tell the
+// model where an uploaded file landed on disk (so it can read_file it). It is
+// model-facing and persisted; display surfaces strip it with
+// StripAttachmentNotes and render a chip from the filename instead.
+func AttachmentNote(path string) string {
+	return fmt.Sprintf("[Attached file: %s]", path)
+}
+
+// StripAttachmentNotes removes "[Attached file: <path>]" notes from display text
+// and returns the cleaned text plus the display filename of each note (in order)
+// so a UI can render an attachment chip. The name is the path basename with the
+// upload timestamp prefix removed, so every surface (web bubble, reloaded
+// transcript, TUI echo) shows the original filename. The notes stay in the
+// persisted, model-facing content — only rendering paths call this. Text with no
+// notes is returned byte-identical.
+func StripAttachmentNotes(s string) (cleaned string, names []string) {
+	for _, m := range attachmentNoteRe.FindAllStringSubmatch(s, -1) {
+		base := filepath.Base(strings.TrimSpace(m[1]))
+		names = append(names, uploadTSPrefix.ReplaceAllString(base, ""))
+	}
+	if names == nil {
+		return s, nil
+	}
+	// Notes are always appended after the user's text, so removing them leaves
+	// only trailing whitespace that TrimSpace handles — no interior collapse
+	// that would mangle the user's own blank lines (and break the live-vs-echo
+	// dedup, which compares exact content).
+	cleaned = strings.TrimSpace(attachmentNoteRe.ReplaceAllString(s, ""))
+	return cleaned, names
+}
+
+// AttachmentPaths returns the raw on-disk paths from every "[Attached file: <>]"
+// note in s, in order. This is the complement of StripAttachmentNotes: callers
+// that need the full path (e.g. to derive an /api/uploads/ thumbnail URL) use
+// this; callers that only need a display name use StripAttachmentNotes.
+func AttachmentPaths(s string) []string {
+	var paths []string
+	for _, m := range attachmentNoteRe.FindAllStringSubmatch(s, -1) {
+		paths = append(paths, strings.TrimSpace(m[1]))
+	}
+	return paths
+}
+
+// LoadSession reads ~/.octo/sessions/<id>.jsonl. id may be a bare session id,
+// an id with a .jsonl/.json suffix, or an absolute path to a transcript file.
+func LoadSession(id string) (*Session, error) {
+	path, err := resolveSessionPath(id)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("session %q not found", id)
+		}
+		return nil, fmt.Errorf("session: open %s: %w", path, err)
+	}
+
+	// A complete record always ends in '\n' (json.Encoder writes it), so bytes
+	// after the last newline are an incomplete tail — left by a crash mid-append
+	// or by a writer the read is racing. Drop the tail instead of failing the
+	// whole session: it is at most one message that was never fully committed.
+	// The tail bytes are still in the file, though, so a plain append would
+	// fuse them with the next record into one corrupt line — force the first
+	// Save of this Session to rewrite the file instead.
+	droppedTail := false
+	if n := bytes.LastIndexByte(data, '\n'); n >= 0 {
+		if n+1 < len(data) {
+			droppedTail = true
+		}
+		data = data[:n+1]
+	} else {
+		droppedTail = len(data) > 0
+		data = nil
+	}
+
+	s := &Session{}
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	// A single message (e.g. a large tool_result) can exceed the default 64 KB
+	// line cap; allow up to 16 MB per line.
+	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var rec sessionRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			return nil, fmt.Errorf("session: parse %s: %w", path, err)
+		}
+		switch rec.Type {
+		case "meta":
+			s.ID, s.CreatedAt, s.Model, s.System = rec.ID, rec.CreatedAt, rec.Model, rec.System
+			s.ComposedSystem, s.ComposedLeanSystem, s.ComposedForModel = rec.ComposedSystem, rec.ComposedLeanSystem, rec.ComposedForModel // a rewritten file carries it in its meta header
+			s.ComposedForCWD, s.ComposedForSourceDirs = rec.ComposedForCWD, rec.ComposedForSourceDirs
+			s.Title = rec.Title // a compacted file carries the title in its meta header
+			s.Source = rec.Source
+			s.ModelConfig = rec.ModelConfig
+			s.AgentID = rec.AgentID
+			s.WorkingDir = rec.WorkingDir
+			s.PermissionMode = rec.PermissionMode
+			s.ReasoningEffort = rec.ReasoningEffort
+			s.LastContextTokens = rec.LastContextTokens // a rewritten file carries it in its meta header
+			s.ContentUpdatedAt = rec.ContentUpdatedAt   // a rewritten file carries it in its meta header
+			s.BoundEntry = rec.BoundEntry
+			s.BoundAt = rec.BoundAt
+			s.HookStarted = rec.HookStarted
+			s.BranchedFrom = rec.BranchedFrom
+			s.Goal = rec.Goal // a rewritten file carries the goal in its meta header
+			s.InFlight = 0
+		case "title":
+			s.Title = rec.Title // last one wins
+		case "model_config":
+			s.ModelConfig = rec.ModelConfig // last one wins, like title
+			if rec.Model != "" {
+				s.Model = rec.Model
+			}
+		case "agent_id":
+			s.AgentID = rec.AgentID // last one wins, like title
+		case "working_dir":
+			s.WorkingDir = rec.WorkingDir // last one wins, like title
+		case "permission_mode":
+			s.PermissionMode = rec.PermissionMode // last one wins, like title
+		case "reasoning_effort":
+			s.ReasoningEffort = rec.ReasoningEffort // last one wins, like title
+		case "context_tokens":
+			s.LastContextTokens = rec.LastContextTokens // last one wins, like title
+		case "content_updated_at":
+			s.ContentUpdatedAt = rec.ContentUpdatedAt // last one wins, like title — appendDelta's own record
+		case "composed_system":
+			// Last one wins — a mid-session model switch or a retargeted
+			// working directory each append a new record.
+			s.ComposedSystem, s.ComposedLeanSystem, s.ComposedForModel = rec.ComposedSystem, rec.ComposedLeanSystem, rec.ComposedForModel
+			s.ComposedForCWD, s.ComposedForSourceDirs = rec.ComposedForCWD, rec.ComposedForSourceDirs
+		case "message":
+			if rec.Message != nil {
+				s.Messages = append(s.Messages, *rec.Message)
+			}
+		case "lease":
+			// Last lease record wins. An empty lease_entry clears the marker.
+			s.LeaseEntry = rec.LeaseEntry
+			s.LeaseExpires = rec.LeaseExpires
+		case "goal":
+			// Last goal record wins (it may also arrive via the meta header
+			// after a rewrite). A record with no goal payload is a clear.
+			s.Goal = rec.Goal
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("session: read %s: %w", path, err)
+	}
+
+	if s.ID == "" {
+		// Meta line was missing/corrupt — fall back to the filename stem.
+		s.ID = strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	}
+	rehydrateImageBlocks(s.Messages)
+	// An accruing goal restarts its wall-clock baseline at load: the time the
+	// session spent on disk is downtime, not goal work.
+	if s.Goal != nil && (s.Goal.Status == GoalActive || s.Goal.Status == GoalBudgetLimited) {
+		s.goalWallClockAt = time.Now()
+	}
+	s.persisted = len(s.Messages) // a resumed session continues appending
+	s.forceRewrite = droppedTail
+	return s, nil
+}
+
+// rehydrateImageBlocks reloads persisted image attachments (ImagePath) into
+// memory so provider adapters can re-send them on resumed turns — image bytes
+// are never serialised into the transcript itself. A block whose file is gone,
+// or a legacy block saved without a path, degrades to text: the anthropic
+// adapter hard-errors on an image block with no data, which would otherwise
+// make every later turn of the resumed session fail.
+//
+// It also resets each image's vision-helper retry budget. A budget spent on a
+// broken endpoint shouldn't outlive the session that spent it — resuming after
+// fixing the endpoint has to be able to try again.
+func rehydrateImageBlocks(msgs []Message) {
+	for mi := range msgs {
+		for bi := range msgs[mi].Blocks {
+			b := &msgs[mi].Blocks[bi]
+			if b.Type != "image" {
+				continue
+			}
+			b.ImageDescFailures = 0
+			if b.Image != nil {
+				continue
+			}
+			if b.ImagePath != "" {
+				if data, err := os.ReadFile(b.ImagePath); err == nil {
+					b.Image = &ImageData{MIMEType: imageMIMEFromPath(b.ImagePath), Data: data}
+					continue
+				}
+			}
+			// The bytes are gone, but a description of them may not be. Tool
+			// output (read_file, screenshots, MCP) never carries an ImagePath,
+			// so this is the normal path for exactly the images the vision
+			// helper exists to handle — dropping to "no longer available"
+			// would throw away a description already paid for. Wording is
+			// neutral about the active model: the session may have been
+			// resumed on a vision-capable one.
+			if b.ImageDescription != "" {
+				name := "image"
+				if b.ImagePath != "" {
+					name = filepath.Base(b.ImagePath)
+				}
+				*b = NewTextBlock("[Image: " + name + " — original no longer available; a vision helper described it earlier:]\n" + b.ImageDescription)
+				continue
+			}
+			name := "image"
+			if b.ImagePath != "" {
+				name = filepath.Base(b.ImagePath)
+			}
+			*b = NewTextBlock("[image attachment no longer available: " + name + "]")
+		}
+	}
+}
+
+// imageMIMEFromPath maps a file extension to its image MIME type, defaulting
+// to JPEG (the web UI re-encodes every image upload as JPEG).
+func imageMIMEFromPath(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".bmp":
+		return "image/bmp"
+	default:
+		return "image/jpeg"
+	}
+}
+
+// resolveSessionPath maps an id (bare or with a .jsonl/.json suffix) to the
+// transcript file path under ~/.octo/sessions. The id reaches here straight
+// from HTTP/WS requests, so it must be a plain filename stem: absolute paths,
+// path separators, and "." / ".." components are all rejected so a
+// caller-supplied id can never escape the sessions directory.
+func resolveSessionPath(id string) (string, error) {
+	stem := strings.TrimSuffix(strings.TrimSuffix(id, ".jsonl"), ".json")
+	if stem == "" {
+		return "", fmt.Errorf("session id is empty")
+	}
+	if filepath.IsAbs(id) || stem != filepath.Base(stem) || strings.Contains(stem, "..") {
+		return "", fmt.Errorf("invalid session id %q", id)
+	}
+	// A stem ending in ".agent-events" names a sidecar, not a transcript. The
+	// containment rules above let it through — it is a plain filename — so an
+	// id lifted from a listing that used to include sidecars could read, and
+	// DeleteSession could delete, another session's event trail.
+	if !IsTranscriptName(stem + ".jsonl") {
+		return "", fmt.Errorf("invalid session id %q", id)
+	}
+	dir, err := sessionsDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, stem+".jsonl"), nil
+}
+
+// SessionMTime returns the file mtime of the session whose id is given.
+// Used by the C9 Phase 2 memory daemon to gate "is this session quiet
+// long enough to safely run boundary extraction" — the chat path
+// updates the session file on every turn, so a recent mtime means the
+// user is still actively chatting and the daemon should defer.
+func SessionMTime(id string) (time.Time, error) {
+	p, err := resolveSessionPath(id)
+	if err != nil {
+		return time.Time{}, err
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return info.ModTime(), nil
+}
+
+// ListSessions returns up to n most-recently-modified sessions from
+// ~/.octo/sessions/, newest first (by file mtime).
+func ListSessions(n int) ([]*Session, error) {
+	dir, err := sessionsDir()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("session: readdir %s: %w", dir, err)
+	}
+
+	type item struct {
+		s   *Session
+		mod time.Time
+	}
+	var items []item
+	for _, e := range entries {
+		if e.IsDir() || !IsTranscriptName(e.Name()) {
+			continue
+		}
+		s, err := LoadSession(strings.TrimSuffix(e.Name(), ".jsonl"))
+		if err != nil {
+			continue // skip corrupt files
+		}
+		mod := s.CreatedAt
+		if info, err := e.Info(); err == nil {
+			mod = info.ModTime()
+		}
+		items = append(items, item{s: s, mod: mod})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].mod.After(items[j].mod)
+	})
+
+	out := make([]*Session, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.s)
+	}
+	if n > 0 && len(out) > n {
+		out = out[:n]
+	}
+	return out, nil
+}
+
+// ShortID returns the 8-character abbreviation suitable for CLI display.
+// It's the trailing hex suffix of the full ID — the random part — since the
+// timestamp prefix repeats across same-second sessions and uniqueness comes
+// from the suffix. Same idea as git's short SHA.
+func (s *Session) ShortID() string { return shortSessionID(s.ID) }
+
+func shortSessionID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[len(id)-8:]
+}
+
+// listSessionIDs returns every session ID on disk, newest first. Lexicographic
+// reverse sort matches chronological order because IDs are timestamp-prefixed.
+// Cheap — reads the directory listing, never opens the JSONL bodies.
+func listSessionIDs() ([]string, error) {
+	dir, err := sessionsDir()
+	if err != nil {
+		return nil, err
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("session: readdir %s: %w", dir, err)
+	}
+	var ids []string
+	for _, e := range ents {
+		n := e.Name()
+		if e.IsDir() || !IsTranscriptName(n) {
+			continue
+		}
+		ids = append(ids, strings.TrimSuffix(n, ".jsonl"))
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(ids)))
+	return ids, nil
+}
+
+// ResolveSessionID maps a user-typed identifier to a full session ID.
+// Accepted shapes:
+//
+//   - "last"                  → the most-recently-modified session
+//   - the full session ID     → returned as-is (fast path; never walks the dir)
+//   - any substring of an ID  → unique match required
+//
+// On zero matches returns a "no session matches" error; on multiple, an
+// ambiguity error listing the candidates so the user can re-disambiguate.
+// The returned ID is suitable for passing to LoadSession.
+func ResolveSessionID(input string) (string, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", fmt.Errorf("session id is empty")
+	}
+	if input == "last" {
+		sessions, err := ListSessions(1)
+		if err != nil {
+			return "", err
+		}
+		if len(sessions) == 0 {
+			return "", fmt.Errorf("no saved sessions to resume")
+		}
+		return sessions[0].ID, nil
+	}
+	// Fast path: exact filename hit. Skips the directory walk when the
+	// user pasted a full ID.
+	if path, err := resolveSessionPath(input); err == nil {
+		if _, err := os.Stat(path); err == nil {
+			return strings.TrimSuffix(filepath.Base(path), ".jsonl"), nil
+		}
+	}
+	ids, err := listSessionIDs()
+	if err != nil {
+		return "", err
+	}
+	var matches []string
+	for _, id := range ids {
+		if strings.Contains(id, input) {
+			matches = append(matches, id)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("no session matches %q", input)
+	case 1:
+		return matches[0], nil
+	}
+	return "", fmt.Errorf("ambiguous session %q matches %d sessions:\n  %s",
+		input, len(matches), strings.Join(matches, "\n  "))
+}
+
+// DeleteSession permanently removes the transcript file for the given session
+// id — session deletes bypass the trash, so there is nothing to recall. id may be
+// a bare id or one with a .jsonl/.json suffix; absolute paths are rejected, and
+// any id that would resolve outside the sessions directory (e.g. via "..") is
+// refused so a caller-supplied id can't reach arbitrary files. A missing file
+// is treated as success — deleting an already-gone session is not an error.
+func DeleteSession(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("session id is empty")
+	}
+	if filepath.IsAbs(id) {
+		return fmt.Errorf("session %q: absolute paths not allowed", id)
+	}
+	stem := strings.TrimSuffix(strings.TrimSuffix(id, ".jsonl"), ".json")
+	// Reject anything that isn't a plain filename stem (no separators, no "..")
+	// and anything naming a sidecar rather than a transcript — see
+	// resolveSessionPath.
+	if stem != filepath.Base(stem) || strings.Contains(stem, "..") || !IsTranscriptName(stem+".jsonl") {
+		return fmt.Errorf("invalid session id %q", id)
+	}
+	dir, err := sessionsDir()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, stem+".jsonl")
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("session: remove %s: %w", path, err)
+	}
+	return nil
+}
+
+// ToHistory converts the session's message slice into an agent History.
+func (s *Session) ToHistory() *History {
+	h := NewHistory()
+	for _, m := range s.Messages {
+		h.Append(m)
+	}
+	return h
+}
+
+// SyncFrom copies the current messages from h into the session.
+// Call this before Save to flush the latest turns. When the history was
+// rewritten since the last sync (compaction, repair, popLast), the next Save
+// rewrites the file instead of appending — see History.rewritten.
+func (s *Session) SyncFrom(h *History) {
+	s.Messages = h.Snapshot()
+	if h.takeRewriteDirty() {
+		s.forceRewrite = true
+		s.rewriteIsContent = true
+	}
+}

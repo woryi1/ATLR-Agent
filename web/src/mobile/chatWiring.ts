@@ -1,0 +1,500 @@
+// Mobile chat session wiring.
+//
+// The desktop ChatView owns a large, DOM- and UI-coupled $effect that wires the
+// WebSocket stream into the chat stores. Mobile only needs a CORE SUBSET of that
+// stream, and the real message-assembly logic already lives in stores.ts
+// (appendToLastAssistant / addToolCallToGroup / updateToolResult / …), shared by
+// both. So rather than extract ChatView's coupled wiring, this registers a thin
+// mobile-only handler set that calls those same shared store functions.
+//
+// Deliberately omitted (desktop-only or a later batch): optimistic-send
+// bookkeeping / steer queues / rollback, the floating sub-agent & workflow
+// panels (their trails do show, inside the tool cards — though a synchronous
+// sub-agent's card only claims its trail once the tool returns, so it shows
+// no progress while it runs),
+// turn-error banner, next-message suggestions. Tool groups render through the
+// desktop ToolGroup, so the tool fields set here feed the same cards. Artifacts are
+// observed into the shared store, as on desktop, and the session's artifacts
+// sheet (ArtifactsSheet) renders them.
+import { get, writable } from 'svelte/store'
+import { ws } from '../lib/ws'
+import { tr } from '../lib/i18n'
+import * as api from '../lib/api'
+import { inlineSlashCommand } from '../lib/inlineSlash'
+import type { Attachment } from '../lib/composerDrafts'
+import { appendLiveAfterHistory, isReplayedUserEcho } from '../lib/userEchoDedup'
+import { observeArtifact, resetArtifacts } from '../lib/artifacts'
+import { shiftMessageIndices } from '../lib/reindex'
+import {
+  chatMessages,
+  chatStreaming,
+  chatThinking,
+  chatProgress,
+  chatTodos,
+  chatPermMode,
+  chatContextUsage,
+  chatLastTextAt,
+  chatGoal,
+  addChatMsg,
+  appendToLastAssistant,
+  commitThinking,
+  stopTrailingCaret,
+  addToolCallToGroup,
+  updateToolResult,
+  setToolError,
+  appendToolStdout,
+  finishAllTools,
+  finishToolsById,
+  clearMsgs,
+  showToast,
+  uid,
+  hydrateAgentRuns,
+  recordAgentTrailEvent,
+  recordWorkflowTrailEvent,
+} from '../lib/stores'
+
+// Apply one persisted history event to the stores. A trimmed copy of the
+// desktop's handleHistoryEvent; the message-shaping and artifact observation
+// are the shared helpers, so the two stay behaviourally aligned.
+function applyHistoryEvent(sid: string, ev: Record<string, any>, showReasoning: boolean) {
+  if (ev.type === 'history_user_message') {
+    addChatMsg(sid, {
+      id: uid('u'), type: 'user', content: ev.content ?? '', createdAt: ev.created_at ?? Date.now(),
+      streaming: false, pending: false, tools: [], todos: [], images: ev.images ?? [],
+      messageIndex: ev.message_index,
+    })
+  } else if (ev.type === 'assistant_message') {
+    if (!(ev.content ?? '').trim() && !(ev.thinking ?? '').trim()) return
+    // message_index rides only on a reply that closed a turn; editing reads
+    // it to tell which user messages a running turn still allows.
+    addChatMsg(sid, {
+      id: uid('a'), type: 'assistant', content: ev.content ?? '', thinking: ev.thinking ?? '',
+      createdAt: ev.created_at ?? Date.now(), streaming: false, tools: [], todos: [],
+      messageIndex: ev.message_index,
+    })
+  } else if (ev.type === 'thinking') {
+    if (showReasoning) commitThinking(sid, ev.text ?? '')
+  } else if (ev.type === 'tool_call') {
+    addToolCallToGroup(sid, {
+      id: uid('t'), toolId: ev.tool_id ?? '', name: ev.name ?? '', args: ev.args ?? '',
+      // Persisted message timestamp (absent on pre-CreatedAt sessions) — lets
+      // a reloaded transcript show real durations.
+      summary: ev.summary ?? '', startedAt: ev.created_at, done: false, error: null, result: null, stdout: [], diff: null,
+    })
+  } else if (ev.type === 'tool_result') {
+    updateToolResult(sid, ev.tool_id, ev.result, ev.ui_payload, ev.created_at)
+    observeArtifact(sid, ev.ui_payload, false)
+  }
+}
+
+// Fetch and render a session's persisted transcript. Resolves once settled, so
+// the caller can subscribe over WS only after history renders (same ordering the
+// desktop relies on to avoid replayed tool cards landing before their message).
+export function loadMobileHistory(sid: string): Promise<void> {
+  api.getSessionGoal(sid)
+    .then(resp => chatGoal.update(m => ({ ...m, [sid]: resp?.goal ?? null })))
+    .catch(() => {})
+  // The persisted sub-agent / workflow trails, so a finished run's tool card
+  // can show what it did; an older server just leaves the card's plain result.
+  api.getAgentRuns(sid)
+    .then((resp: any) => hydrateAgentRuns(sid, resp))
+    .catch(() => {})
+  return api.getSessionMessages(sid).then((resp: any) => {
+    const events: any[] = resp?.events ?? []
+    const showReasoning = resp?.show_reasoning ?? true
+    // After a rollback the rerun is already streaming while this fetch is in
+    // flight; render history first, then put the live messages back behind
+    // it (same as the desktop's loadHistory).
+    const live = get(chatMessages)[sid] ?? []
+    clearMsgs(sid)
+    // The replay below re-observes every artifact in transcript order.
+    resetArtifacts(sid)
+    const historyToolIds = new Set<string>()
+    for (const ev of events) {
+      if (ev.type === 'tool_call' && ev.tool_id) historyToolIds.add(ev.tool_id)
+      applyHistoryEvent(sid, ev, showReasoning)
+    }
+    finishToolsById(sid, historyToolIds)
+    if (live.length) {
+      chatMessages.update(m => ({ ...m, [sid]: appendLiveAfterHistory(m[sid] ?? [], live) }))
+    }
+  }).catch(() => {})
+}
+
+// Messages sent while a turn runs. The server folds them into that turn (or
+// chains them after it) and only echoes them as history_user_message once the
+// turn picks them up — so until then they stay out of the transcript, where a
+// bubble would split the reply still being written, and show as pending
+// below it instead (the desktop's pendingSteers, without retract/queue).
+export type MobileSteer = { id: string; content: string; images: string[] }
+export const mobileSteers = writable<Record<string, MobileSteer[]>>({})
+
+// Where a confirmed steer enters the transcript: before the reply still
+// streaming, so it reads as steer → the reply that follows it (as on desktop).
+export function insertConfirmedSteer<T extends { type: string; streaming?: boolean }>(msgs: T[], confirmed: T): T[] {
+  const out = [...msgs]
+  const at = out.findLastIndex(x => x.type === 'assistant' && x.streaming)
+  if (at >= 0) out.splice(at, 0, confirmed)
+  else out.push(confirmed)
+  return out
+}
+
+// Optimistically echo the user's message, mark the turn streaming, and send.
+// history_user_message reconciles the echo (see the handler below).
+export function sendMobile(sid: string, text: string, files?: Attachment[]) {
+  const t = text.trim()
+  if (!t && !files?.length) return
+  // Server-inline commands never enter history, so no history_user_message
+  // comes back to reconcile the echo — it would spin forever. Mobile has no
+  // slash menu, so these only arrive typed by hand, but /reload and /goal do
+  // reach here. /compact keeps the optimistic busy flag: it is a long
+  // server-side job that closes with its own session_update idle, which the
+  // handler below already listens for. What the others report is the server's
+  // own doing (a history_reload, a toast, a goal notice).
+  const inline = inlineSlashCommand(t, !!(files && files.length))
+  if (inline) {
+    if (inline === 'compact') chatStreaming.update(s => ({ ...s, [sid]: true }))
+    ws.sendMessage(sid, t, files)
+    return
+  }
+  if (get(chatStreaming)[sid]) {
+    mobileSteers.update(m => ({ ...m, [sid]: [...(m[sid] ?? []), { id: uid('s'), content: t, images: echoRefs(files) }] }))
+    ws.sendMessage(sid, t, files)
+    return
+  }
+  addChatMsg(sid, {
+    id: uid('u'), type: 'user', content: t, createdAt: Date.now(),
+    streaming: false, pending: true, tools: [], todos: [], images: echoRefs(files),
+  })
+  chatStreaming.update(s => ({ ...s, [sid]: true }))
+  ws.sendMessage(sid, t, files)
+}
+
+// The scrollback line for a finished sub-agent (sub_agent_notice) or
+// workflow (workflow_event done) — the desktop's wording, quoted rather than
+// backticked since mobile notices are plain text; null when there is none.
+export function agentRunNotice(ev: any): { text: string; level: 'success' | 'warning' | 'error' } | null {
+  if (ev.type === 'workflow_event') {
+    if (ev.kind !== 'done') return null
+    const label = ev.description || ev.run_id || 'workflow'
+    return ev.status === 'error'
+      ? { text: `Workflow “${label}” failed`, level: 'error' }
+      : { text: `Workflow “${label}” completed`, level: 'success' }
+  }
+  const label = ev.description || ev.agent_id || 'sub-agent'
+  switch (ev.status) {
+    case 'success': return { text: `Sub-agent “${label}” completed`, level: 'success' }
+    case 'warning': return { text: `Sub-agent “${label}” incomplete`, level: 'warning' }
+    case 'cancelled': return { text: `Sub-agent “${label}” cancelled`, level: 'warning' }
+    default: return { text: `Sub-agent “${label}” failed`, level: 'error' }
+  }
+}
+
+// The echo's attachment refs, in the shape history_user_message carries: an
+// image's data URL, or "pdf:<name>" for any other file (see docChipRefs).
+export function echoRefs(files?: Attachment[]): string[] {
+  return (files ?? []).map(f => f.data_url || `pdf:${f.name}`)
+}
+
+// Register the core WS handlers for a session. Returns a cleanup that removes
+// them all. Pair with ws.subscribe/unsubscribe in the caller's effect.
+export function wireMobileSession(sid: string): () => void {
+  const forSid = (ev: any) => !ev.session_id || ev.session_id === sid
+  const cleanups: Array<() => void> = []
+
+  cleanups.push(ws.on('text_delta', (ev: any) => {
+    if (!forSid(ev)) return
+    const txt = ev.text ?? ''
+    const pendingThinking = get(chatThinking)[sid] ?? ''
+    appendToLastAssistant(sid, txt, pendingThinking)
+    if (pendingThinking) chatThinking.update(tt => ({ ...tt, [sid]: '' }))
+    if (txt) chatLastTextAt.update(tt => ({ ...tt, [sid]: Date.now() }))
+  }))
+
+  cleanups.push(ws.on('thinking_delta', (ev: any) => {
+    if (!forSid(ev)) return
+    if (!(get(chatThinking)[sid] ?? '')) stopTrailingCaret(sid)
+    chatThinking.update(tt => ({ ...tt, [sid]: (tt[sid] ?? '') + (ev.text ?? '') }))
+  }))
+
+  cleanups.push(ws.on('assistant_message', (ev: any) => {
+    if (!forSid(ev)) return
+    const think = ev.thinking ?? ''
+    chatThinking.update(tt => ({ ...tt, [sid]: '' }))
+    const cur = get(chatMessages)[sid] ?? []
+    const streaming = get(chatStreaming)[sid] ?? false
+    if (streaming && cur.length > 0 && cur[cur.length - 1]?.type === 'assistant') {
+      chatMessages.update(m => {
+        const arr = [...(m[sid] || [])]
+        const last = arr.length - 1
+        if (last >= 0) arr[last] = { ...arr[last], content: ev.content ?? arr[last].content, thinking: think || arr[last].thinking, streaming: false }
+        return { ...m, [sid]: arr }
+      })
+    } else {
+      addChatMsg(sid, { id: uid('a'), type: 'assistant', content: ev.content ?? '', thinking: think, createdAt: Date.now(), streaming: false, tools: [], todos: [] })
+    }
+  }))
+
+  cleanups.push(ws.on('history_user_message', (ev: any) => {
+    if (!forSid(ev)) return
+    const content = ev.content ?? ''
+    const createdAt = ev.created_at ?? Date.now()
+    const images = ev.images ?? []
+    // A steer the turn just picked up: retire its pending line and place it
+    // ahead of the streaming reply. A replayed echo (mid-turn resubscribe) of
+    // one already placed matches no pending steer and falls through.
+    const steers = get(mobileSteers)[sid] ?? []
+    let si = steers.findIndex(s => s.content === content)
+    if (si < 0 && steers.length) {
+      // No exact match — the server appends document notes to a steer's text
+      // before echoing it. Retire the oldest steer instead, as the desktop's
+      // FIFO does, unless this is the echo of a pending idle send.
+      const pend = (get(chatMessages)[sid] ?? []).findLast((x: any) => x.type === 'user' && x.pending)
+      if (pend?.content !== content) si = 0
+    }
+    if (si >= 0 && !isReplayedUserEcho(get(chatMessages)[sid] ?? [], content, createdAt)) {
+      mobileSteers.update(m => ({ ...m, [sid]: steers.filter((_, i) => i !== si) }))
+      chatMessages.update(m => ({
+        ...m,
+        [sid]: insertConfirmedSteer(m[sid] || [], { id: uid('u'), type: 'user', content, createdAt, streaming: false, pending: false, tools: [], todos: [], images, messageIndex: ev.message_index }),
+      }))
+      return
+    }
+    chatMessages.update(m => {
+      const msgs = [...(m[sid] || [])]
+      // Reconcile the optimistic echo: replace the trailing pending user bubble
+      // of the same text, else append.
+      const lastPending = msgs.findLastIndex((x: any) => x.type === 'user' && x.pending)
+      if (lastPending >= 0 && msgs[lastPending].content === content) {
+        msgs[lastPending] = { ...msgs[lastPending], id: uid('u'), createdAt, pending: false, images, messageIndex: ev.message_index }
+      } else if (!isReplayedUserEcho(msgs, content, createdAt)) {
+        // Not a pending match: a fresh message — unless this echo is a replay
+        // from a mid-turn (re)subscribe and the confirmed bubble is already
+        // rendered (same (content, createdAt); see userEchoDedup).
+        msgs.push({ id: uid('u'), type: 'user', content, createdAt, streaming: false, pending: false, tools: [], todos: [], images, messageIndex: ev.message_index })
+      }
+      return { ...m, [sid]: msgs }
+    })
+  }))
+
+  cleanups.push(ws.on('tool_call', (ev: any) => {
+    if (!forSid(ev)) return
+    commitThinking(sid, get(chatThinking)[sid] ?? '')
+    chatThinking.update(tt => ({ ...tt, [sid]: '' }))
+    addToolCallToGroup(sid, {
+      id: uid('t'), toolId: ev.tool_id ?? '', name: ev.name ?? '', args: ev.args ?? '',
+      // Prefer the server-stamped start time — a mid-turn resubscribe
+      // redelivers this event from the replay buffer, and stamping "now"
+      // would reset every finished tool's clock to the replay moment.
+      summary: ev.summary ?? '', startedAt: ev.ts ?? Date.now(), done: false, error: null, result: null, stdout: [], diff: null,
+    })
+  }))
+
+  cleanups.push(ws.on('tool_result', (ev: any) => {
+    if (!forSid(ev)) return
+    updateToolResult(sid, ev.tool_id, ev.result, ev.ui_payload, ev.ts)
+    // Never `live`: that flag only opens the desktop's side panel.
+    observeArtifact(sid, ev.ui_payload, false)
+  }))
+
+  cleanups.push(ws.on('tool_error', (ev: any) => {
+    if (!forSid(ev)) return
+    setToolError(sid, ev.tool_id, ev.error ?? 'error', ev.ts)
+  }))
+
+  cleanups.push(ws.on('tool_stdout', (ev: any) => {
+    if (!forSid(ev)) return
+    appendToolStdout(sid, ev.tool_id, ev.lines ?? [])
+  }))
+
+  cleanups.push(ws.on('progress', (ev: any) => {
+    if (!forSid(ev)) return
+    chatProgress.update(p => ({ ...p, [sid]: { message: ev.message || 'Thinking', phase: ev.phase } }))
+    if (ev.phase === 'active') chatStreaming.update(s => ({ ...s, [sid]: true }))
+  }))
+
+  // Sub-agent and workflow progress feeds the trails ToolGroup renders inside
+  // each sub_agent / workflow tool card; a finished run also leaves a line.
+  const runNotice = (ev: any) => {
+    const n = agentRunNotice(ev)
+    if (!n) return
+    addChatMsg(sid, {
+      id: uid('note'), type: 'notice', content: n.text, level: n.level,
+      createdAt: Date.now(), streaming: false, tools: [], todos: [],
+    })
+  }
+  cleanups.push(ws.on('sub_agent_event', (ev: any) => {
+    if (!forSid(ev)) return
+    recordAgentTrailEvent(sid, ev)
+  }))
+  cleanups.push(ws.on('sub_agent_notice', (ev: any) => {
+    if (!forSid(ev)) return
+    runNotice({ ...ev, type: 'sub_agent_notice' })
+  }))
+  cleanups.push(ws.on('workflow_event', (ev: any) => {
+    if (!forSid(ev)) return
+    recordWorkflowTrailEvent(sid, ev)
+    runNotice({ ...ev, type: 'workflow_event' })
+  }))
+
+  // The goal bar's snapshot. Carries its own session id: a goal can change in a
+  // session other than the one this handler set is wired for, and keeping it
+  // current means the bar is right when that session opens.
+  cleanups.push(ws.on('goal_updated', (ev: any) => {
+    if (!ev.session_id) return
+    chatGoal.update(m => ({ ...m, [ev.session_id]: ev.goal ?? null }))
+  }))
+
+  // The goal's scrollback lines, as on desktop: the /goal reply, a status
+  // change, and the start of a continuation turn — whose prompt is hidden
+  // server-side, so without this line the turn would look unprompted.
+  cleanups.push(ws.on('goal_notice', (ev: any) => {
+    if (ev.session_id !== sid) return
+    const fixed: Record<string, string> = {
+      start: 'Goal starts — /goal pause to stop',
+      continue: 'Goal continues — /goal pause to stop',
+    }
+    const text = ev.text || fixed[ev.kind ?? '']
+    if (!text) return
+    addChatMsg(sid, {
+      id: uid('note'), type: 'notice', content: text, level: ev.level ?? 'info',
+      createdAt: Date.now(), streaming: false, tools: [], todos: [],
+    })
+  }))
+
+  // The session plan (task_create / task_update). Replayed on subscribe, so a
+  // freshly opened chat picks up a plan already in progress.
+  cleanups.push(ws.on('todo_update', (ev: any) => {
+    if (!forSid(ev)) return
+    chatTodos.update(t => ({ ...t, [sid]: ev.todos ?? [] }))
+  }))
+
+  cleanups.push(ws.on('complete', (ev: any) => {
+    if (!forSid(ev)) return
+    // Anything the turn didn't pick up runs as a turn of its own, echoed then
+    // like any fresh send — no longer a pending steer of this one.
+    mobileSteers.update(m => ({ ...m, [sid]: [] }))
+    chatStreaming.update(s => ({ ...s, [sid]: false }))
+    chatProgress.update(p => ({ ...p, [sid]: null }))
+    // The reply's persisted index when the turn ended on one (as on desktop):
+    // stamp it on the bubble this turn produced, unless that bubble already
+    // has one — a turn that ended with no reply must not relabel the last.
+    const replyIndex = ev.message_index
+    chatMessages.update(m => {
+      const msgs = (m[sid] || []).map((x: any) => (x.streaming ? { ...x, streaming: false } : x))
+      if (typeof replyIndex === 'number') {
+        const k = msgs.findLastIndex((x: any) => x.type === 'assistant')
+        if (k >= 0 && typeof msgs[k].messageIndex !== 'number') msgs[k] = { ...msgs[k], messageIndex: replyIndex }
+      }
+      return { ...m, [sid]: msgs }
+    })
+    finishAllTools(sid)
+  }))
+
+  cleanups.push(ws.on('turn_error', (ev: any) => {
+    if (!forSid(ev)) return
+    addChatMsg(sid, {
+      id: uid('err'), type: 'notice', content: `${tr('m.err_prefix')}: ${ev.error ?? tr('m.request_failed')}`,
+      level: 'error', createdAt: Date.now(), streaming: false, tools: [], todos: [],
+    })
+    chatStreaming.update(s => ({ ...s, [sid]: false }))
+    chatProgress.update(p => ({ ...p, [sid]: null }))
+  }))
+
+  cleanups.push(ws.on('toast', (ev: any) => {
+    if (ev.session_id !== sid) return
+    showToast(ev.message ?? '', ev.level ?? 'info')
+  }))
+
+  // Another entry stole this session's binding: informational toast, nothing
+  // is persisted and the turn is not blocked.
+  cleanups.push(ws.on('session_taken_over', (ev: any) => {
+    if (ev.session_id !== sid) return
+    showToast(tr('chat.session_taken_over').replace('{entry}', ev.entry ?? ''), 'info')
+  }))
+
+  // Operation errors surfaced over WS (retry-while-running, session-not-found…).
+  cleanups.push(ws.on('error', (ev: any) => {
+    if (!forSid(ev)) return
+    showToast(ev.message ?? 'Error', 'error')
+  }))
+
+  // The server rejected the send (session bound to another client, not found…).
+  // Without this the optimistic bubble and the streaming flag would hang forever
+  // — the server sends no idle snapshot after a rejection. Roll the echo back,
+  // clear streaming, and surface why. (No steer/force bookkeeping — mobile has
+  // no optimistic-steer path; force-takeover UI is a later batch.)
+  const rollbackSend = (ev: any) => {
+    // A rejection is synchronous, so it belongs to the latest send: mid-turn
+    // that was a steer — drop it and leave the running turn as it is.
+    const steers = get(mobileSteers)[sid] ?? []
+    if (steers.length && get(chatStreaming)[sid]) {
+      mobileSteers.update(m => ({ ...m, [sid]: steers.slice(0, -1) }))
+      showToast(ev.message ?? tr('m.send_fail'), 'error')
+      return
+    }
+    chatMessages.update(m => {
+      const msgs = [...(m[sid] || [])]
+      const lastPending = msgs.findLastIndex((x: any) => x.type === 'user' && x.pending)
+      if (lastPending >= 0) msgs.splice(lastPending, 1)
+      return { ...m, [sid]: msgs }
+    })
+    chatStreaming.update(s => ({ ...s, [sid]: false }))
+    showToast(ev.message ?? tr('m.send_fail'), 'error')
+  }
+  cleanups.push(ws.on('send_rejected', (ev: any) => {
+    if (!forSid(ev)) return
+    rollbackSend(ev)
+  }))
+  cleanups.push(ws.on('bind_required', (ev: any) => {
+    if (!forSid(ev)) return
+    // Mobile has no force-takeover UI yet, so treat it as a rejection rather
+    // than leaving the turn stuck: roll back and tell the user it's in use.
+    rollbackSend({ message: ev.message ?? tr('m.session_busy') })
+  }))
+
+  cleanups.push(ws.on('session_update', (ev: any) => {
+    if (!forSid(ev)) return
+    // A permission-mode change from another client keeps the settings sheet
+    // current; partial pings carry no mode and must not clear it.
+    if (typeof ev.permission_mode === 'string' && ev.permission_mode) {
+      chatPermMode.update(m => ({ ...m, [sid]: ev.permission_mode }))
+    }
+    if (typeof ev.context_usage === 'number') {
+      chatContextUsage.update(u => ({ ...u, [sid]: ev.context_usage }))
+    }
+    // Mobile only needs the idle snapshot to clear a stale streaming indicator.
+    if (ev.status === 'idle') {
+      chatStreaming.update(s => ({ ...s, [sid]: false }))
+      chatProgress.update(p => ({ ...p, [sid]: null }))
+      chatThinking.update(t => ({ ...t, [sid]: '' }))
+    }
+  }))
+
+  // A mid-turn compaction moved every persisted index on disk; shift the ones
+  // the bubbles carry so editing a message still targets the right one.
+  cleanups.push(ws.on('history_reindex', (ev: any) => {
+    if (!forSid(ev)) return
+    const folded = Number(ev.folded_msgs) || 0
+    chatMessages.update(m => (m[sid] ? { ...m, [sid]: shiftMessageIndices(m[sid], folded) } : m))
+  }))
+
+  cleanups.push(ws.on('history_reload', (ev: any) => {
+    if (!forSid(ev)) return
+    mobileSteers.update(m => ({ ...m, [sid]: [] }))
+    clearMsgs(sid)
+    loadMobileHistory(sid)
+  }))
+
+  // An edit or retry (from any client) stripped the transcript tail
+  // server-side; without this the phone keeps the stale tail and the rerun
+  // lands after it.
+  cleanups.push(ws.on('history_rollback', (ev: any) => {
+    if (!forSid(ev)) return
+    mobileSteers.update(m => ({ ...m, [sid]: [] }))
+    clearMsgs(sid)
+    loadMobileHistory(sid)
+  }))
+
+  return () => cleanups.forEach(fn => fn())
+}

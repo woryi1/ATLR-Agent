@@ -1,0 +1,60 @@
+name: Windows installer check
+
+# Compile the Inno Setup script whenever a PR touches it, so a broken installer
+# surfaces here instead of at release time — release.yml only builds it on a
+# tag push. Path-filtered, so it costs nothing on PRs that don't touch the
+# installer.
+on:
+  pull_request:
+    paths:
+      - 'packaging/windows/**'
+      - 'cmd/octo-desktop/**'
+      - '.github/workflows/windows-installer-check.yml'
+  workflow_dispatch:
+
+# Least-privilege default: this job only checks out and compiles.
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    name: compile installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: cmd/octo-desktop/go.sum
+
+      - name: Build the binaries to package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          go build -o staging\octo.exe ./cmd/octo # plain build; embedded rg is irrelevant to packaging
+          # The desktop app is a nested module (its own go.mod); Windows builds it
+          # pure-Go (WebView2, no CGO). -H windowsgui: no console window flashes.
+          # Generate the icon+manifest .syso in the package directory so go build
+          # links it into the .exe; then build the desktop binary.
+          go run -C cmd/octo-desktop ./build/windows/generate-syso amd64 build/windows/icon.ico build/windows/wails.exe.manifest
+          go build -C cmd/octo-desktop -ldflags "-H windowsgui" -o "$PWD\staging\octo-desktop.exe" .
+          Copy-Item LICENSE.txt staging\LICENSE.txt
+          # uv.exe is skipifsourcedoesntexist in the .iss, so a check compile that
+          # doesn't stage it still succeeds.
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          # Source paths in the .iss resolve relative to the script's own dir,
+          # so SourceDir / OutputDir must be absolute.
+          $staging = Join-Path $PWD 'staging'
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            /DAppVersion=0.0.0-ci "/DSourceDir=$staging" "/O$staging" `
+            packaging\windows\octo.iss
+          if (-not (Test-Path "$staging\octo-setup.exe")) { throw "installer was not produced" }

@@ -1,0 +1,519 @@
+package server
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"path/filepath"
+	"strings"
+
+	"github.com/open-octo/octo-agent/internal/app"
+	"github.com/open-octo/octo-agent/internal/config"
+	"github.com/open-octo/octo-agent/internal/mcp"
+	"github.com/open-octo/octo-agent/internal/tools"
+)
+
+// allowedMCPCommands lists stdio executables that are commonly used to launch
+// MCP servers and are considered safe without an explicit user opt-in. Any
+// other command requires allow_arbitrary_command=true.
+var allowedMCPCommands = map[string]bool{
+	"npx": true, "npm": true, "node": true,
+	"uvx": true, "uv": true,
+	"python": true, "python3": true,
+	"cargo": true, "go": true, "ruby": true,
+}
+
+// parseStdioCommand splits a command line into executable and arguments,
+// validates the executable, and returns the parsed parts.
+//
+// When allowArbitrary is false (the default for safety):
+//   - Absolute paths are rejected (user must use a basename resolvable via PATH)
+//   - The basename must be in allowedMCPCommands
+//
+// When allowArbitrary is true (user set allow_arbitrary_command in mcp.json):
+//   - Absolute paths are permitted (needed for tools outside PATH like codegraph)
+//   - The whitelist is bypassed
+//   - Shell metacharacters and ".." traversal are still rejected — this gate
+//     is about injection safety, not command trust
+func parseStdioCommand(name, line string, allowArbitrary bool) (string, []string, error) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return "", nil, fmt.Errorf("mcp server %q: empty command", name)
+	}
+	base := fields[0]
+	// Injection-safety check on the raw line: reject shell metacharacters and
+	// ".." traversal paths before any other parsing. This check is about
+	// preventing command injection, so it applies regardless of opt-in.
+	if strings.ContainsAny(line, ";|&$<>") || strings.Contains(base, "..") {
+		return "", nil, fmt.Errorf("mcp server %q: command contains forbidden characters", name)
+	}
+	if filepath.IsAbs(base) {
+		if !allowArbitrary {
+			return "", nil, fmt.Errorf("mcp server %q: absolute-path command rejected — check \"Allow non-standard commands\" in the import dialog, or set \"allow_arbitrary_command\": true per server", name)
+		}
+		// Absolute path is trusted by user opt-in; use as-is.
+		return base, fields[1:], nil
+	}
+	base = filepath.Base(base)
+	if !allowArbitrary && !allowedMCPCommands[base] {
+		return "", nil, fmt.Errorf("mcp server %q: command %q is not a well-known launcher — check \"Allow non-standard commands\" in the import dialog, or set \"allow_arbitrary_command\": true per server", name, base)
+	}
+	return base, fields[1:], nil
+}
+
+// MCP server management API. Reads and writes both go to ~/.octo/mcp.json
+// (internal/mcp.LoadManaged). Mutations apply to the live registry
+// incrementally (connect/disconnect just the touched server), so a change is
+// effective for the next turn of every session without a restart. All
+// mutation handlers hold s.mcpMu — the registry swap inside reload must not
+// interleave with incremental connects.
+
+type mcpServerInfo struct {
+	Name      string            `json:"name"`
+	Transport string            `json:"transport"` // "stdio" | "http" | "" (invalid entry)
+	Disabled  bool              `json:"disabled"`
+	Invalid   string            `json:"invalid,omitempty"`
+	Command   string            `json:"command,omitempty"`
+	Args      []string          `json:"args,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	URL       string            `json:"url,omitempty"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Auth      string            `json:"auth,omitempty"`
+	Status    string            `json:"status"` // "connected" | "error" | "disabled" | "invalid" | "disconnected"
+	Error     string            `json:"error,omitempty"`
+	Tools     int               `json:"tools"`
+}
+
+// mcpToolInfo is the detail view of a single advertised tool.
+type mcpToolInfo struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"inputSchema,omitempty"`
+}
+
+// mcpServerDetail extends mcpServerInfo with the live tool surface list.
+type mcpServerDetail struct {
+	mcpServerInfo
+	ToolList []mcpToolInfo `json:"tool_list,omitempty"`
+}
+
+// mcpServerList builds the management view: configured entries joined with
+// live-registry state.
+func (s *Server) mcpServerList() ([]mcpServerInfo, error) {
+	managed, err := mcp.LoadManaged()
+	if err != nil {
+		return nil, err
+	}
+	reg := tools.ActiveMCPRegistry()
+	out := make([]mcpServerInfo, 0, len(managed))
+	for _, m := range managed {
+		info := mcpServerInfo{
+			Name:      m.Name,
+			Transport: m.Entry.Kind(),
+			Disabled:  m.Entry.Disabled,
+			Invalid:   m.Invalid,
+			Command:   m.Entry.Command,
+			Args:      m.Entry.Args,
+			Env:       m.Entry.Env,
+			URL:       m.Entry.URL,
+			Headers:   m.Entry.Headers,
+			Auth:      m.Entry.Auth,
+		}
+		var conn *mcp.Connection
+		if reg != nil {
+			conn = reg.Get(m.Name)
+		}
+		switch {
+		case m.Invalid != "":
+			info.Status = "invalid"
+		case m.Entry.Disabled:
+			info.Status = "disabled"
+		case conn != nil:
+			if msg, ok := conn.ReauthRequired(); ok {
+				// Connection is still registered but a call through it hit
+				// an OAuth failure nobody was present to fix — report it as
+				// an error so the panel's Authorize/Reconnect controls
+				// unlock instead of showing a falsely healthy "connected".
+				info.Status = "error"
+				info.Error = msg
+			} else {
+				info.Status = "connected"
+				info.Tools = len(conn.Tools())
+			}
+		default:
+			info.Status = "disconnected"
+			if reg != nil {
+				if msg, ok := reg.ConnectError(m.Name); ok {
+					info.Status = "error"
+					info.Error = msg
+				}
+			}
+		}
+		out = append(out, info)
+	}
+	return out, nil
+}
+
+func (s *Server) writeMCPServerList(w http.ResponseWriter) {
+	list, err := s.mcpServerList()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"servers": list})
+}
+
+// connectIfLive dials one server into the active registry unless tools are
+// disabled for this serve process. Connect failures are not surfaced as HTTP
+// errors — the entry is saved either way and the per-server status reports
+// the failure.
+func (s *Server) connectIfLive(r *http.Request, name string, entry mcp.ServerEntry) {
+	if !s.cfg.Tools || entry.Disabled {
+		return
+	}
+	// r.Context() bounds only the dial — an established connection is not
+	// tied to it. A client that gives up mid-connect aborts the attempt; the
+	// recorded per-server error tells them what happened.
+	_ = app.ConnectMCPServer(r.Context(), name, entry, nil)
+}
+
+// ─── GET /api/mcp/servers ───────────────────────────────────────────────────
+
+func (s *Server) handleListMCPServers(w http.ResponseWriter, r *http.Request) {
+	_ = r
+	s.writeMCPServerList(w)
+}
+
+// ─── GET /api/mcp/servers/{name} ────────────────────────────────────────────
+
+func (s *Server) handleGetMCPServer(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	managed, err := mcp.LoadManaged()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var entry *mcp.ManagedServer
+	for i := range managed {
+		if managed[i].Name == name {
+			entry = &managed[i]
+			break
+		}
+	}
+	if entry == nil {
+		writeError(w, http.StatusNotFound, "mcp server not found")
+		return
+	}
+
+	info := mcpServerInfo{
+		Name:      entry.Name,
+		Transport: entry.Entry.Kind(),
+		Disabled:  entry.Entry.Disabled,
+		Invalid:   entry.Invalid,
+		Command:   entry.Entry.Command,
+		Args:      entry.Entry.Args,
+		Env:       entry.Entry.Env,
+		URL:       entry.Entry.URL,
+		Headers:   entry.Entry.Headers,
+		Auth:      entry.Entry.Auth,
+	}
+	switch {
+	case entry.Invalid != "":
+		info.Status = "invalid"
+	case entry.Entry.Disabled:
+		info.Status = "disabled"
+	default:
+		reg := tools.ActiveMCPRegistry()
+		var conn *mcp.Connection
+		if reg != nil {
+			conn = reg.Get(name)
+		}
+		if conn != nil {
+			if msg, ok := conn.ReauthRequired(); ok {
+				info.Status = "error"
+				info.Error = msg
+			} else {
+				info.Status = "connected"
+				info.Tools = len(conn.Tools())
+			}
+		} else {
+			info.Status = "disconnected"
+			if reg != nil {
+				if msg, ok := reg.ConnectError(name); ok {
+					info.Status = "error"
+					info.Error = msg
+				}
+			}
+		}
+	}
+
+	detail := mcpServerDetail{mcpServerInfo: info}
+	if info.Status == "connected" {
+		reg := tools.ActiveMCPRegistry()
+		if reg != nil {
+			conn := reg.Get(name)
+			if conn != nil {
+				detail.ToolList = make([]mcpToolInfo, 0, len(conn.Tools()))
+				for _, t := range conn.Tools() {
+					detail.ToolList = append(detail.ToolList, mcpToolInfo{
+						Name:        t.Name,
+						Description: t.Description,
+						InputSchema: t.InputSchema,
+					})
+				}
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// ─── POST /api/mcp/servers ──────────────────────────────────────────────────
+
+// Accepts a Claude Code-style bulk import (paste of an mcp.json):
+//
+//	{"mcpServers": {"fs": {...}, "api": {...}}}
+//
+// This is the only way to add a server through the API — the structured
+// single-server "Add Server" form was removed from the web UI in favor of
+// the mcp-creator skill, which edits ~/.octo/mcp.json directly and isn't
+// subject to this endpoint's command allowlist.
+func (s *Server) handleCreateMCPServer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Servers map[string]mcp.ServerEntry `json:"mcpServers"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if len(req.Servers) == 0 {
+		writeError(w, http.StatusBadRequest, "expected {mcpServers: {...}}")
+		return
+	}
+
+	s.mcpMu.Lock()
+	defer s.mcpMu.Unlock()
+
+	// Validate everything first so a half-bad paste doesn't land half the
+	// servers. For stdio entries, parse + validate the command. Servers with
+	// allow_arbitrary_command may use absolute paths or non-whitelisted
+	// commands; others are restricted to the allowlist.
+	for name, e := range req.Servers {
+		if err := mcp.ValidateServerName(name); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if e.Command != "" {
+			cmd, args, err := parseStdioCommand(name, e.Command, e.AllowArbitraryCommand)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			e.Command = cmd
+			e.Args = append(args, e.Args...)
+		}
+		if err := e.Validate(name); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	for name, e := range req.Servers {
+		if err := mcp.UpsertUserServer(name, e); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		s.connectIfLive(r, name, e)
+	}
+
+	s.writeMCPServerList(w)
+}
+
+// lookupManagedServer resolves a path name to its managed entry. Writes the
+// HTTP error itself; the second return is false when the caller should stop.
+func (s *Server) lookupManagedServer(w http.ResponseWriter, name string) (mcp.ManagedServer, bool) {
+	managed, err := mcp.LoadManaged()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return mcp.ManagedServer{}, false
+	}
+	for _, m := range managed {
+		if m.Name == name {
+			return m, true
+		}
+	}
+	writeError(w, http.StatusNotFound, "mcp server not found")
+	return mcp.ManagedServer{}, false
+}
+
+// ─── DELETE /api/mcp/servers/{name} ─────────────────────────────────────────
+
+func (s *Server) handleDeleteMCPServer(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	s.mcpMu.Lock()
+	defer s.mcpMu.Unlock()
+
+	if _, ok := s.lookupManagedServer(w, name); !ok {
+		return
+	}
+	if err := mcp.DeleteUserServer(name); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	app.DisconnectMCPServer(name)
+	s.writeMCPServerList(w)
+}
+
+// ─── PATCH /api/mcp/servers/{name}/toggle ───────────────────────────────────
+
+func (s *Server) handleToggleMCPServer(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	s.mcpMu.Lock()
+	defer s.mcpMu.Unlock()
+
+	m, ok := s.lookupManagedServer(w, name)
+	if !ok {
+		return
+	}
+	nowDisabled := !m.Entry.Disabled
+	if err := mcp.SetUserServerDisabled(name, nowDisabled); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if nowDisabled {
+		app.DisconnectMCPServer(name)
+	} else {
+		entry := m.Entry
+		entry.Disabled = false
+		s.connectIfLive(r, name, entry)
+	}
+	s.writeMCPServerList(w)
+}
+
+// ─── POST /api/mcp/servers/{name}/reconnect ─────────────────────────────────
+
+func (s *Server) handleReconnectMCPServer(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	s.mcpMu.Lock()
+	defer s.mcpMu.Unlock()
+
+	managed, err := mcp.LoadManaged()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var entry *mcp.ManagedServer
+	for i := range managed {
+		if managed[i].Name == name {
+			entry = &managed[i]
+			break
+		}
+	}
+	if entry == nil {
+		writeError(w, http.StatusNotFound, "mcp server not found")
+		return
+	}
+	if entry.Invalid != "" {
+		writeError(w, http.StatusConflict, "cannot connect an invalid entry: "+entry.Invalid)
+		return
+	}
+	if entry.Entry.Disabled {
+		writeError(w, http.StatusConflict, "server is disabled; enable it first")
+		return
+	}
+	if !s.cfg.Tools {
+		writeError(w, http.StatusConflict, "tools are disabled on this server")
+		return
+	}
+	_ = app.ConnectMCPServer(r.Context(), name, entry.Entry, nil)
+	s.writeMCPServerList(w)
+}
+
+// ─── POST /api/mcp/reload ───────────────────────────────────────────────────
+
+// Full reload from disk: picks up hand-edited config files and retries every
+// failed connection in one pass.
+func (s *Server) handleReloadMCP(w http.ResponseWriter, r *http.Request) {
+	s.mcpMu.Lock()
+	defer s.mcpMu.Unlock()
+
+	if !s.cfg.Tools {
+		writeError(w, http.StatusConflict, "tools are disabled on this server")
+		return
+	}
+	if err := app.SwapMCP(r.Context(), nil); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.writeMCPServerList(w)
+}
+
+// ─── GET /api/config/toolsearch ─────────────────────────────────────────────
+
+type toolSearchSettings struct {
+	Enabled      string `json:"enabled"` // "auto" | "on" | "off"
+	ThresholdPct int    `json:"threshold_pct"`
+}
+
+// toolSearchDefaults mirrors the documented tools.tool_search defaults
+// (auto / 10%) so the UI shows effective values, not zeros.
+func toolSearchDefaults(c config.ToolSearchConfig) toolSearchSettings {
+	out := toolSearchSettings{
+		Enabled:      c.Enabled,
+		ThresholdPct: c.ThresholdPct,
+	}
+	if out.Enabled == "" {
+		out.Enabled = "auto"
+	}
+	if out.ThresholdPct == 0 {
+		out.ThresholdPct = 10
+	}
+	return out
+}
+
+func (s *Server) handleGetToolSearch(w http.ResponseWriter, r *http.Request) {
+	_ = r
+	cfg, err := config.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load config")
+		return
+	}
+	writeJSON(w, http.StatusOK, toolSearchDefaults(cfg.Tools.ToolSearch))
+}
+
+// ─── PUT /api/config/toolsearch ─────────────────────────────────────────────
+
+// Persists tools.tool_search.enabled and applies it to the live process so
+// the next turn of every session sees the change.
+func (s *Server) handlePutToolSearch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled string `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	switch req.Enabled {
+	case "auto", "on", "off":
+	default:
+		writeError(w, http.StatusBadRequest, `enabled must be "auto", "on", or "off"`)
+		return
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load config")
+		return
+	}
+	cfg.Tools.ToolSearch.Enabled = req.Enabled
+	if err := cfg.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save config")
+		return
+	}
+	tools.SetToolSearchConfig(app.ToolSearchConfigFrom(cfg.Tools.ToolSearch))
+	writeJSON(w, http.StatusOK, toolSearchDefaults(cfg.Tools.ToolSearch))
+}

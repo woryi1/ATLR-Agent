@@ -1,0 +1,2112 @@
+<script lang="ts">
+  import { get } from 'svelte/store'
+  import { onDestroy, onMount, untrack, tick } from 'svelte'
+  import { fade } from 'svelte/transition'
+  import { cubicOut } from 'svelte/easing'
+  import { prefersReducedMotion } from 'svelte/motion'
+  import {
+    running, activeSessionId, chatStreaming, sessions, sessionGroups,
+    chatContextUsage, chatWorkingDir, chatPermMode, chatReasoningEffort, chatShowReasoning, showToast, chatGoal, chatModel,
+    globalPermissionMode, globalReasoningEffort, nativeShell, localAccess, activeAgent, pendingModel, view, openSettingsAt,
+    pendingAgent, pendingWorkingDir, pendingGroupId, pendingReasoningEffort, pendingPermissionMode, pendingShowReasoning,
+    normalizeDir, dirLeaf, projectsClaimingDir, composerFocusRequest, superMode,
+  } from '../../lib/stores'
+  import { ws } from '../../lib/ws'
+  import * as api from '../../lib/api'
+  import { t } from '../../lib/i18n'
+  import { submitIntent } from '../../lib/composerKeys'
+  import { composeSlashCommand } from '../../lib/slashCompose'
+  import { parkDraft, takeDraft, patchParkedAttachments, type Attachment } from '../../lib/composerDrafts'
+  import { compressImage } from '../../lib/imageCompress'
+  import { goalChip as goalChipText } from '../../lib/goalChip'
+  import FolderPickerModal from '../overlays/FolderPickerModal.svelte'
+  import ProjectModal from '../overlays/ProjectModal.svelte'
+  import BalanceStrip from './BalanceStrip.svelte'
+  import EffortSlider from './EffortSlider.svelte'
+  import EffortArtOverlay from '../overlays/EffortArtOverlay.svelte'
+  import type { McpServerDetail, McpTool, SessionGroup } from '../../lib/types'
+  import { getMcpServer } from '../../lib/api'
+
+  let { onSend, onSilentSend }: {
+    onSend?: (text: string, files?: any[], queued?: boolean) => void
+    // Resolves true when the note reached the running turn. The composer only
+    // clears the draft on true, so a 409 ("no turn is running") leaves the
+    // user's text where they typed it.
+    onSilentSend?: (text: string) => Promise<boolean>
+  } = $props()
+
+  // Reject oversized attachments client-side with a clear message rather than
+  // letting them fail late. Images keep a conservative cap: they are canvas-
+  // decoded for compression and ride inline as data URLs. Other files stream
+  // to ~/.octo/uploads and are read from disk by the agent, so they only stop
+  // at the server's much larger request cap — keep MAX_FILE_BYTES in sync with
+  // maxUploadBytes in internal/server/upload_handler.go.
+  const MAX_IMAGE_BYTES = 32 * 1024 * 1024
+  const MAX_FILE_BYTES = 512 * 1024 * 1024
+
+  // Mounting claims the draft parked for this session — a trip through another
+  // view and back picks the box up exactly where it was left. The
+  // session-switch effect below owns it from there.
+  const initialSid = get(activeSessionId) ?? ''
+  const initialDraft = takeDraft(initialSid)
+  let text = $state(initialDraft.text)
+  let draftSid = initialSid
+  let textareaEl = $state<HTMLTextAreaElement | null>(null)
+  let fileInputEl = $state<HTMLInputElement | null>(null)
+  let skillMenuEl = $state<HTMLDivElement | null>(null)
+  let attachments = $state<Attachment[]>(initialDraft.attachments)
+  let dragOver = $state(false)
+
+  // Voice input. Recording + recognition happen in the Go process (see
+  // internal/voice), so the page never asks for a microphone permission and no
+  // audio crosses the webview. The button is focus-free on purpose: clicking it
+  // must not move the caret out of the draft while the user talks.
+  let voiceOn = $state(false)
+  let voiceBusy = $state(false)
+  let voiceInterim = $state('')
+
+  // The same cue 樱花简音 plays, synthesised exactly: start = 784 Hz (70 ms) +
+  // 40 ms gap + 988 Hz (70 ms) at 0.5, stop = 660 Hz (90 ms) at 0.34, each with
+  // a 5 ms fade-in and 12 ms fade-out so there is no click. WebAudio keeps it
+  // asset-free and instant; the button press is itself the user gesture that
+  // lets audio start.
+  let audioCtx: AudioContext | null = null
+
+  function cue(kind: 'start' | 'end'): void {
+    try {
+      const Ctx = window.AudioContext
+      if (!Ctx) return
+      if (!audioCtx) audioCtx = new Ctx()
+      if (audioCtx.state === 'suspended') void audioCtx.resume()
+      const ctx = audioCtx
+      const tone = (freq: number, ms: number, volume: number, at: number) => {
+        const sr = ctx.sampleRate
+        const n = Math.round((sr * ms) / 1000)
+        const buf = ctx.createBuffer(1, n, sr)
+        const data = buf.getChannelData(0)
+        const fadeIn = Math.max(1, Math.round(sr * 0.005))
+        const fadeOut = Math.max(1, Math.round(sr * 0.012))
+        for (let i = 0; i < n; i++) {
+          let env = 1
+          if (i < fadeIn) env = i / fadeIn
+          else if (i > n - fadeOut) env = Math.max(0, (n - i) / fadeOut)
+          data[i] = Math.sin((2 * Math.PI * freq * i) / sr) * volume * env
+        }
+        const src = ctx.createBufferSource()
+        src.buffer = buf
+        src.connect(ctx.destination)
+        src.start(at)
+      }
+      const t0 = ctx.currentTime + 0.01
+      if (kind === 'start') {
+        tone(784, 70, 0.5, t0)
+        tone(988, 70, 0.5, t0 + 0.11)
+      } else {
+        tone(660, 90, 0.34, t0)
+      }
+    } catch {
+      /* the cue is decorative; never let it break recording */
+    }
+  }
+
+  // While recording, mirror the server: live interim text, and a reset if the
+  // session died (gateway unreachable, device error). Without this poll the
+  // button could claim "recording" forever after a background failure.
+  $effect(() => {
+    if (!voiceOn) return
+    let alive = true
+    const tick = async () => {
+      try {
+        const st = await api.voiceStatus()
+        if (!alive) return
+        voiceInterim = st.interim
+        if (voiceOn && !st.recording) {
+          voiceOn = false
+          voiceInterim = ''
+          if (st.error) showToast($t('composer.voice_failed'), 'error')
+        }
+      } catch { /* transient: keep polling */ }
+    }
+    const id = setInterval(tick, 500)
+    void tick()
+    return () => { alive = false; clearInterval(id) }
+  })
+
+  async function toggleVoice(): Promise<void> {
+    if (voiceBusy) return
+    voiceBusy = true
+    try {
+      if (!voiceOn) {
+        voiceInterim = ''
+        cue('start')
+        await api.startVoice()
+        voiceOn = true
+      } else {
+        voiceOn = false
+        cue('end')
+        const recognised = await api.stopVoice()
+        voiceInterim = ''
+        if (recognised) insertAtCaret(recognised)
+      }
+    } catch {
+      voiceOn = false
+      voiceInterim = ''
+      showToast($t('composer.voice_failed'), 'error')
+    } finally {
+      voiceBusy = false
+    }
+  }
+
+  // Drop the transcript where the caret was, not at the end — the caret holds
+  // its place precisely because the button never took focus.
+  function insertAtCaret(snippet: string): void {
+    const el = textareaEl
+    if (!el) {
+      text = text ? `${text}${snippet}` : snippet
+      return
+    }
+    const start = el.selectionStart ?? text.length
+    const end = el.selectionEnd ?? start
+    text = text.slice(0, start) + snippet + text.slice(end)
+    const caret = start + snippet.length
+    requestAnimationFrame(() => {
+      el.focus()
+      el.selectionStart = el.selectionEnd = caret
+    })
+  }
+
+  // Called by ChatView when the user clicks "edit" on a prior message — loads
+  // that text back into the composer for resend.
+  export function setText(v: string) {
+    text = v
+    queueMicrotask(() => textareaEl?.focus())
+  }
+
+  // Another surface asked for the caret — the question banner's "interrupt
+  // and add context" button, for one. Taking focus here means the user can
+  // type their addition straight away instead of hunting for the input.
+  $effect(() => {
+    $composerFocusRequest
+    queueMicrotask(() => textareaEl?.focus())
+  })
+
+  // Called by ChatView when the user retracts a pending steer message: reload
+  // its text AND any attachments back into the composer for editing. The files
+  // are the same already-staged Attachment objects (data_url / path / local_path
+  // all resolved), so they can go straight back into the tray.
+  export function restore(v: string, files?: Attachment[]) {
+    text = v
+    if (files && files.length) attachments = [...files]
+    queueMicrotask(() => textareaEl?.focus())
+  }
+
+  // Whether the box already holds something the user typed. Callers that push
+  // text back in unprompted (a turn error handing back the failed message) check
+  // this first so they never clobber a message being composed.
+  export function isEmpty(): boolean {
+    return text.trim() === '' && attachments.length === 0
+  }
+
+  // Auto-grow the textarea with its content up to a max height, then scroll
+  // inside (matches the max-height in CSS). The $effect re-runs on every text
+  // change — typing, paste, send-clear, or programmatic setText.
+  //
+  // On Windows, setting height:'auto' then reading scrollHeight can return an
+  // inflated value (the drag strip + font metrics differ), blowing the textarea
+  // up to 5-6 lines on mount. Lock overflow to hidden while measuring so the
+  // scrollbar never contributes to scrollHeight, and floor the result to a
+  // single line so an empty box never opens tall.
+  const MAX_TEXTAREA_PX = 156
+  const MIN_TEXTAREA_PX = 24 // ≈ one line: 14px * 1.6 line-height + padding
+  function autoResize() {
+    const el = textareaEl
+    if (!el) return
+    el.style.overflow = 'hidden'
+    el.style.height = 'auto'
+    const h = el.scrollHeight
+    el.style.height = Math.min(Math.max(h, MIN_TEXTAREA_PX), MAX_TEXTAREA_PX) + 'px'
+    // Scrolling only exists once the content passes the height cap — below it
+    // a rounding sliver (scrollHeight a px or two over the set height) would
+    // otherwise paint a phantom scrollbar thumb beside the send button.
+    el.style.overflowY = h > MAX_TEXTAREA_PX ? 'auto' : 'hidden'
+    el.style.overflowX = ''
+  }
+  $effect(() => {
+    text // track the bound value so the effect re-runs when it changes
+    autoResize()
+  })
+
+  // The attach button. Same machine as the agent: attach by real path, no
+  // upload (and no size cap — the agent reads the file in place).
+  //  - desktop shell → native OS file dialog
+  //  - localhost web → in-app file picker (server-side fs browse)
+  // Remote web → browser upload (front and back aren't co-located).
+  async function openAttach() {
+    if (get(nativeShell)) {
+      try {
+        const res = await api.nativePickFile(attachStartDir)
+        if (!res.cancelled && res.path) attachLocalFile(res.path)
+      } catch (e: any) {
+        showToast(e.message ?? 'Failed to open file dialog', 'error')
+      }
+      return
+    }
+    if (get(localAccess)) {
+      pickerMode = 'file'
+      pickerOpen = true
+      return
+    }
+    fileInputEl?.click()
+  }
+
+  // Attach a real local file by its absolute path — the agent reads it in place
+  // (see server parseUserFiles' local_path handling), no upload round-trip.
+  function attachLocalFile(path: string) {
+    const name = path.split(/[/\\]/).pop() || path
+    attachTo(sid, { name, local_path: path })
+  }
+
+  function onFilesPicked(e: Event) {
+    const input = e.target as HTMLInputElement
+    const files = Array.from(input.files ?? [])
+    for (const f of files) addAttachment(f)
+    input.value = ''
+  }
+
+  // Attachment reads (image FileReader, non-image upload) resolve asynchronously.
+  // These helpers land the result on the session that STARTED the read, not
+  // whatever session is active when it finishes — otherwise switching sessions
+  // (or sending) mid-upload leaks the file into the wrong conversation.
+  // `destroyed` splits the same way for time rather than session: once the
+  // composer is gone its `attachments` is a dead end, so the result has to go
+  // to the parked draft — the placeholder is already sitting in there waiting
+  // for it (see patchParkedAttachments).
+  let uploadSeq = 0
+  let destroyed = false
+  function live(originSid: string): boolean {
+    return !destroyed && originSid === sid
+  }
+  function attachTo(originSid: string, att: Attachment) {
+    if (live(originSid)) attachments = [...attachments, att]
+    else patchParkedAttachments(originSid, list => [...list, att])
+  }
+  function patchAttachment(originSid: string, id: string, patch: Partial<Attachment>) {
+    const apply = (list: Attachment[]) => list.map(a => a.id === id ? { ...a, ...patch } : a)
+    if (live(originSid)) attachments = apply(attachments)
+    else patchParkedAttachments(originSid, apply)
+  }
+  function dropAttachment(originSid: string, id: string) {
+    const drop = (list: Attachment[]) => list.filter(a => a.id !== id)
+    if (live(originSid)) attachments = drop(attachments)
+    else patchParkedAttachments(originSid, drop)
+  }
+
+  async function addAttachment(file: File, fallbackName?: string) {
+    const name = file.name || fallbackName || 'attachment'
+    const isImage = file.type.startsWith('image/')
+    if (file.size > (isImage ? MAX_IMAGE_BYTES : MAX_FILE_BYTES)) {
+      showToast($t(isImage ? 'chat.attach_img_too_large' : 'chat.attach_too_large'), 'error')
+      return
+    }
+    const originSid = sid
+    // Images ride inline as a data URL (decoded into an image block server-side).
+    if (isImage) {
+      // Stage a placeholder synchronously (same pattern as the upload branch
+      // below): canvas compression takes ~100ms-1s for a large photo, and a
+      // send() in that window must be blocked — not fire with text only while
+      // the image silently lands on the NEXT message.
+      const id = `up-${++uploadSeq}`
+      attachTo(originSid, { id, name, mime_type: file.type, uploading: true })
+      try {
+        const dataUrl = await compressImage(file)
+        patchAttachment(originSid, id, { data_url: dataUrl, mime_type: dataUrl.startsWith('data:image/jpeg') ? 'image/jpeg' : file.type, uploading: false })
+      } catch (e: any) {
+        dropAttachment(originSid, id)
+        showToast(e?.message ?? `Failed to read ${name}`, 'error')
+      }
+      return
+    }
+    // Any other file (pdf, xlsx, zip, csv, …) uploads to ~/.octo/uploads and is
+    // sent by path; the agent reads it from disk with its own tools. Stage a
+    // visible placeholder immediately so the file is never silently lost while
+    // the upload is in flight (send() refuses until it clears), then fill in the
+    // path or drop the placeholder on failure.
+    const id = `up-${++uploadSeq}`
+    attachTo(originSid, { id, name, mime_type: file.type, uploading: true })
+    try {
+      const url = await api.uploadFile(file)
+      patchAttachment(originSid, id, { path: url, uploading: false })
+    } catch (e: any) {
+      dropAttachment(originSid, id)
+      showToast(e.message ?? `Failed to upload ${name}`, 'error')
+    }
+  }
+
+  // Paste files from the clipboard into the composer (images or any other file).
+  function onPaste(e: ClipboardEvent) {
+    const items = Array.from(e.clipboardData?.items ?? [])
+    const fileItems = items.filter(it => it.kind === 'file')
+    if (fileItems.length === 0) return
+    e.preventDefault()
+    for (const it of fileItems) {
+      const f = it.getAsFile()
+      if (!f) continue
+      addAttachment(f, f.type.startsWith('image/') ? 'pasted-image' : undefined)
+    }
+  }
+
+  // Drop files onto the composer input card.
+  function onDragOver(e: DragEvent) {
+    e.preventDefault()
+    dragOver = true
+  }
+
+  function onDragLeave(e: DragEvent) {
+    const card = e.currentTarget as HTMLElement
+    if (!card.contains(e.relatedTarget as Node)) dragOver = false
+  }
+
+  function onDrop(e: DragEvent) {
+    e.preventDefault()
+    dragOver = false
+    const files = Array.from(e.dataTransfer?.files ?? [])
+    for (const f of files) addAttachment(f)
+  }
+
+  function removeAttachment(i: number) {
+    attachments = attachments.filter((_, idx) => idx !== i)
+  }
+
+  // ── Slash autocomplete (skills + workflows via /wf + MCP servers/tools) ───
+  import type { Skill } from '../../lib/types'
+
+  let skills = $state<Skill[]>([])
+  let workflows = $state<api.NamedWorkflow[]>([])
+  let mcpServerNames = $state<string[]>([])
+  let mcpToolCache = $state<Record<string, McpTool[]>>({})
+  let slashMenu = $state(false)
+  let slashMode = $state<'skills' | 'workflows' | 'mcp-servers' | 'mcp-tools' | 'agents'>('skills')
+  let slashQuery = $state('')
+  let slashActiveIndex = $state(-1)
+  let slashMcpServer = $state('')
+  // Draft parked under a picked command so it survives as the command's
+  // argument. See composeSlashCommand.
+  let slashDraftTail = $state('')
+
+  type SlashItem =
+    | { kind: 'builtin'; name: string; descKey: string; takesArgs: boolean }
+    | { kind: 'skill'; skill: Skill }
+    | { kind: 'workflow'; workflow: api.NamedWorkflow }
+    | { kind: 'mcp-server'; name: string }
+    | { kind: 'mcp-tool'; server: string; tool: McpTool }
+    | { kind: 'agent'; id: string; name: string; icon?: string }
+    | { kind: 'agent-create' }
+
+  // Built-in slash commands that actually do something on web: /clear, /compact
+  // and /goal are handled inline by the server; /loop falls through to the model
+  // (backed by the schedule_wakeup tool). Unlike skills they aren't discoverable
+  // on their own, so surface them in the same "/" menu — the TUI already lists
+  // its built-ins in completion. Names only; descriptions are translated in the
+  // template via descKey.
+  // takesArgs=false marks the ones the server matches by exact equality
+  // (handleSlashCommand): anything appended after them turns the command into
+  // an ordinary chat message, so they never absorb a parked draft.
+  const BUILTIN_COMMANDS: { name: string; descKey: string; takesArgs: boolean }[] = [
+    { name: 'loop', descKey: 'composer.cmd_loop', takesArgs: true },
+    { name: 'goal', descKey: 'composer.cmd_goal', takesArgs: true },
+    { name: 'compact', descKey: 'composer.cmd_compact', takesArgs: false },
+    { name: 'reload', descKey: 'composer.cmd_reload', takesArgs: false },
+    { name: 'clear', descKey: 'composer.cmd_clear', takesArgs: false },
+  ]
+
+  function normalizeSlash(value: string): string {
+    return value.replace(/^[\uff0f\u3001]/, '/').replace(/^\uff20/, '@')
+  }
+
+  function parseSlashInput(value: string): { mode: SlashItem['kind'] | null; query: string; serverName?: string } {
+    const trimmed = normalizeSlash(value)
+    // A leading "@" with no whitespace summons the agent picker — only
+    // meaningful before the session is locked (see handleSlashInput's
+    // agentLocked guard): agent_profile can be reassigned up until the
+    // session's first turn runs, never after.
+    if (/^@\S*$/.test(trimmed)) {
+      return { mode: 'agent', query: trimmed.slice(1).toLowerCase() }
+    }
+    if (!trimmed.startsWith('/')) return { mode: null, query: '' }
+    const rest = trimmed.slice(1)
+    const lowerRest = rest.toLowerCase()
+    if (lowerRest === 'mcp' || lowerRest.startsWith('mcp/') || lowerRest.startsWith('mcp ')) {
+      const after = rest.slice(3).trimStart() // after "mcp"
+      if (after === '' || after === '/') {
+        return { mode: 'mcp-server', query: '' }
+      }
+      const withoutLeadingSlash = after.startsWith('/') ? after.slice(1) : after
+      const spaceIdx = withoutLeadingSlash.search(/\s/)
+      const serverName = spaceIdx >= 0 ? withoutLeadingSlash.slice(0, spaceIdx) : withoutLeadingSlash
+      const query = spaceIdx >= 0 ? withoutLeadingSlash.slice(spaceIdx + 1).trimStart().toLowerCase() : ''
+      return { mode: 'mcp-tool', query, serverName }
+    }
+    // "/wf" (own trigger, like "/mcp") lists named workflows. Checked before the
+    // generic skill match so it isn't swallowed as a skill query.
+    if (lowerRest === 'wf' || lowerRest.startsWith('wf/') || lowerRest.startsWith('wf ')) {
+      const after = rest.slice(2).trimStart() // after "wf"
+      const query = after.startsWith('/') ? after.slice(1) : after
+      return { mode: 'workflow', query: query.toLowerCase() }
+    }
+    if (/^\/\S*$/.test(trimmed)) {
+      return { mode: 'skill', query: rest.toLowerCase() }
+    }
+    return { mode: null, query: '' }
+  }
+
+  function scoreNameMatch(rawName: string, query: string): number {
+    if (!query) return 50
+    const q = query.toLowerCase()
+    const name = rawName.toLowerCase()
+    if (name === q) return 100
+    if (name.startsWith(q)) return 80
+    if (name.includes(q)) return 60
+    return 0
+  }
+
+  function scoreSkillMatch(skill: Skill, query: string): number {
+    return scoreNameMatch(skill.name, query)
+  }
+
+  function filteredItems(): SlashItem[] {
+    if (slashMode === 'skills') {
+      const q = slashQuery
+      // Built-in commands share the generic "/" trigger with skills; list them
+      // first so a bare "/" (or a prefix like "/l") surfaces them alongside
+      // matching skills.
+      const builtins: SlashItem[] = BUILTIN_COMMANDS
+        .map(cmd => ({ cmd, score: scoreNameMatch(cmd.name, q) }))
+        .filter(({ score }) => score > 0)
+        .sort((a, b) => b.score - a.score || a.cmd.name.localeCompare(b.cmd.name))
+        .map(({ cmd }) => ({ kind: 'builtin', name: cmd.name, descKey: cmd.descKey, takesArgs: cmd.takesArgs }))
+      // Mirrors RenderManifest/ManifestForProfile on the server: with no
+      // expert picked, every skill except one bundled for a specific curated
+      // expert (source "expert") is fair game — same as the Default Agent's
+      // own manifest. Once an expert is picked, only its own tool_skills
+      // show, general ("default"/"user") skills included — an expert with no
+      // tool_skills configured sees none at all, same as the server showing
+      // it an empty manifest rather than falling back to "everything".
+      const visibleSkills = currentExpertToolSkills != null
+        ? skills.filter(s => currentExpertToolSkills!.includes(s.name))
+        : skills.filter(s => s.source !== 'expert')
+      let scored = visibleSkills
+        .map(s => ({ skill: s, score: scoreSkillMatch(s, q) }))
+        .filter(({ score }) => score > 0)
+      scored.sort((a, b) => b.score - a.score || a.skill.name.localeCompare(b.skill.name))
+      const skillItems: SlashItem[] = scored.map(({ skill }) => ({ kind: 'skill', skill }))
+      return [...builtins, ...skillItems]
+    }
+    if (slashMode === 'workflows') {
+      const q = slashQuery
+      return workflows
+        .filter(w => !q || w.name.toLowerCase().includes(q) || w.description.toLowerCase().includes(q))
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map(workflow => ({ kind: 'workflow', workflow }))
+    }
+    if (slashMode === 'mcp-servers') {
+      const q = slashQuery
+      return mcpServerNames
+        .filter(n => !q || n.toLowerCase().includes(q))
+        .sort((a, b) => a.localeCompare(b))
+        .map(name => ({ kind: 'mcp-server', name }))
+    }
+    if (slashMode === 'mcp-tools') {
+      const tools = mcpToolCache[slashMcpServer] ?? []
+      const q = slashQuery
+      return tools
+        .filter(t => !q || t.name.toLowerCase().includes(q))
+        .map(tool => ({ kind: 'mcp-tool', server: slashMcpServer, tool }))
+    }
+    if (slashMode === 'agents') {
+      const q = slashQuery
+      // The expert agents, then a fixed create row that ignores the filter.
+      // Default is not one of the rows: @ is how you pick an expert, and
+      // "no expert" is reached by clearing the mention (backspace on an empty
+      // box) or from the agent menu's own Default entry.
+      const rows: SlashItem[] = pickableAgents.map(a => ({ kind: 'agent' as const, id: a.id, name: a.name, icon: a.icon }))
+      const filtered = rows
+        .map(r => ({ r, score: scoreNameMatch(r.kind === 'agent' ? r.name : '', q) }))
+        .filter(({ score }) => score > 0)
+        .sort((a, b) => b.score - a.score)
+        .map(({ r }) => r)
+      return [...filtered, { kind: 'agent-create' }]
+    }
+    return []
+  }
+
+  function showSlashMenu(mode: 'skills' | 'workflows' | 'mcp-servers' | 'mcp-tools' | 'agents', query: string, serverName = '') {
+    // Every re-open re-derives the menu from the current text, so a draft
+    // parked earlier is stale by now — keeping it would resurrect text the
+    // user has since deleted.
+    slashDraftTail = ''
+    slashMode = mode
+    slashQuery = query
+    slashMcpServer = serverName
+    slashActiveIndex = -1
+    slashMenu = true
+  }
+
+  function hideSlashMenu() {
+    slashMenu = false
+    slashActiveIndex = -1
+    slashMcpServer = ''
+    slashDraftTail = ''
+  }
+
+  async function maybeLoadMcpTools(serverName: string) {
+    if (mcpToolCache[serverName]) return
+    try {
+      const detail = await getMcpServer(serverName)
+      mcpToolCache[serverName] = detail.tool_list ?? []
+    } catch {
+      mcpToolCache[serverName] = []
+    }
+  }
+
+  // Generation guard (like modelsFetchSeq): the mcp-tool branch awaits a
+  // fetch mid-keystroke-stream, and a stale invocation resuming after the
+  // user deleted the trigger or switched servers must not re-open its menu.
+  let slashInputSeq = 0
+
+  async function handleSlashInput() {
+    const seq = ++slashInputSeq
+    const normalized = normalizeSlash(text)
+    if (normalized !== text) text = normalized
+    const parsed = parseSlashInput(text)
+    if (parsed.mode === null) {
+      hideSlashMenu()
+      return
+    }
+    if (parsed.mode === 'skill') {
+      showSlashMenu('skills', parsed.query)
+      return
+    }
+    if (parsed.mode === 'agent') {
+      // Once a session has run its first turn, agent_profile is locked —
+      // "@" is just a character then, not a picker trigger.
+      if (!agentLocked) showSlashMenu('agents', parsed.query)
+      else hideSlashMenu()
+      return
+    }
+    if (parsed.mode === 'workflow') {
+      showSlashMenu('workflows', parsed.query)
+      return
+    }
+    if (parsed.mode === 'mcp-server') {
+      showSlashMenu('mcp-servers', parsed.query)
+      return
+    }
+    if (parsed.mode === 'mcp-tool' && parsed.serverName) {
+      await maybeLoadMcpTools(parsed.serverName)
+      if (seq !== slashInputSeq) return
+      showSlashMenu('mcp-tools', parsed.query, parsed.serverName)
+      return
+    }
+    hideSlashMenu()
+  }
+
+  function selectItem(item: SlashItem) {
+    const draft = slashDraftTail
+    let command = ''
+    let takesArgs = true
+    if (item.kind === 'builtin') {
+      takesArgs = item.takesArgs
+      // Prefill "/name "; the no-arg ones (/clear, /compact) tolerate the
+      // trailing space (the server trims before matching), and the arg-taking
+      // ones (/loop, /goal) leave the caret ready for input.
+      command = '/' + item.name + ' '
+    } else if (item.kind === 'skill') {
+      command = '/' + item.skill.name + ' '
+    } else if (item.kind === 'workflow') {
+      // Prefill an editable run instruction; the user adds any args, then sends,
+      // and the agent calls the workflow tool by name. (agentic-first)
+      command = `Run the "${item.workflow.name}" workflow`
+    } else if (item.kind === 'mcp-server') {
+      command = '/mcp/' + item.name + ' '
+    } else if (item.kind === 'mcp-tool') {
+      command = $t('composer.mcp_tool_prompt').replace('{server}', item.server).replace('{tool}', item.tool.name)
+    } else if (item.kind === 'agent') {
+      // Assign the agent and swallow the "@query" trigger — the text box goes
+      // back to whatever draft the trigger was parked over (usually empty).
+      pickAgent(item.id)
+      text = draft
+      hideSlashMenu()
+      return
+    } else if (item.kind === 'agent-create') {
+      text = draft
+      hideSlashMenu()
+      view.set('agents')
+      return
+    }
+    text = takesArgs ? composeSlashCommand(command, draft) : command
+    hideSlashMenu()
+    queueMicrotask(() => textareaEl?.focus())
+  }
+
+  function moveSlashActive(delta: number) {
+    const items = filteredItems()
+    if (!slashMenu || items.length === 0) return
+    slashActiveIndex = (slashActiveIndex + delta + items.length) % items.length
+    // Keyboard nav can move the active item outside the menu's scroll
+    // viewport (max-height: 240px); scroll it back into view.
+    tick().then(() => {
+      skillMenuEl?.querySelector('.skill-menu-item.active')?.scrollIntoView({ block: 'nearest' })
+    })
+  }
+
+
+  // Full-width slash replacement + autocomplete trigger on input.
+  function onInput() {
+    handleSlashInput()
+  }
+
+  // $store autosubscription is reactive inside $derived (get() is not).
+  let sid = $derived($activeSessionId ?? '')
+
+  // Swap the composer's live text + staged attachments for the session's own
+  // draft on every session switch: save the departing session's in-progress
+  // state, restore the incoming session's (or start blank). Also resets
+  // input-history navigation, which is likewise per-session (see
+  // recallOlder/recallNewer). `sid` is the only tracked dependency — reading
+  // text/attachments inside untrack() keeps this from re-running on every
+  // keystroke or attachment change.
+  $effect(() => {
+    const nextSid = sid
+    if (nextSid === draftSid) return
+    untrack(() => {
+      if (draftSid) parkDraft(draftSid, text, attachments)
+      const draft = takeDraft(nextSid)
+      text = draft.text
+      attachments = draft.attachments
+      draftSid = nextSid
+      historyIndex = null
+      // The menu describes the departing session's text. Keyboard switches
+      // (⌘K) never fire the outside-click that would otherwise close it.
+      hideSlashMenu()
+    })
+  })
+
+  // Leaving the chat view destroys the composer. Park what's in the box under
+  // the session it belongs to (including the empty-string key of a not-yet-
+  // created chat) so coming back restores it instead of starting blank. Park
+  // before flipping `destroyed`: an upload resolving after this point patches
+  // the entry left here.
+  onDestroy(() => {
+    parkDraft(draftSid, text, attachments)
+    destroyed = true
+  })
+
+  let isStreaming = $derived($chatStreaming[sid] ?? false)
+  let currentSession = $derived($sessions.find(s => s.id === sid) ?? null)
+
+  // Session meta chips — pull live values from per-session stores, fall back
+  // to the session record, then to sensible defaults.
+  // No session yet → show the pending pick (composite "<endpoint>::<model>"
+  // id; display just the model half) that ensureActiveSession will apply, or,
+  // absent a pick, the configured default — which is the model the session
+  // ensureActiveSession creates will actually run on, so the blank new-chat
+  // view names it instead of showing a dash.
+  let defaultModelName = $state('')
+  let modelName = $derived(
+    $chatModel[sid] || currentSession?.model || currentSession?.model_id
+    || ($pendingModel ? $pendingModel.split('::').pop() : '')
+    || defaultModelName || '—',
+  )
+  // A pending pick belongs to the blank new-chat view only. Once a session is
+  // active (auto-created — which consumed it — or picked/created any other
+  // way), drop any leftover so it can't leak into a later blank view.
+  $effect(() => { if (sid) { pendingModel.set(''); pendingReasoningEffort.set('') } })
+  // "" (off) is a legitimate resolved value, not "no data yet" — only fall
+  // back to a default (?? only skips null/undefined, not "") when neither
+  // source has reported anything at all. On the landing page (no sid) that
+  // default is whatever the user already picked there (pendingReasoningEffort,
+  // consumed by ChatView.ensureActiveSession at session creation — mirrors
+  // pendingModel), or else the configured global default; a loaded session
+  // always has real data by the time it's active, so the global default is
+  // the fallback there too.
+  let reasoning = $derived.by(() => {
+    const v = $chatReasoningEffort[sid] ?? currentSession?.reasoning_effort
+    if (v !== undefined) return v || 'off'
+    // Last-resort project fallback: the session list can lag the project write
+    // (a sibling created moments ago, or a cold start where only the groups
+    // snapshot has landed). Without this the slider's first frame shows the
+    // hardcoded "off" the bug report is about, then snaps to the real value.
+    if (sid) {
+      const g = $sessionGroups.find(g => !!g.working_dir && g.session_ids.includes(sid))
+      if (g?.reasoning_effort !== undefined) return g.reasoning_effort || 'off'
+    }
+    return (sid ? '' : $pendingReasoningEffort) || $globalReasoningEffort || 'off'
+  })
+  // The project (a session group carrying a working dir) this session belongs
+  // to, if any. A project's directory governs every session in it, so the dir
+  // chip below goes read-only rather than letting the user edit a value the
+  // server would refuse.
+  // On the landing page there is no session to look up membership for, so the
+  // project comes from whichever pick is going to decide it. A group docked by
+  // the sidebar's per-group "+" wins outright — the same precedence
+  // ensureActiveSession applies — so show THAT project, or the chip would offer
+  // to choose a directory whose value the send then discards. Otherwise the
+  // project is whoever already owns the directory the user picked, which is the
+  // match ensureActiveSession will make when it files the session.
+  let project = $derived.by(() => {
+    if (sid) return $sessionGroups.find(g => !!g.working_dir && g.session_ids.includes(sid)) ?? null
+    const docked = $pendingGroupId
+    if (docked) return $sessionGroups.find(g => g.id === docked && !!g.working_dir) ?? null
+    const dir = $pendingWorkingDir
+    if (!dir) return null
+    // A parked folder pick belongs to whichever project references it — as a
+    // mounted source folder now, not only as the directory itself.
+    const norm = normalizeDir(dir)
+    return $sessionGroups.find(g => !g.task_id && !!g.working_dir &&
+      (normalizeDir(g.working_dir!) === norm || (g.source_dirs ?? []).some(sd => normalizeDir(sd) === norm))) ?? null
+  })
+  // A docked group's own directory governs the session, exactly as it does for
+  // a session already inside a project. A plain group has no directory to show,
+  // but the user still just clicked ITS "+", so name it — otherwise the landing
+  // page says nothing at all about where the session is headed.
+  let dockedGroup = $derived(!sid ? ($sessionGroups.find(g => g.id === $pendingGroupId) ?? null) : null)
+  let workingDir = $derived(
+    sid
+      ? (project?.working_dir || $chatWorkingDir[sid] || currentSession?.working_dir || '')
+      : (project?.working_dir || $pendingWorkingDir),
+  )
+  // Where the attach dialog can jump to: the project's workspace plus every
+  // folder it mounts. Both pickers open cold at one directory, and for a
+  // project that directory is the workspace — scratch ground, which is by
+  // construction not where the material you want to attach lives. Offer every
+  // place the project has and privilege none: source_dirs is a mount order,
+  // not a ranking. Empty for a session in no project (nothing to offer).
+  let attachShortcuts = $derived(
+    project && (project.source_dirs ?? []).length > 0
+      ? [
+          { label: $t('folder.shortcut_workspace'), path: project.working_dir ?? '' },
+          ...(project.source_dirs ?? []).map(d => ({ label: dirLeaf(d), path: d })),
+        ].filter(s => s.path)
+      : [],
+  )
+  // The OS file dialog takes one starting directory and no shortcut list, so
+  // seeding it with the workspace does not merely start in the wrong place —
+  // SetDirectory overrides the panel's own memory of where the user last was.
+  // For a project with mounts, seed nothing: the panel restores that memory,
+  // which after the first attach is a better answer than any directory we
+  // could name. A project with no mounts keeps the workspace, which is then
+  // genuinely the only place its work happens.
+  let attachStartDir = $derived(attachShortcuts.length > 0 ? '' : workingDir)
+  // On the landing page (no sid) the fallback is whatever was picked there
+  // (pendingPermissionMode, consumed by ChatView.ensureActiveSession at
+  // session creation — mirrors pendingReasoningEffort), else the configured
+  // global default.
+  let permMode = $derived($chatPermMode[sid] || currentSession?.permission_mode || (sid ? '' : $pendingPermissionMode) || $globalPermissionMode)
+  // Effective show-reasoning for this session: live store > session record >
+  // (landing page only) pendingShowReasoning > default true.
+  let showReasoning = $derived($chatShowReasoning[sid] ?? currentSession?.show_reasoning ?? (sid ? true : ($pendingShowReasoning ?? true)))
+  let ctxUsage = $derived(Number($chatContextUsage[sid] ?? currentSession?.context_usage ?? 0))
+  // Session goal chip: usage while active, status label otherwise. null/absent
+  // hides the chip entirely.
+  let goal = $derived($chatGoal[sid] ?? null)
+  let goalChip = $derived(goalChipText(goal))
+
+  // ── model + reasoning pickers ──────────────────────────────────────────────
+  // PR5/PR6: the flat ModelEntry list is gone — read the two-level endpoint
+  // view and flatten it into model rows the picker can show. Each row carries
+  // the composite id "<endpoint>::<model>" so pickModel can pass it to
+  // updateSessionModel, which resolves it via cfg.EntryByModel (composite-id
+  // aware since PR2).
+  // One row per endpoint model. `efforts` is the ladder the model declares
+  // (GET /api/config/endpoints → models[].reasoning_efforts); empty/missing
+  // means the model declared nothing and the pickers fall back to the full
+  // six-level ladder. Typed locally rather than in api.ts so the wire type
+  // stays exactly what the server documents.
+  type EndpointModelRow = api.EndpointModel & { reasoning_efforts?: string[] }
+  let models = $state<{ id: string; model: string; endpoint: string; endpointName: string; efforts: string[] }[]>([])
+  // Composite id of the configured default entry (EndpointsResponse.default),
+  // refreshed together with the model list.
+  let defaultModelId = $state('')
+  let modelMenu = $state(false)
+  // The landing page's project picker: search + list + create + open-folder.
+  let projMenu = $state(false)
+  let projQuery = $state('')
+  // When an opened folder is referenced by several projects, the menu narrows
+  // to those claimants so the user picks explicitly instead of us guessing.
+  let claimChoices = $state<SessionGroup[] | null>(null)
+  let projectModalOpen = $state(false)
+  let projectModalGroup = $state<SessionGroup | null>(null)
+  let agentMenu = $state(false)
+  let permMenu = $state(false)
+
+  // The model menu groups rows under their endpoint, like the design mock.
+  // The heading shows the endpoint's display name when it has one — the id is
+  // only the fallback, since a named endpoint is named precisely so the user
+  // doesn't have to read its id here.
+  let modelGroups = $derived.by(() => {
+    const out: { endpoint: string; endpointName: string; items: { id: string; model: string }[] }[] = []
+    for (const m of models) {
+      let g = out.find(x => x.endpoint === m.endpoint)
+      if (!g) { g = { endpoint: m.endpoint, endpointName: m.endpointName, items: [] }; out.push(g) }
+      g.items.push({ id: m.id, model: m.model })
+    }
+    return out
+  })
+
+  // Composite id of the row the menu should highlight as current. Rows are
+  // unique by composite id but NOT by model name (two endpoints may expose
+  // the same model, #2141), so matching by name alone lights up both — prefer
+  // the composite id whenever one is known: the session's own binding
+  // (model_id), the pending pick for a yet-to-be-created session, or the
+  // configured default for an unbound session. Empty means identity unknown
+  // (legacy bare-model binding) and the menu falls back to name matching.
+  let activeModelId = $derived.by(() => {
+    const bound = currentSession?.model_id ?? ''
+    if (bound.includes('::')) return bound
+    if (bound) return ''
+    if (!sid) return $pendingModel || defaultModelId
+    // Unbound session: it runs on the default entry — trust that only while
+    // the default still points at the model the session displays.
+    return defaultModelId.split('::').pop() === modelName ? defaultModelId : ''
+  })
+
+  // ── model menu: balance strip, effort slider, open/close motion ────────────
+  // prefersReducedMotion is a MediaQuery signal (svelte/motion), not a store —
+  // read .current so a mid-session OS change is picked up.
+  let reduce = $derived(prefersReducedMotion.current)
+  // Bumped on every open. Svelte's {#if} already recreates the subtree, but the
+  // explicit key makes "stagger restarts at zero" a stated guarantee rather
+  // than a side effect of block lifetime.
+  let modelMenuSeq = $state(0)
+
+  // Endpoint half of the current composite id — the balance endpoint falls
+  // back to ?endpoint_id=&model= only when there is no session to ask about.
+  let activeEndpointId = $derived.by(() => {
+    const id = activeModelId
+    if (id.includes('::')) return id.split('::')[0]
+    return models.find(m => m.model === modelName)?.endpoint ?? ''
+  })
+  // Reasoning ladder of the ACTIVE model. Model rows are unique by composite id
+  // but not by name, so prefer the bound id and fall back to name matching for
+  // legacy bare-model bindings — the same precedence the menu highlight uses.
+  // Derived (not cached in an effect) so a model switch repaints the slider on
+  // the next microtask, while the menu is still open.
+  let activeEfforts = $derived.by(() => {
+    const row = (activeModelId && models.find(m => m.id === activeModelId))
+      || models.find(m => m.model === modelName)
+    return row?.efforts ?? []
+  })
+
+  // 200ms in / 120ms out on the container. One element can only carry one
+  // in:/out:, so fade+lift+scale are merged into one css() string; the origin
+  // (bottom left) lives in CSS on .menu.model-menu. cubicOut is visually
+  // cubic-bezier(.22,.61,.36,1), no custom easing needed.
+  function menuIn(_node: Element, { duration = 200, delay = 0 } = {}) {
+    return {
+      duration, delay, easing: cubicOut,
+      css: (t: number) => `opacity:${t};transform:translateY(${(1 - t) * 6}px) scale(${0.96 + 0.04 * t});`,
+    }
+  }
+  function menuOut(_node: Element, { duration = 120, delay = 0 } = {}) {
+    return {
+      duration, delay, easing: cubicOut,
+      css: (t: number) => `opacity:${t};transform:translateY(${(1 - t) * 4}px) scale(${0.98 + 0.02 * t});`,
+    }
+  }
+  // Rows fade in 4px low, each one 20ms after the previous, capped at 8 steps
+  // (~160ms) so a long endpoint list never crawls in for a second.
+  function itemIn(_node: Element, { duration = 160, delay = 0 } = {}) {
+    return {
+      duration, delay, easing: cubicOut,
+      css: (t: number) => `opacity:${t};transform:translateY(${(1 - t) * 4}px);`,
+    }
+  }
+  // Flat index across grouped rows (each group's label counts as one slot).
+  function delayFor(gi: number, i: number): number {
+    let flat = i
+    for (let k = 0; k < gi; k++) flat += modelGroups[k].items.length + 1
+    return Math.max(0, Math.min(flat, 8)) * 20
+  }
+
+  // ── agent assignment ───────────────────────────────────────────────────────
+  // agent_profile can be (re)assigned right up until the session's first turn
+  // runs — the server 409s a rebind past that point, since a turn may already
+  // have applied the old profile's system prompt/tool allowlist (see
+  // handleUpdateSessionAgentProfile). Before that point — no session yet, or
+  // an existing session with turn_count 0 — the chip stays a live picker;
+  // once locked, it becomes a read-only label of the session's own profile.
+  let agents = $state<api.Agent[]>([])
+  // Pickable set: a curated expert the user hid in the gallery drops out of
+  // both pickers, while `agents` stays whole so an already-assigned (now
+  // hidden) expert still resolves to its own name in the chip label.
+  let pickableAgents = $derived(agents.filter(a => a.enabled !== false))
+  let agentLocked = $derived(!!currentSession && ((currentSession as any)?.turn_count ?? 0) > 0)
+  let sessionAgent = $derived((currentSession as any)?.agent_profile ?? '')
+  // Which id is "current" right now: the session's own profile once one
+  // exists (even pre-lock), else the pending pick for the session about to be
+  // created on send (ensureActiveSession prefers pendingAgent — what the
+  // sidebar's "+" caret or this picker chose for THIS landing page — and falls
+  // back to the globally active agent).
+  let effectiveAgentId = $derived(currentSession ? sessionAgent : ($pendingAgent || $activeAgent))
+  // Empty when the default agent applies — the chip only renders for an
+  // expert agent.
+  let agentLabel = $derived.by(() => {
+    if (!effectiveAgentId || effectiveAgentId === 'default') return ''
+    return agents.find(a => a.id === effectiveAgentId)?.name ?? effectiveAgentId
+  })
+  // null means "no expert" — the "/" menu falls back to every general skill.
+  // A non-null array (empty or not) means an expert IS picked, so the menu
+  // shows only its own tool_skills, however few — including while `agents`
+  // hasn't loaded yet, which must not read as "no expert" (see filteredItems).
+  let currentExpertToolSkills = $derived.by((): string[] | null => {
+    if (!effectiveAgentId || effectiveAgentId === 'default') return null
+    return agents.find(a => a.id === effectiveAgentId)?.tool_skills ?? []
+  })
+  async function pickAgent(id: string) {
+    agentMenu = false
+    if (currentSession) {
+      if (id !== sessionAgent) {
+        try {
+          await api.updateSessionAgentProfile(sid, id)
+          sessions.update(list => list.map((s: any) => s.id === sid ? { ...s, agent_profile: id } : s))
+        } catch (e: any) {
+          showToast(e.message ?? 'Failed to change agent', 'error')
+        }
+      }
+    } else {
+      // Overwrite the sidebar caret's pick too, or ensureActiveSession would
+      // prefer the parked one over what the composer now displays.
+      activeAgent.set(id)
+      pendingAgent.set(id)
+    }
+    queueMicrotask(() => textareaEl?.focus())
+  }
+  let dirSaving = $state(false)
+  let pickerOpen = $state(false)
+  let pickerMode = $state<'folder' | 'file'>('folder')
+  // The slider owns the ladder now: the effort row in the model menu is the
+  // only reasoning picker left, so no local ladder copy is needed here.
+
+  // Loaded at mount AND re-fetched every time the model menu opens: the list
+  // otherwise freezes at page load, so an endpoint/model configured in
+  // Settings never appeared (and rows for since-edited endpoints kept stale
+  // composite ids that no longer resolve) until a full reload (#2066).
+  // The sequence guard drops out-of-order responses — reopening the menu
+  // quickly fires overlapping fetches, and a slow first response must not
+  // overwrite a newer one.
+  let modelsFetchSeq = 0
+  async function refreshModels() {
+    const seq = ++modelsFetchSeq
+    try {
+      const ep = await api.getEndpoints()
+      if (seq !== modelsFetchSeq) return
+      const flat: { id: string; model: string; endpoint: string; endpointName: string; efforts: string[] }[] = []
+      for (const e of ep.endpoints) {
+        for (const m of e.models as EndpointModelRow[]) {
+          flat.push({
+            id: `${e.id}::${m.model}`, model: m.model, endpoint: e.id, endpointName: e.name ?? '',
+            efforts: m.reasoning_efforts ?? [],
+          })
+        }
+      }
+      models = flat
+      // Default is echoed verbatim from config — a hand-written file may
+      // carry a bare model name, which no menu row's composite id can ever
+      // equal. Treat that as identity-unknown so name matching still applies.
+      defaultModelId = ep.default?.includes('::') ? ep.default : ''
+      // Display name, unlike defaultModelId: a bare-model default is unusable
+      // as an identity but still names the model the chip should show.
+      defaultModelName = ep.default?.split('::').pop() ?? ''
+    } catch { /* keep the previous list */ }
+  }
+
+  onMount(async () => {
+    await refreshModels()
+    try { skills = await api.listSkills() } catch { /* leave empty */ }
+    try { agents = await api.listAgents() } catch { /* leave empty */ }
+    try { workflows = await api.listWorkflows() } catch { /* leave empty */ }
+    try {
+      const data = await api.listMcpServers()
+      mcpServerNames = (data.servers ?? [])
+        .filter((s: any) => s.status === 'connected')
+        .map((s: any) => s.name)
+    } catch { /* leave empty */ }
+  })
+
+  async function pickModel(m: { id: string; model: string; endpoint: string }) {
+    modelMenu = false
+    if (!sid) {
+      // No session yet: remember the pick for the session about to be
+      // auto-created (ensureActiveSession in ChatView), mirroring pickAgent.
+      // Silently returning here made the menu look broken (#2066).
+      pendingModel.set(m.id)
+      queueMicrotask(() => textareaEl?.focus())
+      return
+    }
+    try {
+      // m.id is the composite id "<endpoint>::<model>" — the backend's
+      // handleUpdateSessionModel resolves it via cfg.EntryByModel (composite-
+      // id aware since PR2), binding the session to that endpoint's sender.
+      const res = await api.updateSessionModel(sid, m.id)
+      sessions.update(list => list.map((s: any) => s.id === sid ? { ...s, model: res.model, model_id: res.model_id } : s))
+      chatModel.update(mx => ({ ...mx, [sid]: res.model }))
+    } catch (e: any) {
+      showToast(e.message ?? 'Failed to switch model', 'error')
+    }
+  }
+
+  // Returns whether the level was accepted, so the effort slider can snap its
+  // thumb back on failure (the toast alone left it showing a rejected level).
+  async function pickReasoning(level: string): Promise<boolean> {
+    // No active session yet (landing page): just park the pick, exactly like
+    // pickModel does with pendingModel. Nothing is sent to the server until
+    // ChatView.ensureActiveSession actually creates a session — this menu is
+    // freely reversible up to that point, so it must not write global state
+    // (or broadcast to every other session) on every click.
+    if (!sid) {
+      pendingReasoningEffort.set(level)
+      return true
+    }
+    try {
+      await api.updateSessionReasoningEffort(sid, level)
+      chatReasoningEffort.update(r => ({ ...r, [sid]: level }))
+      globalReasoningEffort.set(level)
+      // Mirror the server's project write locally: the project's saved level is
+      // what a NEW session born in it starts on, and the sidebar's groups
+      // snapshot is not refetched for this.
+      const g = $sessionGroups.find(g => !!g.working_dir && g.session_ids.includes(sid))
+      if (g) sessionGroups.update(gs => gs.map(x => x.id === g.id ? { ...x, reasoning_effort: level } : x))
+      // Off has no trace to show — the server forces show_reasoning off too
+      // (see handleUpdateSessionReasoningEffort); mirror it locally so the
+      // toggle doesn't flash "on" until the session_update broadcast lands.
+      if (level === 'off') {
+        chatShowReasoning.update(r => ({ ...r, [sid]: false }))
+      }
+      return true
+    } catch (e: any) {
+      showToast(e.message ?? 'Failed to set reasoning', 'error')
+      return false
+    }
+  }
+
+  async function toggleShowReasoning() {
+    if (reasoning === 'off') return
+    const next = !showReasoning
+    if (!sid) {
+      // Landing page: park the flip, exactly like pickReasoning does with
+      // pendingReasoningEffort — nothing to PATCH until a session exists.
+      pendingShowReasoning.set(next)
+      return
+    }
+    try {
+      await api.updateSessionShowReasoning(sid, next)
+      chatShowReasoning.update(r => ({ ...r, [sid]: next }))
+    } catch (e: any) {
+      showToast(e.message ?? 'Failed to toggle reasoning visibility', 'error')
+    }
+  }
+
+  // Explicit dropdown for the three engine modes (the old chip cycled on
+  // click, which hid what the next state would be — #1114's strict mode is a
+  // plain menu row now).
+  const PERM_MODES = ['interactive', 'auto', 'strict']
+  const PERM_LABEL_KEY: Record<string, string> = {
+    interactive: 'chat.ask_mode', auto: 'chat.auto_mode', strict: 'chat.strict_mode',
+  }
+  async function pickPermMode(next: string) {
+    permMenu = false
+    if (next === permMode) return
+    if (!sid) {
+      // Landing page: park the pick, exactly like pickReasoning does with
+      // pendingReasoningEffort — consumed once ChatView.ensureActiveSession
+      // actually creates a session.
+      pendingPermissionMode.set(next)
+      return
+    }
+    try {
+      await api.updateSessionPermissionMode(sid, next)
+      chatPermMode.update(m => ({ ...m, [sid]: next }))
+    } catch (e: any) {
+      showToast(e.message ?? 'Failed to switch permission mode', 'error')
+    }
+  }
+
+  function closeMenus() { modelMenu = false; agentMenu = false; permMenu = false; projMenu = false; claimChoices = null }
+
+  // The landing page's project list: claimants-only while an ambiguous folder
+  // pick is being resolved, otherwise every project, filtered by the query.
+  let projChoices = $derived.by(() => {
+    const base = claimChoices ?? $sessionGroups.filter(g => !g.task_id && !!g.working_dir)
+    const q = projQuery.trim().toLowerCase()
+    return q ? base.filter(g => g.name.toLowerCase().includes(q)) : base
+  })
+
+  function pickProject(g: SessionGroup) {
+    pendingGroupId.set(g.id)
+    pendingWorkingDir.set('')
+    closeMenus()
+  }
+
+  // Shared by the typed input and the folder picker: PATCH the session working
+  // dir and store the canonical path the server resolved (~ expanded, absolute).
+  // Returns whether it succeeded so callers can close their own UI.
+  async function applyWorkingDir(dir: string): Promise<boolean> {
+    // Landing page: the opened folder resolves to a project by the same
+    // three-state rule the CLI applies — a unique claimant is joined, several
+    // narrow the picker to an explicit choice, none parks the folder and the
+    // first send creates a project mounting it (resolveProjectForDir).
+    if (!sid) {
+      const claims = projectsClaimingDir(dir)
+      if (claims.length === 1) {
+        pickProject(claims[0])
+        return true
+      }
+      if (claims.length > 1) {
+        claimChoices = claims
+        projQuery = ''
+        projMenu = true
+        return true
+      }
+      pendingGroupId.set('')
+      pendingWorkingDir.set(dir)
+      return true
+    }
+    dirSaving = true
+    try {
+      const res = await api.updateSessionWorkingDir(sid, dir)
+      chatWorkingDir.update(w => ({ ...w, [sid]: res.working_dir }))
+      showToast(`${$t('chat.dir_set_toast')} ${shortDir(res.working_dir)}`, 'success')
+      return true
+    } catch (e: any) {
+      showToast(e.message ?? 'Failed to set working directory', 'error')
+      return false
+    } finally {
+      dirSaving = false
+    }
+  }
+
+  async function openPicker() {
+    // The chip's onclick stops propagation, so the window-level closeMenus
+    // never runs — close them here or a dropdown stays open behind the modal.
+    closeMenus()
+    // Desktop shell: use the OS folder dialog. Plain web: open the in-app tree.
+    if (get(nativeShell)) {
+      try {
+        const res = await api.nativePickFolder(workingDir)
+        if (!res.cancelled && res.path) await applyWorkingDir(res.path)
+      } catch (e: any) {
+        showToast(e.message ?? 'Failed to open folder dialog', 'error')
+      }
+      return
+    }
+    pickerMode = 'folder'
+    pickerOpen = true
+  }
+
+  // The in-app picker either attaches a file (openAttach) or sets the session
+  // working directory, depending on the mode it was opened in.
+  async function onPickerSelect(path: string) {
+    if (pickerMode === 'file') {
+      attachLocalFile(path)
+      closePicker()
+      return
+    }
+    if (await applyWorkingDir(path)) closePicker()
+  }
+
+  // Dismissing the modal must hand focus back to the composer; otherwise it
+  // lands on <body> and the next keystroke goes nowhere.
+  function closePicker() {
+    pickerOpen = false
+    queueMicrotask(() => textareaEl?.focus())
+  }
+
+  // Show only the last two path segments so a long working dir doesn't push
+  // the chip row onto a second line. Full path is in the title tooltip.
+  function shortDir(p: string): string {
+    if (!p) return ''
+    const parts = p.split('/').filter(Boolean)
+    return parts.length <= 2 ? p : '…/' + parts.slice(-2).join('/')
+  }
+
+  // Split for the landing bar: everything above the last segment collapses
+  // under CSS ellipsis, the last segment never does.
+  function dirHead(p: string): string {
+    const cut = p.lastIndexOf('/')
+    return cut <= 0 ? '' : p.slice(0, cut)
+  }
+  function dirTail(p: string): string {
+    const cut = p.lastIndexOf('/')
+    return cut < 0 ? p : p.slice(cut)
+  }
+
+  // queued=true parks the message as its own follow-up turn instead of steering
+  // the turn in flight (Cmd/Ctrl+Enter — the web counterpart of the TUI's
+  // Ctrl+Q). Idle it makes no difference: the server just starts the turn.
+  function send(queued = false) {
+    if (!text.trim() && attachments.length === 0) return
+    // Don't send while an attachment upload is still in flight — the file
+    // would be dropped and re-appear on the next message.
+    if (attachments.some(a => a.uploading)) {
+      showToast($t('chat.upload_in_progress'), 'error')
+      return
+    }
+    // Everything staged rides one WS message bounded by wsMaxMessageSize
+    // (4 MB server-side). Compressed images are ~600KB each, but exempt
+    // GIFs/SVGs and large batches can still aggregate past the cap — refuse
+    // cleanly here instead of letting the server drop the connection (1009)
+    // and losing the whole message.
+    let payload = text.length
+    for (const a of attachments) payload += a.data_url?.length ?? 0
+    if (payload > 3_500_000) {
+      showToast($t('chat.attach_batch_too_big'), 'error')
+      return
+    }
+    const v = text.trim()
+    const files = attachments.length ? [...attachments] : undefined
+    pushHistory(sid, v)
+    // Enter sends whenever no menu row is highlighted, so the menu can outlive
+    // the message it was opened over. Close it with the text it belongs to.
+    hideSlashMenu()
+    text = ''
+    attachments = []
+    if (onSend) {
+      onSend(v, files, queued)
+    } else {
+      running.set(true)
+    }
+  }
+
+  function stop() {
+    const s = get(activeSessionId)
+    if (s) ws.interrupt(s)
+    running.set(false)
+  }
+
+  // ── Silent send ────────────────────────────────────────────────────────────
+  // Mid-turn only: appends the draft to the running turn's tool log so the
+  // agent sees it on its next step, without interrupting the tool that is
+  // running and without queueing a new turn. Clear the draft only once the
+  // server confirms; on 409 the text stays put so the user can hit the normal
+  // send button (which steers) themselves.
+  let silentBusy = $state(false)
+  async function silentSend() {
+    if (silentBusy) return
+    if (!text.trim()) return
+    if (!onSilentSend) return
+    // Text only: the endpoint takes {text}. Silently dropping staged files is
+    // not an option, so refuse instead.
+    if (attachments.length > 0) {
+      showToast($t('chat.silent_send_attachments'), 'error')
+      return
+    }
+    if (attachments.some(a => a.uploading)) {
+      showToast($t('chat.upload_in_progress'), 'error')
+      return
+    }
+    silentBusy = true
+    try {
+      const ok = await onSilentSend(text.trim())
+      if (!ok) return
+      hideSlashMenu()
+      text = ''
+      attachments = []
+    } finally {
+      silentBusy = false
+    }
+  }
+
+  // ── Input history (↑/↓ recall of previously sent messages) ────────────────
+  // Keyed by session id, like the draft above, so recall never surfaces
+  // another conversation's messages. Plain object — not rendered, only read
+  // from keyboard handlers.
+  let sentHistory: Record<string, string[]> = {}
+  let historyIndex = $state<number | null>(null)
+  let historyDraft = ''
+
+  function pushHistory(forSid: string, sent: string) {
+    if (!forSid || !sent) return
+    const list = sentHistory[forSid] ?? (sentHistory[forSid] = [])
+    if (list[list.length - 1] !== sent) list.push(sent)
+    historyIndex = null
+  }
+
+  function caretAtStart(el: HTMLTextAreaElement): boolean {
+    return el.selectionStart === 0 && el.selectionEnd === 0
+  }
+  function caretAtEnd(el: HTMLTextAreaElement): boolean {
+    return el.selectionStart === el.value.length && el.selectionEnd === el.value.length
+  }
+
+  // Recall the previous (older) sent message. Only armed when the caret sits
+  // at the very start of the textarea so it doesn't hijack normal cursor
+  // movement inside a multi-line draft.
+  function recallOlder() {
+    const list = sentHistory[sid] ?? []
+    if (list.length === 0) return
+    if (historyIndex === null) {
+      historyDraft = text
+      historyIndex = list.length - 1
+    } else if (historyIndex > 0) {
+      historyIndex -= 1
+    } else {
+      return
+    }
+    text = list[historyIndex]
+    queueMicrotask(() => textareaEl?.setSelectionRange(text.length, text.length))
+  }
+
+  // Recall the next (newer) sent message, or restore the in-progress draft
+  // once history is exhausted.
+  function recallNewer() {
+    if (historyIndex === null) return
+    const list = sentHistory[sid] ?? []
+    if (historyIndex < list.length - 1) {
+      historyIndex += 1
+      text = list[historyIndex]
+    } else {
+      historyIndex = null
+      text = historyDraft
+    }
+    queueMicrotask(() => textareaEl?.setSelectionRange(text.length, text.length))
+  }
+
+  function onKeydown(e: KeyboardEvent) {
+    // While an IME composition is active (CJK input via pinyin/kana/etc.), let
+    // the IME own every key. The Enter that confirms a candidate must not also
+    // send the message, and arrows must navigate candidates, not the slash menu.
+    // keyCode 229 covers browsers that don't set isComposing on the final key.
+    if (e.isComposing || e.keyCode === 229) return
+    // Slash menu navigation
+    if (slashMenu) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); moveSlashActive(1); return }
+      if (e.key === 'ArrowUp') { e.preventDefault(); moveSlashActive(-1); return }
+      if (e.key === 'Escape') { e.preventDefault(); hideSlashMenu(); return }
+      if ((e.key === 'Tab' || e.key === 'Enter') && slashActiveIndex >= 0) {
+        const items = filteredItems()
+        if (items[slashActiveIndex]) {
+          e.preventDefault()
+          selectItem(items[slashActiveIndex])
+          return
+        }
+      }
+    }
+
+    // Backspace on an empty box un-assigns the picked agent (back to Default)
+    // instead of doing nothing — only while it's still changeable (agentLocked
+    // false) and there's actually something assigned to clear. Lets the user
+    // immediately reselect via "@" without hunting for the dropdown.
+    if (e.key === 'Backspace' && text === '' && !slashMenu && !agentLocked && agentLabel) {
+      e.preventDefault()
+      pickAgent('default')
+      return
+    }
+
+    // Enter sends (mid-turn: steers); Cmd/Ctrl+Enter queues as the next turn;
+    // Shift+Enter falls through to the textarea's own newline. See composerKeys.
+    const intent = submitIntent(e)
+    if (intent) {
+      e.preventDefault()
+      send(intent === 'queue')
+      return
+    }
+
+    // History recall — armed only at the start/end of the textarea so it
+    // doesn't hijack cursor movement inside a multi-line draft.
+    if (e.key === 'ArrowUp' && textareaEl && caretAtStart(textareaEl)) {
+      e.preventDefault()
+      recallOlder()
+      return
+    }
+    if (e.key === 'ArrowDown' && textareaEl && historyIndex !== null && caretAtEnd(textareaEl)) {
+      e.preventDefault()
+      recallNewer()
+      return
+    }
+  }
+
+  // Click outside to close slash menu.
+  function onWindowClick(e: MouseEvent) {
+    const target = e.target as HTMLElement
+    if (slashMenu && !target.closest('.skill-menu')) {
+      hideSlashMenu()
+    }
+    closeMenus()
+  }
+</script>
+
+<svelte:window onclick={onWindowClick} />
+
+<div class="composer">
+  <div class="input-wrap">
+    <!-- Picking a working directory is the landing page's first real decision
+         — and the one that files the session under a project — so it sits in a
+         bar of its own above the input instead of hiding among the toolbar
+         chips. Docked sessions inherit the directory and never see this. -->
+    {#if !sid && !dockedGroup}
+      <div class="picker dir-bar-wrap">
+        <button
+          class="dir-bar"
+          class:empty={!workingDir}
+          title={workingDir ? $t('chat.dir_change') + ` — ${workingDir}` : undefined}
+          onclick={(e) => { e.stopPropagation(); const open = projMenu; closeMenus(); projMenu = !open; if (!open) projQuery = '' }}
+        >
+          <iconify-icon icon="ant-design:folder-outlined" width="15"></iconify-icon>
+          {#if workingDir}
+            <!-- Two spans, not one elided string: the last segment is the
+                 directory the user recognises, so it stays at its natural width
+                 and only the parent path collapses when the bar runs out of
+                 room. Full path is in the tooltip. -->
+            <span class="mono dir-bar-path">
+              <span class="dir-head">{dirHead(workingDir)}</span><span class="dir-tail">{dirTail(workingDir)}</span>
+            </span>
+            {#if project}
+              <span class="dir-owner">{project.name}</span>
+            {/if}
+          {:else}
+            <span class="dir-bar-path">{$t('chat.project_pick')}</span>
+          {/if}
+        </button>
+        {#if projMenu}
+          <div class="menu proj-menu" onclick={(e) => e.stopPropagation()}>
+            {#if claimChoices}
+              <div class="menu-label">{$t('chat.project_ambiguous')}</div>
+            {:else}
+              <input
+                class="proj-search mono"
+                placeholder={$t('chat.project_search')}
+                bind:value={projQuery}
+              />
+            {/if}
+            {#if projChoices.length === 0}
+              <div class="menu-empty">{$t('chat.project_none')}</div>
+            {/if}
+            {#each projChoices as g (g.id)}
+              <button class="menu-item" onclick={() => pickProject(g)}>
+                <iconify-icon icon="ant-design:folder-outlined" width="13"></iconify-icon>
+                <span class="mi-name">{g.name}</span>
+              </button>
+            {/each}
+            <div class="menu-divider"></div>
+            <button class="menu-item" onclick={() => { closeMenus(); projectModalGroup = null; projectModalOpen = true }}>
+              <iconify-icon icon="lucide:plus" width="13"></iconify-icon>
+              <span class="mi-name">{$t('chat.project_new')}</span>
+            </button>
+            <button class="menu-item" onclick={() => { openPicker() }}>
+              <iconify-icon icon="ant-design:folder-open-outlined" width="13"></iconify-icon>
+              <span class="mi-name">{$t('chat.project_open_folder')}</span>
+            </button>
+          </div>
+        {/if}
+      </div>
+    {/if}
+    <div
+      class="input-card"
+      class:drag-over={dragOver}
+      ondragover={onDragOver}
+      ondragleave={onDragLeave}
+      ondrop={onDrop}
+    >
+      {#if attachments.length > 0}
+        <div class="attachments">
+          {#each attachments as a, i}
+            <span class="attach-chip" class:uploading={a.uploading} title={a.name}>
+              <iconify-icon icon={a.uploading ? 'ant-design:loading-outlined' : 'ant-design:paper-clip-outlined'} width="12"></iconify-icon>
+              <span class="attach-name">{a.name}</span>
+              {#if !a.uploading}
+                <button class="attach-x" title={$t('chat.remove')} onclick={() => removeAttachment(i)}>
+                  <iconify-icon icon="ant-design:close-outlined" width="11"></iconify-icon>
+                </button>
+              {/if}
+            </span>
+          {/each}
+        </div>
+      {/if}
+      <div class="input-row">
+        {#if agentLabel}
+        {#if agentLocked}
+        <span class="agent-chip" title={$t('composer.session_agent')}>
+          <span class="agent-at">@</span>
+          <span class="agent-name">{agentLabel}</span>
+        </span>
+        {:else}
+        <div class="picker">
+          <button class="agent-chip pickable" title={$t('composer.assign_agent')} onclick={(e) => { e.stopPropagation(); const open = agentMenu; closeMenus(); agentMenu = !open }}>
+            <span class="agent-at">@</span>
+            <span class="agent-name">{agentLabel}</span>
+          </button>
+          {#if agentMenu}
+            <div class="menu agent-menu" onclick={(e) => e.stopPropagation()}>
+              <div class="menu-label">{$t('composer.assign_agent')}</div>
+              <button class="menu-item" class:active={effectiveAgentId === 'default'} onclick={() => pickAgent('default')}>
+                <span class="mi-name">Default</span>
+              </button>
+              {#each pickableAgents as a (a.id)}
+                <button class="menu-item" class:active={effectiveAgentId === a.id} onclick={() => pickAgent(a.id)}>
+                  <span class="mi-name with-icon">
+                    <iconify-icon icon={a.icon || 'ant-design:robot-outlined'} width="13"></iconify-icon>
+                    {a.name}
+                  </span>
+                </button>
+              {/each}
+              <div class="menu-divider"></div>
+              <button class="menu-item manage" onclick={() => { agentMenu = false; view.set('agents') }}>
+                <iconify-icon icon="ant-design:plus-outlined" width="12"></iconify-icon>
+                <span class="mi-name">{$t('agents.create')}</span>
+              </button>
+            </div>
+          {/if}
+        </div>
+        {/if}
+        {/if}
+        <textarea
+          bind:this={textareaEl}
+          rows={1}
+          placeholder={isStreaming || $running ? $t('chat.placeholder_running') : $t('chat.placeholder')}
+          bind:value={text}
+          onkeydown={onKeydown}
+          oninput={onInput}
+          onpaste={onPaste}
+        ></textarea>
+        {#if isStreaming || $running}
+          <!-- Mid-turn: Stop interrupts the running turn; Send stays available
+               so a follow-up message steers the turn in flight (rides the
+               running Agent's Inbox server-side), and Cmd/Ctrl+Enter queues it
+               as a separate turn instead (the server's steer queue). -->
+          <button class="stop-btn" title={$t('chat.stop')} onclick={stop}>
+            <span class="stop-sq"></span>
+          </button>
+          <!-- Silent send: appends the draft to the tool log without steering
+               or interrupting. No keyboard binding on purpose — Enter must keep
+               steering, this is a deliberate second click. -->
+          <button
+            class="silent-send-btn"
+            title={$t('chat.silent_send_hint')}
+            aria-label={$t('chat.silent_send')}
+            disabled={silentBusy || !text.trim() || attachments.length > 0}
+            onclick={silentSend}
+          >
+            <iconify-icon icon="ph:paper-plane-tilt" width="15"></iconify-icon>
+          </button>
+        {/if}
+        <!-- Arrow-wrapped: a bare `onclick={send}` would hand the MouseEvent to
+             the `queued` parameter and queue every click. -->
+        <button class="send-btn" title={isStreaming || $running ? $t('chat.send_or_queue_hint') : $t('chat.send')} aria-label={$t('chat.send')} onclick={() => send()}>
+          <iconify-icon icon="lucide:send" width="16"></iconify-icon>
+        </button>
+      </div>
+      {#if slashMenu}
+        <div class="skill-menu" bind:this={skillMenuEl}>
+          {#each filteredItems() as item, i (item.kind + ':' + (item.kind === 'builtin' ? item.name : item.kind === 'skill' ? item.skill.name : item.kind === 'workflow' ? item.workflow.name : item.kind === 'mcp-server' ? item.name : item.kind === 'agent' ? item.id : item.kind === 'agent-create' ? '' : item.server + '/' + item.tool.name))}
+            <button
+              class="skill-menu-item"
+              class:active={i === slashActiveIndex}
+              onclick={() => selectItem(item)}
+            >
+              {#if item.kind === 'builtin'}
+                <span class="skill-name">/{item.name}</span>
+                <span class="skill-desc">{$t(item.descKey)}</span>
+              {:else if item.kind === 'skill'}
+                <span class="skill-name">/{item.skill.name}</span>
+                {#if item.skill.desc}
+                  <span class="skill-desc">{item.skill.desc}</span>
+                {/if}
+              {:else if item.kind === 'workflow'}
+                <span class="skill-name">{item.workflow.name}</span>
+                {#if item.workflow.description}
+                  <span class="skill-desc">{item.workflow.description}</span>
+                {/if}
+              {:else if item.kind === 'agent'}
+                <span class="skill-name with-icon">
+                  <iconify-icon icon={item.icon || 'ant-design:robot-outlined'} width="13"></iconify-icon>
+                  @{item.name}
+                </span>
+                <span class="skill-desc">{$t('composer.assign_agent')}</span>
+              {:else if item.kind === 'agent-create'}
+                <span class="skill-name create">
+                  <iconify-icon icon="ant-design:plus-outlined" width="12"></iconify-icon>
+                  {$t('agents.create')}
+                </span>
+              {:else if item.kind === 'mcp-server'}
+                <span class="skill-name">/mcp/{item.name}</span>
+                <span class="skill-desc">{$t('composer.label_mcp_server')}</span>
+              {:else}
+                <span class="skill-name">mcp__{item.server}__{item.tool.name}</span>
+                {#if item.tool.description}
+                  <span class="skill-desc">{item.tool.description}</span>
+                {/if}
+              {/if}
+            </button>
+          {:else}
+            <div class="skill-menu-empty">
+              {slashMode === 'skills' ? $t('composer.no_match_skills') : slashMode === 'workflows' ? $t('composer.no_match_workflows') : slashMode === 'mcp-servers' ? $t('composer.no_match_servers') : $t('composer.no_match_tools')}
+            </div>
+          {/each}
+        </div>
+      {/if}
+      <div class="meta-row">
+        <input
+          bind:this={fileInputEl}
+          type="file"
+          multiple
+          style="display:none"
+          onchange={onFilesPicked}
+        />
+        <button class="meta-chip" title={$t('chat.attach_file')} onclick={openAttach}>
+          <iconify-icon icon="ant-design:paper-clip-outlined" width="13"></iconify-icon>
+        </button>
+        <div class="picker">
+          <button class="meta-chip" onclick={(e) => { e.stopPropagation(); const open = modelMenu; closeMenus(); if (!open) modelMenuSeq++; modelMenu = !open; if (!open) void refreshModels() }}>
+            <iconify-icon icon="ant-design:robot-outlined" width="13"></iconify-icon>
+            <span class="mono">{modelName}</span>
+            <iconify-icon icon="lucide:chevron-down" width="12"></iconify-icon>
+          </button>
+          {#if modelMenu}
+            <!-- The head (balance + effort + show-reasoning) never scrolls; only
+                 .mm-body does, which is why .menu.model-menu hands its
+                 max-height down. in:/out: are split on purpose: 200ms rise in,
+                 120ms reverse out. -->
+            <div
+              class="menu model-menu"
+              in:menuIn={{ duration: reduce ? 0 : 200 }}
+              out:menuOut={{ duration: reduce ? 0 : 120 }}
+              onclick={(e) => e.stopPropagation()}
+            >
+              <div class="mm-head">
+                <BalanceStrip sessionId={sid} projectId={project?.id ?? ''} endpointId={activeEndpointId} model={modelName === '—' ? '' : modelName} />
+                <EffortSlider value={reasoning} levels={activeEfforts} onCommit={pickReasoning} />
+                <!-- "Show reasoning" lives here now: the effort slider above is
+                     the only reasoning picker, so its companion toggle sits
+                     directly under it. Off has no trace to show — disabled. -->
+                <button
+                  class="menu-item toggle-item show-reasoning"
+                  disabled={reasoning === 'off'}
+                  onclick={() => toggleShowReasoning()}
+                >
+                  <span class="mi-name">{$t('chat.show_reasoning')}</span>
+                  <span class="toggle" class:on={showReasoning && reasoning !== 'off'}>
+                    <span class="toggle-knob"></span>
+                  </span>
+                </button>
+              </div>
+              <div class="mm-body">
+                {#if models.length === 0}
+                  <div class="menu-empty">{$t('chat.no_models')}</div>
+                {:else}
+                  {#key modelMenuSeq}
+                    {#each modelGroups as g, gi (g.endpoint)}
+                      <div
+                        class="menu-label"
+                        class:mono={!g.endpointName}
+                        in:itemIn={{ duration: reduce ? 0 : 160, delay: reduce ? 0 : delayFor(gi, -1) }}
+                        out:fade={{ duration: reduce ? 0 : 90 }}
+                      >{g.endpointName || g.endpoint}</div>
+                      {#each g.items as m, i (m.id)}
+                        <button
+                          class="menu-item"
+                          class:active={activeModelId ? m.id === activeModelId : m.model === modelName}
+                          in:itemIn={{ duration: reduce ? 0 : 160, delay: reduce ? 0 : delayFor(gi, i) }}
+                          out:fade={{ duration: reduce ? 0 : 90 }}
+                          onclick={() => pickModel({ id: m.id, model: m.model, endpoint: g.endpoint })}
+                        >
+                          <span class="mi-name mono">{m.model}</span>
+                        </button>
+                      {/each}
+                    {/each}
+                    <div class="menu-divider"></div>
+                    <button class="menu-item manage" onclick={() => { modelMenu = false; openSettingsAt('endpoints') }}>
+                      <span class="mi-name">{$t('composer.manage_models')}</span>
+                    </button>
+                  {/key}
+                {/if}
+              </div>
+            </div>
+          {/if}
+        </div>
+        <!-- The reasoning-tier artwork, floating over the page while the model
+             menu is open — and lingering five seconds after it closes when
+             Super is on. It lives OUTSIDE the menu's {#if} on purpose: inside
+             it would be torn down the moment the menu closes, and the linger
+             would never happen. pointer-events: none — it never eats a click. -->
+        <EffortArtOverlay level={reasoning} superOn={$superMode} open={modelMenu} />
+        <!-- Once the session exists the directory is settled and the composer
+             says nothing about it. What's left here is the docked landing page,
+             where the group the session is being filed under already made the
+             choice — dockedGroup is null the moment a session exists, so it
+             gates this row on its own. -->
+        {#if dockedGroup}
+          {#if workingDir && project}
+            <span class="meta-chip static" title={$t('chat.dir_from_project').replace('{name}', project.name) + ` — ${workingDir}`}>
+              <iconify-icon icon="ant-design:folder-outlined" width="13"></iconify-icon>
+              <span class="mono dir-path">{shortDir(workingDir)}</span>
+              <span class="dir-owner">{project.name}</span>
+            </span>
+          {:else}
+            <!-- A plain group: no directory to inherit, but naming it is the only
+                 signal on this page that the session is being filed there. -->
+            <span class="meta-chip static" title={$t('chat.dir_from_project').replace('{name}', dockedGroup.name)}>
+              <iconify-icon icon="ant-design:folder-outlined" width="13"></iconify-icon>
+              <span class="dir-owner">{dockedGroup.name}</span>
+            </span>
+          {/if}
+        {/if}
+        {#if goalChip}
+          <span class="meta-chip static" title={goal?.objective ?? ''}>
+            <span>{$t('chat.goal')}</span>
+            <span class="mono">{goalChip}</span>
+          </span>
+        {/if}
+        <span style="margin-left:auto;"></span>
+        {#if voiceOn && voiceInterim}
+          <span class="voice-live" title={voiceInterim}>{voiceInterim}</span>
+        {/if}
+        <!-- Voice input sits in the small gap left of the context readout.
+             tabindex -1 + pointerdown preventDefault keep the textarea's focus
+             and caret exactly where the user left them. -->
+        <button
+          class="voice-btn"
+          class:on={voiceOn}
+          class:busy={voiceBusy}
+          title={voiceOn ? $t('composer.voice_stop') : $t('composer.voice_start')}
+          aria-label={voiceOn ? $t('composer.voice_stop') : $t('composer.voice_start')}
+          aria-pressed={voiceOn}
+          tabindex="-1"
+          onpointerdown={(e) => e.preventDefault()}
+          onclick={(e) => { e.stopPropagation(); void toggleVoice() }}
+        >
+          <iconify-icon icon={voiceOn ? 'lucide:square' : 'lucide:mic'} width="14"></iconify-icon>
+        </button>
+        <span class="meta-chip static" title={$t('chat.context')}>
+          <iconify-icon icon="lucide:clock" width="13"></iconify-icon>
+          <span>{$t('chat.context')}</span>
+          <span class="mono ctx-pct">{ctxUsage}%</span>
+        </span>
+        <div class="picker">
+          <button class="meta-chip" title={$t('chat.perm_toggle_hint')} onclick={(e) => { e.stopPropagation(); const open = permMenu; closeMenus(); permMenu = !open }}>
+            <span class="perm-dot" data-mode={permMode}></span>
+            <span>{$t(PERM_LABEL_KEY[permMode] ?? 'chat.ask_mode')}</span>
+            <iconify-icon icon="lucide:chevron-down" width="12"></iconify-icon>
+          </button>
+          {#if permMenu}
+            <div class="menu perm-menu" onclick={(e) => e.stopPropagation()}>
+              {#each PERM_MODES as mode}
+                <button class="menu-item" class:active={mode === permMode} onclick={() => pickPermMode(mode)}>
+                  <span class="perm-dot" data-mode={mode}></span>
+                  <span class="mi-name">{$t(PERM_LABEL_KEY[mode])}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{#if pickerOpen}
+  <FolderPickerModal
+    initialPath={workingDir}
+    mode={pickerMode}
+    shortcuts={pickerMode === 'file' ? attachShortcuts : []}
+    onSelect={onPickerSelect}
+    onClose={closePicker}
+  />
+{/if}
+
+{#if projectModalOpen}
+  <ProjectModal
+    group={projectModalGroup}
+    onClose={() => (projectModalOpen = false)}
+    onSaved={(g) => { projectModalOpen = false; if (!sid) pickProject(g) }}
+  />
+{/if}
+
+<style>
+.composer {
+  flex: 0 0 auto;
+  background: var(--bg-layout);
+}
+.picker { position: relative; }
+.menu {
+  position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 50;
+  min-width: 200px; max-width: 320px; max-height: 280px; overflow-y: auto;
+  background: var(--bg-container); border: 1px solid var(--border-secondary); border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(15,23,42,0.14); padding: 4px;
+}
+/* Model menu only: header (balance + effort) pinned, list scrolls. .menu is
+   shared by five dropdowns, so everything here is scoped by .model-menu. */
+.menu.model-menu {
+  display: flex; flex-direction: column;
+  padding: 0; min-width: 340px; max-width: 400px; max-height: 420px;
+  overflow: hidden; transform-origin: bottom left;
+}
+.mm-head {
+  flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px;
+  padding: 9px 10px 9px; border-bottom: 1px solid var(--border-secondary);
+}
+/* min-height:0 is what actually lets a flex child scroll. */
+.mm-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px; }
+.menu-item {
+  width: 100%; display: flex; flex-direction: column; gap: 1px; align-items: flex-start;
+  padding: 7px 10px; border: none; background: transparent; border-radius: 6px;
+  cursor: pointer; font-family: inherit; text-align: left;
+}
+.menu-item:hover { background: var(--active-blue-bg); }
+.menu-item.active { background: var(--active-blue-bg); }
+.menu-divider { height: 1px; background: var(--border-secondary); margin: 4px 0; }
+.menu-item.toggle-item { flex-direction: row; justify-content: space-between; align-items: center; }
+.menu-item.toggle-item:disabled { cursor: default; opacity: 0.5; }
+.menu-item.toggle-item:disabled:hover { background: none; }
+/* Sits in .mm-head, which already pads 10px horizontally — the row only needs
+   a little vertical padding, not the menu-item indent. */
+.menu-item.show-reasoning { padding: 3px 2px; }
+.toggle {
+  width: 30px; height: 16px; border-radius: 9999px; background: var(--border);
+  position: relative; cursor: pointer; transition: background 0.15s ease;
+}
+.toggle.on { background: var(--success); }
+.toggle-knob {
+  position: absolute; top: 2px; left: 2px;
+  width: 12px; height: 12px; border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+  transition: transform 0.15s ease;
+}
+.toggle.on .toggle-knob { transform: translateX(14px); }
+.mi-name { font-size: 13px; color: var(--text); }
+.mi-name.with-icon, .skill-name.with-icon { display: inline-flex; align-items: center; gap: 6px; }
+.menu-empty { padding: 8px 10px; font-size: 12px; color: var(--text-tertiary); }
+.mono { font-family: var(--font-mono); }
+.dir-path { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Names the project that owns this directory, so the landing page explains
+   itself without needing the tooltip: it previews where the first message
+   lands. */
+.dir-owner {
+  max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding-left: 5px; margin-left: 1px; border-left: 1px solid var(--border-secondary);
+  color: var(--text-tertiary);
+}
+.input-wrap { max-width: var(--chat-content-max-width, 1080px); margin: 0 auto; padding: 8px 24px 14px; }
+.dir-bar {
+  width: 100%; display: flex; align-items: center; gap: 8px;
+  margin-bottom: 6px; padding: 9px 14px;
+  background: var(--bg-container); border: 1px solid var(--border-secondary);
+  border-radius: 14px; font-size: 13px; font-family: inherit; color: var(--text);
+  cursor: pointer; text-align: left;
+}
+.dir-bar:hover { border-color: var(--blue-6); background: var(--row-hover); }
+.dir-bar:focus-visible { outline: none; border-color: var(--blue-6); box-shadow: 0 0 0 2px var(--focus-ring); }
+/* Nothing picked yet: reads as an invitation rather than as state. */
+.dir-bar.empty { color: var(--text-tertiary); }
+.dir-bar-path { flex: 1; min-width: 0; display: flex; overflow: hidden; white-space: nowrap; }
+.dir-head { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.dir-tail { flex: 0 0 auto; }
+/* The project picker anchors its menu to the bar; .picker/.menu are the same
+   primitives the model/reasoning pickers use, widened to the bar. */
+.dir-bar-wrap { position: relative; display: block; }
+.proj-menu { left: 0; right: 0; min-width: 0; max-height: 320px; overflow-y: auto; }
+/* Icon + name on one line — the column default exists for menu items that
+   stack a description under the name; these items have none. */
+.proj-menu .menu-item { flex-direction: row; align-items: center; gap: 6px; }
+.proj-search {
+  width: calc(100% - 16px); margin: 6px 8px; padding: 6px 8px;
+  background: var(--bg-layout); border: 1px solid var(--border-secondary);
+  border-radius: 8px; font-size: 12px; color: var(--text);
+}
+.proj-search:focus { outline: none; border-color: var(--blue-6); }
+.input-card {
+  /* A quiet block rather than a bordered card: a hairline edge, no shadow. The
+     rounder corner (18 vs the old 14) reads more like a single soft shape. */
+  background: var(--bg-container); border: 1px solid var(--border-secondary); border-radius: 18px;
+  padding: 8px 10px; display: flex; flex-direction: column; gap: 6px;
+  position: relative;
+}
+.input-card:focus-within {
+  border-color: var(--blue-6);
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+.input-card.drag-over {
+  border-color: var(--blue-6);
+  background: var(--row-hover);
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+.input-row { display: flex; align-items: flex-end; gap: 4px; }
+textarea {
+  border: none; outline: none; resize: none; font-size: 14px; line-height: 1.6;
+  font-family: inherit; color: var(--text); background: transparent;
+  flex: 1; min-width: 0; margin: 4px 4px 5px;
+  max-height: 156px; overflow-y: hidden; overflow-x: hidden; min-height: 24px; /* ≈ MIN_TEXTAREA_PX in autoResize */
+}
+.agent-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 28px; padding: 0 10px 0 5px; margin: 0 2px 2px 0;
+  background: var(--active-blue-bg); border: none; border-radius: 8px;
+  color: var(--blue-6); font-size: 12px; font-weight: 600;
+  font-family: inherit; flex: 0 0 auto;
+}
+.agent-chip.pickable { cursor: pointer; }
+.agent-chip.pickable:hover { background: var(--row-hover); }
+.agent-at {
+  width: 16px; height: 16px; border-radius: 5px;
+  background: var(--blue-6); color: var(--on-accent);
+  display: grid; place-items: center; font-size: 11px; font-weight: 700; line-height: 1;
+}
+.agent-name { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-menu { min-width: 220px; }
+.menu-label {
+  font-size: 11px; font-weight: 600; color: var(--text-secondary);
+  padding: 6px 10px 4px;
+}
+.menu-item.manage { flex-direction: row; align-items: center; gap: 6px; }
+.menu-item.manage .mi-name { color: var(--blue-6); }
+.perm-menu { left: auto; right: 0; min-width: 140px; }
+.perm-menu .menu-item { flex-direction: row; align-items: center; gap: 8px; }
+.perm-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; background: var(--text-quaternary); }
+.perm-dot[data-mode="auto"] { background: var(--success); }
+.perm-dot[data-mode="interactive"] { background: var(--warning); }
+.perm-dot[data-mode="strict"] { background: var(--error); }
+.attachments { display: flex; flex-wrap: wrap; gap: 6px; }
+.attach-chip {
+  display: inline-flex; align-items: center; gap: 5px; max-width: 200px;
+  height: 24px; padding: 0 6px 0 8px; background: var(--surface-info); border: 1px solid var(--blue-2);
+  border-radius: 6px; font-size: 12px; color: var(--text-secondary);
+}
+.attach-chip.uploading { opacity: 0.7; }
+.attach-chip.uploading iconify-icon { animation: attach-spin 0.8s linear infinite; }
+@keyframes attach-spin { to { transform: rotate(360deg); } }
+.attach-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attach-x {
+  border: none; background: transparent; cursor: pointer; padding: 0;
+  display: flex; align-items: center; color: var(--text-tertiary);
+}
+.attach-x:hover { color: var(--error); }
+.meta-row {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 7px 6px 2px; border-top: 1px solid var(--border-secondary);
+}
+.meta-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 4px; border: none; border-radius: 6px; background: transparent;
+  font-size: 12px; color: var(--text-secondary); cursor: pointer; font-family: inherit;
+  white-space: nowrap;
+}
+.meta-chip:hover { color: var(--text); background: var(--hover-neutral); }
+.meta-chip.static { cursor: default; }
+.meta-chip.static:hover { color: var(--text-secondary); background: transparent; }
+.ctx-pct { color: var(--text); font-weight: 600; }
+/* Voice input: a quiet chip-sized button that turns into a red "recording"
+   pill. The pulse is the only loud thing about it. */
+.voice-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; margin-right: 2px; padding: 0;
+  border: none; border-radius: 6px; background: transparent;
+  color: var(--text-secondary); cursor: pointer;
+  transition: color 120ms ease, background-color 120ms ease;
+}
+.voice-btn:hover { color: var(--text); background: var(--hover-neutral); }
+.voice-btn.on {
+  color: #fff; background: #e5484d;
+  animation: voice-pulse 1.4s ease-in-out infinite;
+}
+.voice-btn.busy { opacity: 0.55; }
+/* Live interim transcript, shown while the microphone is open. */
+.voice-live {
+  max-width: 200px; margin-right: 4px;
+  font-size: 11.5px; color: var(--text-tertiary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+@keyframes voice-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(229, 72, 77, 0.45); }
+  50%      { box-shadow: 0 0 0 5px rgba(229, 72, 77, 0); }
+}
+.send-btn {
+  width: 38px; height: 30px; flex: 0 0 auto; margin-bottom: 1px;
+  border: none; background: var(--blue-6); border-radius: 9px;
+  display: grid; place-items: center; color: var(--on-accent);
+  cursor: pointer; font-family: inherit;
+  box-shadow: 0 1px 2px var(--focus-ring);
+}
+.send-btn:hover { background: var(--blue-5); }
+.send-btn:active { background: var(--blue-7); }
+.stop-btn {
+  width: 30px; height: 30px; flex: 0 0 auto; margin-bottom: 1px;
+  border: 1px solid var(--error-border); background: var(--error-bg);
+  border-radius: 9px; display: grid; place-items: center;
+  cursor: pointer; font-family: inherit;
+}
+.stop-btn:hover { border-color: var(--error); }
+.stop-sq { width: 10px; height: 10px; border-radius: 2px; background: var(--error); }
+/* Secondary to Send: same footprint, muted outline — it is the "don't
+   interrupt, just append" path, not the primary action. */
+.silent-send-btn {
+  width: 30px; height: 30px; flex: 0 0 auto; margin-bottom: 1px;
+  border: 1px solid var(--border); background: transparent;
+  border-radius: 9px; display: grid; place-items: center;
+  color: var(--text-secondary); cursor: pointer; font-family: inherit;
+}
+.silent-send-btn:hover:not(:disabled) { color: var(--text); border-color: var(--text-secondary); }
+.silent-send-btn:disabled { opacity: .4; cursor: default; }
+
+/* Skill autocomplete dropdown */
+.skill-menu {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 50;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg-container);
+  border: 1px solid var(--border-secondary);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(15,23,42,0.14);
+  padding: 4px;
+}
+.skill-menu-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+  padding: 7px 10px;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+}
+.skill-menu-item:hover,
+.skill-menu-item.active {
+  background: var(--active-blue-bg);
+}
+.skill-name.create { color: var(--blue-6); display: inline-flex; align-items: center; gap: 6px; }
+.skill-name {
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 500;
+}
+.skill-desc {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.skill-menu-empty {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+/* The menu's in:/out: transitions are JS-driven, so the reduced-motion switch
+   is handled in JS (duration 0). This block only collapses the CSS half —
+   hover/focus easing and any future keyframes — so nothing keeps moving when
+   the OS asks for stillness. */
+@media (prefers-reduced-motion: reduce) {
+  .menu, .menu *, .skill-menu, .skill-menu * {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+</style>

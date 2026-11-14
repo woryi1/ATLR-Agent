@@ -1,0 +1,68 @@
+# Version-update coverage for every real dependency manifest. Before this
+# file existed only GitHub's default security updates ran, and they opened
+# fix PRs for some manifests but not others (see #1842-era postcss alerts:
+# /blog got a PR, /web and /docs did not).
+#
+# Deliberately NOT covered: evals/tasks/*/repo/go.mod — those are eval
+# fixtures whose dependencies are part of the task definition, and the
+# top-level /evals harness module, which shares their churn-free intent.
+#
+# Minor and patch bumps are grouped into one PR per directory to keep the
+# weekly noise reviewable; majors stay individual PRs, except where a
+# package family is only installable as a matched set (see the capacitor
+# group below).
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directories:
+      - "/"
+      - "/cmd/octo-desktop"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      go-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directories:
+      - "/web"
+      - "/docs"
+      - "/blog"
+      - "/mobile"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # Capacitor packages only work as a matched set: bumped one at a time,
+      # a new @capacitor/core cannot type-check against the older
+      # @capacitor/app and @capacitor/ios still on the previous major (see
+      # #1906/#1907/#1909, all closed for exactly this). Listed before
+      # npm-minor-patch so it claims capacitor's minor/patch bumps too —
+      # this group is about moving together, not about the bump size.
+      capacitor:
+        patterns:
+          - "@capacitor/*"
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      # TypeScript 7 is blocked upstream, not declined on its merits: every
+      # published svelte-check, latest 4.7.4 included, declares
+      # `typescript: ^5.0.0 || ^6.0.0` in its peers. /web therefore cannot take
+      # 7, and /mobile stays on 6 so both npm projects share a major. Without
+      # this, every weekly run reopens the same two unmergeable PRs.
+      #
+      # Scoped to 7.x on purpose — a later major still gets a PR. Drop this
+      # entry once svelte-check ships TypeScript 7 support and bump both
+      # directories together.
+      - dependency-name: "typescript"
+        versions: ["7.x"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(deps)"

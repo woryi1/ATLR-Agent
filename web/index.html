@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <!-- viewport-fit=cover makes env(safe-area-inset-*) resolve to real values
+       inside the iOS mobile shell's full-screen WebView; without it the insets
+       are 0 and the feed header draws under the notch / Dynamic Island. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>ATLR-Agent</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <!-- Boot splash first-frame cover (dsh-startup-screen, adapted): a black
+       fixed layer so the app never flashes white before the animation starts.
+       The inline script below decides in <1ms whether the cover stays, using
+       only localStorage — the server-side toggle refines it in main.ts. -->
+  <!-- The plugin's own stylesheet, injected by its Host half upstream
+       (dsh-startup-screen/lib/index.js:385). Must load BEFORE the critical
+       block so the black first-frame cover still wins the cascade.
+       Without it #dsh-startup-root has no position:fixed once splash.js drops
+       .dsu-boot, so the animation collapses into the locked document flow. -->
+  <link rel="stylesheet" href="/dsh-startup/splash.css" />
+  <style id="dsh-startup-critical">
+    html.dsu-lock,html.dsu-lock body{overflow:hidden!important}
+    html.dsu-lock body{background-color:#000!important}
+    :root{--dsh-boot-bg:#000}
+    #dsh-startup-root.dsu-boot{position:fixed;inset:0;z-index:2147483000;background:#000}
+  </style>
+</head>
+<body>
+  <div id="dsh-startup-root" class="dsu-root dsu-boot"></div>
+  <script>
+    (function(){try{
+      var root=document.getElementById('dsh-startup-root');
+      var off=localStorage.getItem('atlr.startupAnim')==='0'
+        ||sessionStorage.getItem('dsh-startup-screen:shown')==='1';
+      if(off){
+        if(root&&root.parentNode)root.parentNode.removeChild(root);
+        window.__DSH_STARTUP_SKIP__=true;
+        return;
+      }
+      document.documentElement.classList.add('dsu-lock');
+      /* Failsafe: if splash.js never runs (404/blocked), release unconditionally
+         after 9s — judged by "did the timeline start", never by a class name. */
+      setTimeout(function(){try{
+        if(window.__DSH_STARTUP_RUNNING__===true)return;
+        var r=document.getElementById('dsh-startup-root');
+        if(r&&r.parentNode)r.parentNode.removeChild(r);
+        document.documentElement.classList.remove('dsu-lock');
+        if(document.body)document.body.style.overflow='';
+        window.__DSH_STARTUP_FAILED__=true;
+      }catch(e){}},9000);
+    }catch(e){} })();
+  </script>
+  <div id="app"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

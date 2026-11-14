@@ -1,0 +1,328 @@
+package main
+
+import (
+	"bytes"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/open-octo/octo-agent/internal/app"
+)
+
+// containsAll is a tiny assertion helper for "every want is present in got".
+func containsAll(got, want []string) bool {
+	set := make(map[string]bool, len(got))
+	for _, g := range got {
+		set[g] = true
+	}
+	for _, w := range want {
+		if !set[w] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestCompletionCandidates_TopLevel(t *testing.T) {
+	cases := [][]string{
+		{},             // no args
+		{"octo"},       // just the program
+		{"octo", ""},   // typing the subcommand (empty partial)
+		{"octo", "co"}, // typing the subcommand (partial)
+	}
+	for _, words := range cases {
+		got := completionCandidates(words)
+		if !containsAll(got, []string{"config", "memory", "init", "help", "completion"}) {
+			t.Errorf("words=%v missing top-level commands; got %v", words, got)
+		}
+	}
+}
+
+func TestCompletionCandidates_ChatFlags(t *testing.T) {
+	// A positional message followed by a new word still completes session flags.
+	got := completionCandidates([]string{"octo", "fix the bug", ""})
+	for _, want := range []string{"-c", "--continue", "--tools", "--provider", "--profile", "--quiet", "--verbose"} {
+		if !sliceContains(got, want) {
+			t.Errorf("chat flag completion missing %q; got %v", want, got)
+		}
+	}
+}
+
+func TestCompletionCandidates_DefaultChatMode(t *testing.T) {
+	// octo with no subcommand defaults to chat, so flags and their values
+	// should complete even without an explicit "chat" subcommand.
+	cases := []struct {
+		words []string
+		want  []string
+	}{
+		// Dash-partial at position 1 → chat flags (user is typing a flag).
+		{[]string{"octo", "-"}, []string{"-c", "--continue", "--provider", "--quiet"}},
+		{[]string{"octo", "--"}, []string{"--continue", "--provider", "--quiet"}},
+		// Flag values after "octo --provider ".
+		{[]string{"octo", "--provider", ""}, []string{"anthropic", "openai"}},
+	}
+	for _, tc := range cases {
+		got := completionCandidates(tc.words)
+		for _, w := range tc.want {
+			if !sliceContains(got, w) {
+				t.Errorf("words=%v missing %q; got %v", tc.words, w, got)
+			}
+		}
+	}
+}
+
+func TestCompletionCandidates_DefaultChatMode_SessionIDs(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	// Completion is scoped like -c itself, so the seeded session has to belong
+	// to the directory the shell is completing in.
+	dir := t.TempDir()
+	t.Chdir(dir)
+	s1 := sessionIn(t, dir)
+
+	got := completionCandidates([]string{"octo", "-c", ""})
+	if len(got) < 1 || got[0] != "last" {
+		t.Errorf("expected 'last' as first candidate; got %v", got)
+	}
+	for _, want := range []string{s1.ShortID(), s1.ID} {
+		if !sliceContains(got, want) {
+			t.Errorf("expected %q in candidates; got %v", want, got)
+		}
+	}
+}
+
+func TestCompletionCandidates_ProviderValueAfterFlag(t *testing.T) {
+	got := completionCandidates([]string{"octo", "--provider", ""})
+	want := make([]string, len(app.Registry))
+	for i, v := range app.Registry {
+		want[i] = v.ID
+	}
+	if !sliceEq(got, want) {
+		t.Errorf("--provider value completion = %v, want %v", got, want)
+	}
+}
+
+func TestCompletionCandidates_PermissionModeAfterFlag(t *testing.T) {
+	got := completionCandidates([]string{"octo", "--permission-mode", ""})
+	if !sliceEq(got, []string{"interactive", "strict", "auto"}) {
+		t.Errorf("--permission-mode value completion = %v", got)
+	}
+}
+
+func TestCompletionCandidates_SessionIDsAfterDashC(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	// Seed two sessions in the completing directory so the candidate list is
+	// meaningful — one elsewhere to confirm the scoping holds here too.
+	dir := t.TempDir()
+	t.Chdir(dir)
+	s1 := sessionIn(t, dir)
+	s2 := sessionIn(t, dir)
+	other := sessionIn(t, t.TempDir())
+
+	got := completionCandidates([]string{"octo", "fix the bug", "-c", ""})
+	// "last" is always first, then short + full for each session.
+	if len(got) < 1 || got[0] != "last" {
+		t.Errorf("expected 'last' as first candidate; got %v", got)
+	}
+	for _, want := range []string{s1.ShortID(), s1.ID, s2.ShortID(), s2.ID} {
+		if !sliceContains(got, want) {
+			t.Errorf("expected %q in candidates; got %v", want, got)
+		}
+	}
+	if sliceContains(got, other.ID) {
+		t.Errorf("candidates offer another directory's session %q; got %v", other.ID, got)
+	}
+}
+
+func TestCompletionCandidates_HelpTargets(t *testing.T) {
+	got := completionCandidates([]string{"octo", "help", ""})
+	want := []string{"config", "memory", "init", "completion", "mcp"}
+	if !sliceEq(got, want) {
+		t.Errorf("help target completion = %v, want %v", got, want)
+	}
+}
+
+func TestCompletionCandidates_CompletionShells(t *testing.T) {
+	got := completionCandidates([]string{"octo", "completion", ""})
+	if !sliceEq(got, []string{"bash", "zsh", "fish", "powershell"}) {
+		t.Errorf("completion shell list = %v", got)
+	}
+}
+
+func TestRunCompletion_BashScript(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := runCompletion([]string{"bash"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr=%q", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"_octo_completions()",
+		"complete -F _octo_completions octo",
+		"octo __complete",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("bash script missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunCompletion_ZshScript(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := runCompletion([]string{"zsh"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d", code)
+	}
+	out := stdout.String()
+	for _, want := range []string{"#compdef octo", "compdef _octo octo", "octo __complete"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("zsh script missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunCompletion_FishScript(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := runCompletion([]string{"fish"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d", code)
+	}
+	out := stdout.String()
+	for _, want := range []string{"complete -c octo", "octo __complete"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("fish script missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunCompletion_PowershellScript(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := runCompletion([]string{"powershell"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr=%q", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{"Register-ArgumentCompleter", "-CommandName octo", "octo __complete"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("powershell script missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunCompletion_UnknownShell(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := runCompletion([]string{"nushell"}, &stdout, &stderr); code != 2 {
+		t.Errorf("exit = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "unsupported shell") {
+		t.Errorf("stderr should explain; got: %q", stderr.String())
+	}
+}
+
+func TestRunCompletion_NoShellArg(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := runCompletion(nil, &stdout, &stderr); code != 2 {
+		t.Errorf("exit = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "Usage:") {
+		t.Errorf("stderr should print usage; got: %q", stderr.String())
+	}
+}
+
+func TestRunComplete_PrintsCandidatesOnePerLine(t *testing.T) {
+	var out bytes.Buffer
+	if code := runComplete([]string{"octo", "--provider", ""}, &out); code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	want := make([]string, len(app.Registry))
+	for i, v := range app.Registry {
+		want[i] = v.ID
+	}
+	if !sliceEq(lines, want) {
+		t.Errorf("output = %v, want %v", lines, want)
+	}
+}
+
+func TestRun_CompletionViaMain(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"completion", "bash"}, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "_octo_completions") {
+		t.Errorf("main() routing for completion broken; got:\n%s", stdout.String())
+	}
+}
+
+func TestRun_CompleteViaMain(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"__complete", "octo", "help", ""}, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr=%q", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{"config", "memory"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+// TestRun_CompleteAdoptsProfile checks that a complete --profile on the line
+// being completed selects that data root, so `octo --profile work -c <TAB>`
+// offers the work profile's sessions rather than the default one's — while the
+// words themselves still reach the candidate routing in their original
+// positions.
+func TestRun_CompleteAdoptsProfile(t *testing.T) {
+	t.Setenv("OCTO_PROFILE", "")
+	var stdout, stderr bytes.Buffer
+	args := []string{"__complete", "octo", "--profile", "work", "--permission-mode", ""}
+	if code := run(args, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(%q) exit = %d, stderr=%q", args, code, stderr.String())
+	}
+	if got := os.Getenv("OCTO_PROFILE"); got != "work" {
+		t.Errorf("OCTO_PROFILE = %q, want %q", got, "work")
+	}
+	// Positions survived: --permission-mode is still the previous word, so its
+	// fixed value set is what gets offered.
+	if got := stdout.String(); !strings.Contains(got, "interactive") {
+		t.Errorf("candidates should be the --permission-mode values; got %q", got)
+	}
+}
+
+func TestRun_CompletePreservesPartialProfileWords(t *testing.T) {
+	for _, words := range [][]string{
+		{"octo", "--profile", ""},
+		{"octo", "--profile="},
+	} {
+		t.Setenv("OCTO_PROFILE", "inherited")
+		var stdout, stderr bytes.Buffer
+		args := append([]string{"__complete"}, words...)
+		if code := run(args, nil, &stdout, &stderr); code != 0 {
+			t.Fatalf("run(%q) exit = %d, stderr=%q", args, code, stderr.String())
+		}
+		if got := os.Getenv("OCTO_PROFILE"); got != "inherited" {
+			t.Errorf("run(%q) changed OCTO_PROFILE to %q", args, got)
+		}
+	}
+}
+
+// sliceContains / sliceEq are tiny test helpers to keep assertions tight.
+func sliceContains(haystack []string, needle string) bool {
+	for _, h := range haystack {
+		if h == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func sliceEq(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

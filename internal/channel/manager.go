@@ -1,0 +1,1024 @@
+package channel
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/agentprofile"
+	"github.com/open-octo/octo-agent/internal/permission"
+	"github.com/open-octo/octo-agent/internal/tasks"
+)
+
+// BindingMode determines how an inbound message maps to an agent session.
+type BindingMode string
+
+const (
+	// BindByChatUser creates one session per (chat, user) pair.
+	// Best for group chats where multiple users interact independently.
+	BindByChatUser BindingMode = "chat_user"
+
+	// BindByChat creates one session per chat (group or DM).
+	// Best for DMs or when all users in a group share one context.
+	BindByChat BindingMode = "chat"
+
+	// BindByUser creates one session per user across all chats.
+	// Best when a single user wants continuity across multiple groups.
+	BindByUser BindingMode = "user"
+)
+
+// SessionKey uniquely identifies a conversation session.
+type SessionKey string
+
+// sessionKeyFor returns the session key for an inbound event based on the
+// binding mode and the routed agent. The default agent ("" or "default")
+// keeps the legacy key byte-for-byte — its in-memory sessions, on-disk store
+// files (sessionStoreID hashes the key), and /bind entries are all unchanged
+// from before multi-agent. Expert agents prefix the legacy key with
+// "<agentID>#": this one convention derives per-agent isolation of the
+// sessions map, the /bind table, and the deterministic store file ID. '#'
+// appears in neither platform names nor profile IDs, so splitSessionKey can
+// strip the prefix unambiguously.
+func sessionKeyFor(mode BindingMode, ev InboundEvent, agentID string) SessionKey {
+	base := sessionKeyBase(mode, ev)
+	if agentID == "" || agentID == agentprofile.DefaultID {
+		return base
+	}
+	return SessionKey(agentID + "#" + string(base))
+}
+
+// sessionKeyBase is the pre-multi-agent key shape: platform:chat[:user].
+func sessionKeyBase(mode BindingMode, ev InboundEvent) SessionKey {
+	switch mode {
+	case BindByChatUser:
+		return SessionKey(ev.Platform + ":" + ev.ChatID + ":" + ev.UserID)
+	case BindByUser:
+		return SessionKey(ev.Platform + ":" + ev.UserID)
+	default: // BindByChat
+		return SessionKey(ev.Platform + ":" + ev.ChatID)
+	}
+}
+
+// normalizeAgentID maps the empty routed-agent sentinel to the default ID.
+func normalizeAgentID(agentID string) string {
+	if agentID == "" {
+		return agentprofile.DefaultID
+	}
+	return agentID
+}
+
+// Session holds the agent and its binding state for one conversation.
+type Session struct {
+	Key   SessionKey
+	Agent *agent.Agent
+
+	// AgentID is the routed agent profile's ID, captured at session creation.
+	// Per-turn behavior (system prompt, model, tool whitelist) is derived from
+	// it by looking the profile up fresh each turn, so profile edits take
+	// effect without rebuilding anything. Matches the persisted store's
+	// agent_id metadata.
+	AgentID string
+
+	// Store is the on-disk history backing this conversation (persist.go).
+	// Loaded/initialised at session creation, written via Persist after
+	// each turn so the conversation survives server restarts. storeMu
+	// guards it: deleteStore tombstones the field while a turn may still
+	// be running, and that turn's Persist must observe the nil.
+	Store   *agent.Session
+	storeMu sync.Mutex
+	// Tasks is the conversation's task store. It lives as long as the session,
+	// so task_* state persists across messages within one chat (a fresh
+	// per-message store would reset the list every turn). Stamped into the turn
+	// ctx by the IM handler; *tasks.Store satisfies tools.TaskStore.
+	Tasks *tasks.Store
+	// AppliedModelConfig records which ModelConfig binding the agent's live
+	// sender currently reflects ("" = the factory-injected sender, typically
+	// the server default). Written by cmdModel and by the server's per-turn
+	// applyChannelModel, which swaps senders only when the persisted binding
+	// actually changes — so a factory-injected sender survives untouched
+	// while no binding exists.
+	AppliedModelConfig string
+	ChatID             string
+	UserID             string
+	BoundAt            time.Time
+
+	// suppressDelivery is set by /unbind while a turn is in flight. Once true,
+	// the session's UIController must silently drop all further outbound
+	// messages to the IM chat instead of sending them — the turn keeps running
+	// (and its history still persists), but the user asked to leave the chat,
+	// so nothing more is delivered there. Pair with the suppressor func wired
+	// into the UIController at turn start; cleared when the session is next
+	// handed to a new entry (e.g. a later /bind back to IM).
+	suppressDelivery atomic.Bool
+
+	// runMu serialises agent turns within this session: the IM dispatcher runs
+	// each message in its own goroutine, and two interleaved turns would
+	// corrupt the agent's user/assistant history alternation. runCancel
+	// (guarded by cancelMu, not runMu — /stop must not queue behind the very
+	// turn it is trying to cancel) aborts the in-flight turn.
+	runMu     sync.Mutex
+	cancelMu  sync.Mutex
+	runCancel context.CancelFunc
+
+	// pendingAsk, while non-nil, claims the session's next message as
+	// the answer to an interactive permission prompt (see ask.go). Guarded by
+	// askMu, not runMu — the reply arrives while the asking turn holds runMu.
+	// askChatID/askUserID pin which chat+user may answer.
+	// askButtonsOnly, when true, prevents DeliverAskReply from consuming plain
+	// text messages — only button callbacks (via DeliverAskButton) resolve the
+	// ask (#1120).
+	askMu          sync.Mutex
+	pendingAsk     chan string
+	askChatID      string
+	askUserID      string
+	askButtonsOnly bool
+}
+
+// SuppressDelivery reports whether this session's outbound IM delivery is
+// currently suppressed (set by /unbind while a turn is in flight). The
+// runChannelTurns handler wires this into its UIController so a mid-turn
+// /unbind drops the rest of the reply.
+func (s *Session) SuppressDelivery() bool {
+	return s.suppressDelivery.Load()
+}
+
+// BeginRun prepares one agent turn: it blocks until any previous turn in this
+// session finishes, then returns a cancellable ctx for the run and a done
+// func that releases the session. Always call done (typically deferred).
+func (s *Session) BeginRun(ctx context.Context) (context.Context, func()) {
+	s.runMu.Lock()
+	ctx, cancel := context.WithCancel(ctx)
+	s.cancelMu.Lock()
+	s.runCancel = cancel
+	s.cancelMu.Unlock()
+	return ctx, func() {
+		s.cancelMu.Lock()
+		s.runCancel = nil
+		s.cancelMu.Unlock()
+		cancel()
+		s.runMu.Unlock()
+	}
+}
+
+// IsRunning reports whether an agent turn is currently in flight. The
+// inbound dispatcher uses it to steer a mid-turn message into the running
+// turn's Inbox instead of queueing a whole new turn behind runMu.
+func (s *Session) IsRunning() bool {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+	return s.runCancel != nil
+}
+
+// Interrupt cancels the session's in-flight agent turn, if any. It reports
+// whether a turn was actually running.
+func (s *Session) Interrupt() bool {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+	if s.runCancel == nil {
+		return false
+	}
+	s.runCancel()
+	s.runCancel = nil
+	return true
+}
+
+// AgentFactory creates a new agent.Agent for a session, parameterized by the
+// routed profile (system prompt / model overrides; nil means default).
+type AgentFactory func(profile *agentprofile.Profile) *agent.Agent
+
+// ModelInfo describes one configured model entry for /model listings.
+//
+// PR4b (design §12.2): the listing is two-level — each info carries its
+// EndpointID/EndpointName so the manager can group models under their channel
+// header, and CompositeID ("<endpoint>::<model>") so /model can be told to
+// switch to a specific endpoint's copy of a model that may exist under more
+// than one. Model stays the bare model id (also still accepted by /model for
+// back-compat — Resolve runs it through ParseModelFlag's default-priority
+// path).
+type ModelInfo struct {
+	EndpointID   string // the channel this model lives under; empty only on a misconfigured ops
+	EndpointName string // display name for the channel header
+	Model        string // the bare model id
+	CompositeID  string // "<endpoint>::<model>" — the precise /model argument
+	Provider     string
+	Default      bool // the config-wide default entry (composite id matches cfg.Default)
+}
+
+// ModelResolution is the server-resolved outcome of a /model switch request:
+// the sender to run on, the model name to run and report, and the config
+// entry the session binds to (empty = follow the server default, mirroring
+// the web model picker's "default" entry).
+type ModelResolution struct {
+	Sender     agent.Sender
+	Model      string
+	BoundEntry string
+	// EndpointID preserves deployment identity for sibling sub-agent models.
+	EndpointID string
+	// ContextWindow is the selected endpoint model's override. It travels with
+	// /model resolution because the bare model name cannot identify a deployment.
+	ContextWindow int
+}
+
+// ModelOps gives the IM /model command access to the server's model table and
+// sender cache, which live outside this package. Injected via SetModelOps; a
+// nil ModelOps disables /model with a graceful reply.
+type ModelOps struct {
+	// List returns every configured model entry for the no-argument listing.
+	List func() []ModelInfo
+	// Resolve maps a /model argument to the sender+model to run on.
+	// "default" resolves to the server's default sender with no binding.
+	// Unknown ids and unbuildable senders are errors; the session is left
+	// unchanged.
+	Resolve func(modelID string) (ModelResolution, error)
+}
+
+// newSession builds a Session with a fresh agent and per-conversation task
+// store. Centralised so every binding path (explicit /bind, auto-create on
+// first message, GetOrCreateSession) wires sessions identically. agentID is
+// the routed agent (never empty — callers normalize "" to "default"); it is
+// stamped onto Session.AgentID and the persisted store's agent_id, and it
+// determines the session-key namespace. profile shapes the factory-built
+// agent (system prompt / model) and may fall back to the default profile if
+// the routed profile was deleted — but the session's AgentID always stays the
+// routed agent, so its key namespace and store identity never drift.
+func (m *Manager) newSession(key SessionKey, ev InboundEvent, agentID string, profile *agentprofile.Profile) *Session {
+	if profile == nil {
+		profile = agentprofile.DefaultProfile()
+	}
+	s := &Session{
+		Key:     key,
+		Agent:   m.factory(profile),
+		AgentID: agentID,
+		Tasks:   tasks.New(),
+		ChatID:  ev.ChatID,
+		UserID:  ev.UserID,
+		BoundAt: time.Now(),
+	}
+	s.restoreOrInitStore(m.resolveStoreID(key))
+	// Index by store ID so /bind can re-attach to this session later.
+	m.sessionsByStore.Store(s.Store.ID, s)
+	return s
+}
+
+// Manager owns the lifecycle of adapters and their bound sessions.
+type Manager struct {
+	cfg     *Config
+	factory AgentFactory
+	mode    BindingMode
+
+	// sessions holds active sessions keyed by SessionKey.
+	sessions sync.Map // SessionKey -> *Session
+
+	// sessionsByStore indexes the same Session objects by their persistent
+	// store ID, so /bind can re-attach to an in-memory session after /unbind
+	// instead of creating a new one. The entry is written once by newSession
+	// and survives LoadAndDelete from sessions (e.g. /unbind), giving cmdBind
+	// a chance to recover the running session. It is overwritten naturally
+	// when a new session claims the same store (via newSession), so old
+	// pointers don't leak.
+	sessionsByStore sync.Map // string (store ID) -> *Session
+
+	// bindings is the persistent chat→session redirection set by /bind. When a
+	// key is present, the chat routes to the recorded store instead of its
+	// deterministic default (see resolveStoreID).
+	bindings *bindingStore
+
+	// modelOps backs the /model command. Set once by the server alongside the
+	// factory; nil means /model replies that switching is unavailable rather
+	// than guessing at config it cannot see from this package.
+	modelOps *ModelOps
+
+	// profileLookup resolves an agent ID to its profile for paths that only
+	// have the routed ID (e.g. /new's agentModel). Set by the server alongside
+	// the factory; nil means every ID resolves to the default profile.
+	profileLookup func(id string) (*agentprofile.Profile, bool)
+}
+
+// NewManager creates a Manager. If mode is empty it defaults to BindByChatUser.
+func NewManager(cfg *Config, factory AgentFactory, mode BindingMode) *Manager {
+	if mode == "" {
+		mode = BindByChatUser
+	}
+	return &Manager{
+		cfg:      cfg,
+		factory:  factory,
+		mode:     mode,
+		bindings: newBindingStore(),
+	}
+}
+
+// SetModelOps injects the server's model table + sender resolver for /model.
+// Called once at manager construction, before any adapter goroutine runs.
+func (m *Manager) SetModelOps(ops *ModelOps) {
+	m.modelOps = ops
+}
+
+// SetProfileLookup injects the server's agent-profile resolver. Called once
+// at manager construction, before any adapter goroutine runs. The closure's
+// ok return value is currently unused (the manager's resolveProfile always
+// falls back to the default profile on a miss) — it exists so callers can
+// report "known unknowns" in future without an API break.
+func (m *Manager) SetProfileLookup(fn func(id string) (*agentprofile.Profile, bool)) {
+	m.profileLookup = fn
+}
+
+// resolveProfile maps an agent ID to its profile, defaulting on a miss (nil
+// lookup, or the profile was deleted mid-session).
+func (m *Manager) resolveProfile(agentID string) *agentprofile.Profile {
+	if m.profileLookup != nil {
+		if p, ok := m.profileLookup(agentID); ok {
+			return p
+		}
+	}
+	return agentprofile.DefaultProfile()
+}
+
+// resolveStoreID returns the on-disk session store ID a chat should use: the
+// session it was explicitly bound to via /bind, or its deterministic default.
+func (m *Manager) resolveStoreID(key SessionKey) string {
+	if id, ok := m.bindings.get(key); ok {
+		return id
+	}
+	return sessionStoreID(key)
+}
+
+// CommandRouter processes slash commands and returns a reply text. agentID is
+// the routed agent for this event: commands operate within that agent's
+// session-key namespace, and /list + /bind only see sessions it owns.
+func (m *Manager) CommandRouter(ev InboundEvent, agentID string) string {
+	agentID = normalizeAgentID(agentID)
+	parts := strings.Fields(strings.TrimSpace(ev.Text))
+	if len(parts) == 0 {
+		return ""
+	}
+	cmd := strings.ToLower(parts[0])
+	args := parts[1:]
+
+	switch cmd {
+	case "/bind":
+		return m.cmdBind(ev, args, agentID)
+	case "/stop":
+		return m.cmdStop(ev, agentID)
+	case "/unbind":
+		return m.cmdUnbind(ev, agentID)
+	case "/status":
+		return m.cmdStatus(ev, agentID)
+	case "/list":
+		return m.cmdList(agentID)
+	case "/clear":
+		return m.cmdClear(ev, agentID)
+	case "/new":
+		return m.cmdNew(ev, agentID)
+	case "/compact":
+		return m.cmdCompact(ev, agentID)
+	case "/reload":
+		return m.cmdReload(ev, agentID)
+	case "/model":
+		return m.cmdModel(ev, strings.Join(args, " "), agentID)
+	case "/help":
+		return "Available: /bind [--force] <number|id>, /unbind, /list, /clear, /new, /compact, /reload, /goal, /model [name|default], /loop [interval] <task>, /stop, /status, /help"
+	default:
+		return fmt.Sprintf("Unknown command: %s", cmd)
+	}
+}
+
+// cmdModel lists the configured models (no argument) or switches the session
+// onto one: "/model <name>" binds to that config entry, "/model default"
+// unbinds back to the server default. The config lookup and sender build live
+// in the injected ModelOps — this package can't see the main config or the
+// server's sender cache. A successful switch swaps the live agent's sender
+// and persists the binding via SetModelConfig, so the web UI sees the same
+// binding and a restart doesn't lose it.
+func (m *Manager) cmdModel(ev InboundEvent, arg string, agentID string) string {
+	if m.modelOps == nil {
+		return "Model switching is unavailable on this server."
+	}
+	key := sessionKeyFor(m.mode, ev, agentID)
+	val, loaded := m.sessions.Load(key)
+	if !loaded {
+		return "No active session. Send a message first, or /bind one."
+	}
+	sess := val.(*Session)
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return m.modelListReply(sess)
+	}
+	if sess.IsRunning() {
+		return "Can't switch model while a turn is running — /stop it first or wait for it to finish."
+	}
+	// Serialize with agent turns so the sender swap cannot race a turn that
+	// starts immediately after the IsRunning check (same pattern as /clear).
+	_, done := sess.BeginRun(context.Background())
+	defer done()
+
+	res, err := m.modelOps.Resolve(arg)
+	if err != nil {
+		return fmt.Sprintf("⚠️ %v", err)
+	}
+	sess.Agent.SetSender(res.Sender)
+	sess.Agent.SetModelDeployment(res.Model, res.ContextWindow, res.EndpointID)
+	sess.AppliedModelConfig = res.BoundEntry
+	if st := sess.Store; st != nil {
+		if err := st.SetModelConfig(res.BoundEntry, res.Model); err != nil {
+			return fmt.Sprintf("Switched to %s, but saving the binding failed: %v", res.Model, err)
+		}
+	}
+	return fmt.Sprintf("Model switched to %s.", res.Model)
+}
+
+// modelListReply renders the no-argument /model listing: the session's
+// current model plus every configured entry, grouped by endpoint (PR4b design
+// §12.2). Each endpoint is a header line; its models are listed below with
+// their composite id (the precise /model argument). The current and default
+// models are marked.
+//
+// Backward compat: when ModelOps returns ModelInfo values with no EndpointID
+// (e.g. a stale or test-injected ops), the listing falls back to the flat
+// one-line-per-model shape so the command still produces something readable
+// rather than crashing on a missing endpoint dimension.
+func (m *Manager) modelListReply(sess *Session) string {
+	infos := m.modelOps.List()
+	if len(infos) == 0 {
+		return "No models configured. Run `octo config` to add one."
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Current model: %s\n", sess.Agent.Model)
+
+	// Group by endpoint, preserving the order List returned (which is the
+	// config order — Endpoints[0].Models[0], Endpoints[0].Models[1], …).
+	type group struct {
+		endpointID   string
+		endpointName string
+		models       []ModelInfo
+	}
+	var groups []*group
+	groupIdx := map[string]int{}
+	hasEndpoints := false
+	for _, info := range infos {
+		if info.EndpointID == "" {
+			continue // fall back to flat rendering below
+		}
+		hasEndpoints = true
+		if idx, ok := groupIdx[info.EndpointID]; ok {
+			groups[idx].models = append(groups[idx].models, info)
+			continue
+		}
+		groupIdx[info.EndpointID] = len(groups)
+		groups = append(groups, &group{
+			endpointID:   info.EndpointID,
+			endpointName: info.EndpointName,
+			models:       []ModelInfo{info},
+		})
+	}
+
+	if !hasEndpoints {
+		// Flat fallback (legacy/test ops without endpoint info).
+		b.WriteString("Available:")
+		for _, info := range infos {
+			mark := ""
+			switch {
+			case info.Model == sess.Agent.Model && info.Default:
+				mark = " ← current (default)"
+			case info.Model == sess.Agent.Model:
+				mark = " ← current"
+			case info.Default:
+				mark = " (default)"
+			}
+			fmt.Fprintf(&b, "\n• %s (%s)%s", info.Model, info.Provider, mark)
+		}
+		b.WriteString("\nSwitch: /model <name> — or /model default to follow the default model.")
+		return b.String()
+	}
+
+	b.WriteString("Channels:")
+	for _, g := range groups {
+		header := g.endpointID
+		if g.endpointName != "" && g.endpointName != g.endpointID {
+			header = fmt.Sprintf("%s (%s)", g.endpointID, g.endpointName)
+		}
+		fmt.Fprintf(&b, "\n  %s", header)
+		for _, info := range g.models {
+			mark := ""
+			// The "current" mark is keyed off the persisted binding
+			// (sess.AppliedModelConfig, a composite id) rather than
+			// sess.Agent.Model (a bare model id). Keying off the bare model
+			// would mark the same model on every endpoint that carries it
+			// (e.g. claude-sonnet-4-6 under both relay and official). The
+			// composite id is unambiguous — only the endpoint the user
+			// actually switched to gets the mark. An unbound session (never
+			// ran /model) shows no "current" mark, which is correct: the
+			// session is on the server default, not any endpoint's binding.
+			switch {
+			case info.CompositeID == sess.AppliedModelConfig && info.Default:
+				mark = " ← current (default)"
+			case info.CompositeID == sess.AppliedModelConfig:
+				mark = " ← current"
+			case info.Default:
+				mark = " (default)"
+			}
+			fmt.Fprintf(&b, "\n    • %s%s", info.CompositeID, mark)
+		}
+	}
+	b.WriteString("\nSwitch: /model <endpoint>::<model> — or /model default to follow the default model.")
+	return b.String()
+}
+
+// cmdClear wipes the current session's conversation history while keeping its
+// binding and persisted store — the chat starts fresh without re-binding. The
+// emptied history is persisted so a restart doesn't bring it back.
+func (m *Manager) cmdClear(ev InboundEvent, agentID string) string {
+	key := sessionKeyFor(m.mode, ev, agentID)
+	val, loaded := m.sessions.Load(key)
+	if !loaded {
+		return "No active session to clear."
+	}
+	sess := val.(*Session)
+	if sess.IsRunning() {
+		return "Can't clear while a turn is running — /stop it first or wait for it to finish."
+	}
+	// Serialize with agent turns so the clear cannot race a turn that starts
+	// immediately after the IsRunning check.
+	_, done := sess.BeginRun(context.Background())
+	defer done()
+
+	sess.Agent.ClearHistory()
+	if err := sess.Persist(); err != nil {
+		return fmt.Sprintf("Cleared, but saving the empty history failed: %v", err)
+	}
+	return "Conversation cleared. Starting fresh."
+}
+
+// cmdReload clears the session's frozen system prompt
+// (Session.ClearComposedSystem) so the next turn recomposes it against live
+// skills/MCP/memory — the way to pick up a skill installed/toggled since this
+// session's prompt was composed, without starting a new session or /bind-ing
+// away and back. Mirrors the web /reload command.
+func (m *Manager) cmdReload(ev InboundEvent, agentID string) string {
+	key := sessionKeyFor(m.mode, ev, agentID)
+	val, loaded := m.sessions.Load(key)
+	if !loaded {
+		return "No active session to reload."
+	}
+	sess := val.(*Session)
+	if sess.IsRunning() {
+		return "Can't reload while a turn is running — /stop it first or wait for it to finish."
+	}
+	// Serialize with agent turns so the reload cannot race a turn that starts
+	// immediately after the IsRunning check.
+	_, done := sess.BeginRun(context.Background())
+	defer done()
+
+	if err := sess.Store.ClearComposedSystem(); err != nil {
+		return fmt.Sprintf("Reload failed: %v", err)
+	}
+	return "System prompt will be recomposed on your next message — new skills, MCP tools, and memory are now visible."
+}
+
+// cmdCompact force-compacts the current session's conversation history now,
+// summarizing older turns to free up context. It refuses to run while an agent
+// turn is in flight so it can't race the turn's own history mutations.
+func (m *Manager) cmdCompact(ev InboundEvent, agentID string) string {
+	key := sessionKeyFor(m.mode, ev, agentID)
+	val, loaded := m.sessions.Load(key)
+	if !loaded {
+		return "No active session to compact."
+	}
+	sess := val.(*Session)
+	if sess.IsRunning() {
+		return "Can't compact while a turn is running — /stop it first or wait for it to finish."
+	}
+	// Serialize with agent turns so the compaction cannot race a turn that
+	// starts immediately after the IsRunning check.
+	ctx, done := sess.BeginRun(context.Background())
+	defer done()
+
+	// Same upstream ID the turn path sets: a /compact before this chat's first
+	// turn would otherwise run on an unset one.
+	upstream := string(sess.Key)
+	sess.storeMu.Lock()
+	if sess.Store != nil {
+		upstream = sess.Store.ID
+	}
+	sess.storeMu.Unlock()
+	if sess.Agent.UpstreamSessionID != upstream {
+		sess.Agent.UpstreamSessionID = upstream
+	}
+	stats, err := sess.Agent.ForceCompact(ctx, nil)
+	if err != nil {
+		return fmt.Sprintf("Compact failed: %v", err)
+	}
+	if err := sess.Persist(); err != nil {
+		return fmt.Sprintf("Compacted, but saving failed: %v", err)
+	}
+	if stats.FoldedMsgs == 0 && stats.ReclaimedTokens == 0 {
+		return "Nothing to compact yet."
+	}
+	if stats.FoldedMsgs == 0 {
+		return fmt.Sprintf("Reclaimed stale tool output · ~%d → ~%d tokens", stats.BeforeTokens, stats.AfterTokens)
+	}
+	return fmt.Sprintf("Compacted context · folded %d message(s) · ~%d → ~%d tokens", stats.FoldedMsgs, stats.BeforeTokens, stats.AfterTokens)
+}
+
+// cmdNew creates a brand-new session and binds the current chat to it. The old
+// store (if any) is left on disk but detached from this chat, so /new is safe
+// to use even when another entry owns the chat's usual session.
+func (m *Manager) cmdNew(ev InboundEvent, agentID string) string {
+	key := sessionKeyFor(m.mode, ev, agentID)
+
+	// Create a fresh session owned by channel, stamped with the routed agent.
+	st := agent.NewSession(m.agentModel(agentID), "")
+	st.Source = "channel"
+	st.AgentID = agentID
+	st.Bind(agent.EntryChannel, false)
+	_ = st.SetPermissionMode(string(permission.ResolveDefaultMode()))
+	// Same working directory a channel session gets anywhere else — see
+	// applyWorkspaceDir. /new must not produce a session shaped differently
+	// from the one restoreOrInitStore builds.
+	applyWorkspaceDir(st)
+	if err := st.Save(); err != nil {
+		return fmt.Sprintf("Could not create new session: %v", err)
+	}
+
+	// Drop any existing override and point this chat at the new session.
+	if _, err := m.bindings.remove(key); err != nil {
+		return fmt.Sprintf("Could not clear old binding: %v", err)
+	}
+	if err := m.bindings.set(key, st.ID); err != nil {
+		return fmt.Sprintf("Could not attach chat to new session: %v", err)
+	}
+
+	// Evict the live session so the next message builds against the new store.
+	m.sessions.LoadAndDelete(key)
+
+	return fmt.Sprintf("Started a new session [%s]. Send a message to begin.", st.ShortID())
+}
+
+// agentModel returns the model name the factory uses for the given agent, so
+// /new can create a session that matches the agent configuration without
+// running a turn.
+func (m *Manager) agentModel(agentID string) string {
+	if m.factory == nil {
+		return ""
+	}
+	return m.factory(m.resolveProfile(normalizeAgentID(agentID))).Model
+}
+
+// cmdBind attaches the current chat to an existing session chosen from /list,
+// by its list number or (short/full) ID. The redirection is recorded in the
+// persistent binding table so it survives a restart, and no history is
+// deleted — /bind switches conversations rather than starting a fresh one.
+// By default, if the target session is bound to another entry, the bind is
+// rejected so IM cannot silently take over a session owned by CLI/TUI/Web.
+// Pass --force to take over a session whose turn lease has expired.
+func (m *Manager) cmdBind(ev InboundEvent, args []string, agentID string) string {
+	steal, targetArg, ok := parseBindArgs(args)
+	if !ok {
+		return "Usage: /bind [--force] <number|id> — run /list to see sessions, then attach this chat to one. History is preserved."
+	}
+	target := m.resolveBindTarget(targetArg, agentID)
+	if target == nil {
+		return fmt.Sprintf("No session matches %q for agent %q. Run /list to see available sessions.", targetArg, agentID)
+	}
+
+	previousEntry := target.BoundEntry
+	res, _, err := target.Bind(agent.EntryChannel, steal)
+	if res == agent.Rejected {
+		return fmt.Sprintf("Cannot bind: %v", err)
+	}
+	if err := target.Save(); err != nil {
+		return fmt.Sprintf("Could not persist entry binding: %v", err)
+	}
+
+	key := sessionKeyFor(m.mode, ev, agentID)
+	if err := m.bindings.set(key, target.ID); err != nil {
+		// Roll back the entry binding so we don't leave the session claimed.
+		target.Unbind(agent.EntryChannel)
+		_ = target.Save()
+		return fmt.Sprintf("Could not save the binding: %v", err)
+	}
+	// If an in-memory session for this store is still running (e.g. after
+	// /unbind mid-turn), re-attach it instead of creating a new one. This
+	// lets /bind recover the running session including its in-flight output:
+	// suppressDelivery is cleared so the remaining turn text resumes delivery.
+	if live, ok := m.sessionsByStore.Load(target.ID); ok {
+		sess := live.(*Session)
+		sess.suppressDelivery.Store(false)
+		sess.Key = key
+		sess.ChatID = ev.ChatID
+		sess.UserID = ev.UserID
+		sess.BoundAt = time.Now()
+		sess.storeMu.Lock()
+		sess.Store.BoundEntry = target.BoundEntry
+		sess.Store.BoundAt = target.BoundAt
+		sess.storeMu.Unlock()
+		m.sessions.Store(key, sess)
+	} else {
+		// No running session found — create a new one from the store file.
+		// The session keeps the routed agent's namespace (agentID) even if the
+		// profile was deleted in the meantime — resolveProfile falls back to
+		// the default profile for shaping the agent, but the key and AgentID
+		// stay anchored to the routed agent.
+		m.sessions.LoadAndDelete(key)
+		m.sessions.Store(key, m.newSession(key, ev, agentID, m.resolveProfile(agentID)))
+	}
+	if res == agent.Stolen {
+		return fmt.Sprintf("Taken over %q [%s] from %s. History preserved.", target.DisplayTitle(), target.ShortID(), previousEntry)
+	}
+	return fmt.Sprintf("Bound to session %q [%s]. History preserved.", target.DisplayTitle(), target.ShortID())
+}
+
+// parseBindArgs extracts the optional --force flag and the target identifier
+// from /bind arguments. It accepts both "/bind --force <id>" and
+// "/bind <id> --force". The second return value is the target argument; the
+// third reports whether the args are well-formed.
+func parseBindArgs(args []string) (steal bool, target string, ok bool) {
+	for _, a := range args {
+		if strings.EqualFold(a, "--force") {
+			steal = true
+			continue
+		}
+		if target != "" {
+			return false, "", false
+		}
+		target = a
+	}
+	if target == "" {
+		return false, "", false
+	}
+	return steal, target, true
+}
+
+// resolveBindTarget maps a /bind argument to a persisted session: a 1-based
+// index into the /list ordering (newest first), or a full / short ID match.
+// Only sessions owned by the routed agent are eligible — cross-agent binds
+// are rejected so a session's behavior never diverges from its owning
+// profile. Returns nil when nothing matches.
+func (m *Manager) resolveBindTarget(arg string, agentID string) *agent.Session {
+	agentID = normalizeAgentID(agentID)
+	sessions, err := agent.ListSessions(0)
+	if err != nil || len(sessions) == 0 {
+		return nil
+	}
+	owned := make([]*agent.Session, 0, len(sessions))
+	for _, s := range sessions {
+		if s.EffectiveAgentID() == agentID {
+			owned = append(owned, s)
+		}
+	}
+	if n, err := strconv.Atoi(arg); err == nil {
+		if n >= 1 && n <= len(owned) {
+			return owned[n-1]
+		}
+		return nil
+	}
+	for _, s := range owned {
+		if s.ID == arg || s.ShortID() == arg {
+			return s
+		}
+	}
+	return nil
+}
+
+// cmdStop interrupts the session's in-flight agent turn (mirrors the Ctrl-C /
+// web "interrupt" semantics; history is repaired by finishInterrupted and the
+// session stays usable).
+func (m *Manager) cmdStop(ev InboundEvent, agentID string) string {
+	key := sessionKeyFor(m.mode, ev, agentID)
+	val, loaded := m.sessions.Load(key)
+	if !loaded {
+		return "No active session for this context."
+	}
+	if val.(*Session).Interrupt() {
+		return "Task interrupted."
+	}
+	return "No task is running."
+}
+
+// cmdUnbind detaches the chat from its current session. If the chat was
+// explicitly /bind-ed to another session, that override is dropped; if the
+// chat owned its automatically-created session's entry binding, that binding
+// is released so other entries can use it. No history is deleted.
+//
+// If a turn is in flight, the turn still runs to completion (its history still
+// persists), but its reply is not delivered to the IM chat — suppressDelivery
+// makes the in-flight UIController silently drop everything it has not sent
+// yet, and the session is treated as handed to web, so any idle follow-up
+// turns the chat suppresses too.
+func (m *Manager) cmdUnbind(ev InboundEvent, agentID string) string {
+	key := sessionKeyFor(m.mode, ev, agentID)
+
+	released := false
+	if val, ok := m.sessions.Load(key); ok {
+		sess := val.(*Session)
+		// The chat is being detached: suppress all further outbound delivery
+		// for this session. This covers both a turn in flight (the in-flight
+		// UIController reads sess.suppressDelivery) and any armed loop wakeup
+		// — imWaker holds this same session object, so its future idle turns
+		// build a UIController that polls the same flag and stay silent too.
+		// A later message rebuilds a fresh session (zero value = not suppressed),
+		// so normal chat resumes after /bind.
+		sess.suppressDelivery.Store(true)
+		released = sess.UnbindStore(agent.EntryChannel)
+	}
+
+	hadOverride, err := m.bindings.remove(key)
+	if err != nil {
+		return fmt.Sprintf("Could not clear the binding: %v", err)
+	}
+	// Detach the live session without touching any store; the next message
+	// re-attaches this chat to its own default session.
+	m.sessions.LoadAndDelete(key)
+	if hadOverride || released {
+		return "Unbound. This chat reverted to its own session; the bound session's history was kept."
+	}
+	return "This chat wasn't bound to another session. Reset to its default session; no history was deleted."
+}
+
+// cmdStatus reports the current session state.
+func (m *Manager) cmdStatus(ev InboundEvent, agentID string) string {
+	key := sessionKeyFor(m.mode, ev, agentID)
+	val, ok := m.sessions.Load(key)
+	if !ok {
+		return "No active session. Send a message to start one, or /bind to attach to a saved session."
+	}
+	sess := val.(*Session)
+	inTok, outTok := sess.Agent.SessionTokens()
+	model := sess.Agent.Model
+	status := "idle"
+	if sess.IsRunning() {
+		status = "running"
+	}
+	title := sess.Store.Title
+	if title == "" {
+		title = sess.Store.DisplayTitle()
+	}
+	return fmt.Sprintf("Session: %s | Model: %s | Status: %s | Since: %s | Tokens: %d in / %d out",
+		title, model, status, sess.BoundAt.Format("15:04:05"), inTok, outTok)
+}
+
+// cmdList shows the persisted sessions a chat can attach to with /bind,
+// newest first — scoped to the routed agent (cross-agent binds are rejected,
+// so listing them would only offer dead ends). The number printed here is
+// the index /bind accepts.
+func (m *Manager) cmdList(agentID string) string {
+	agentID = normalizeAgentID(agentID)
+	// Match resolveBindTarget: fetch all sessions, filter by owner, then cap
+	// at 20. A /list that stopped at 20 before filtering would assign indices
+	// that don't match the indices /bind resolves against.
+	sessions, err := agent.ListSessions(0)
+	if err != nil {
+		return fmt.Sprintf("Could not list sessions: %v", err)
+	}
+	owned := make([]*agent.Session, 0, len(sessions))
+	for _, s := range sessions {
+		if s.EffectiveAgentID() == agentID {
+			owned = append(owned, s)
+		}
+	}
+	if len(owned) > 20 {
+		owned = owned[:20]
+	}
+	if len(owned) == 0 {
+		return "No saved sessions yet."
+	}
+	var b strings.Builder
+	b.WriteString("Sessions (newest first) — /bind <number> to attach:\n")
+	for i, s := range owned {
+		fmt.Fprintf(&b, "%d. %s  [%s]\n", i+1, s.DisplayTitle(), s.ShortID())
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// KeyFor exposes the session key an inbound event maps to under this
+// manager's binding mode and the routed agent, for callers that keep
+// per-session state outside the manager (e.g. the server's
+// remembered-permission stores).
+func (m *Manager) KeyFor(ev InboundEvent, agentID string) SessionKey {
+	return sessionKeyFor(m.mode, ev, agentID)
+}
+
+// GetSession returns the session for the given inbound event and routed
+// agent, or nil if none exists.
+func (m *Manager) GetSession(ev InboundEvent, agentID string) *Session {
+	key := sessionKeyFor(m.mode, ev, agentID)
+	val, ok := m.sessions.Load(key)
+	if !ok {
+		return nil
+	}
+	return val.(*Session)
+}
+
+// GetOrCreateSession returns the existing session for the routed agent's key
+// namespace, or creates a new one shaped by profile (nil → default). The
+// session's AgentID is always the routed agent, even when profile falls back
+// to the default — so a deleted profile's /bind recovery keeps its namespace.
+func (m *Manager) GetOrCreateSession(ev InboundEvent, profile *agentprofile.Profile) *Session {
+	if profile == nil {
+		profile = agentprofile.DefaultProfile()
+	}
+	key := sessionKeyFor(m.mode, ev, profile.ID)
+	val, loaded := m.sessions.Load(key)
+	if !loaded {
+		sess := m.newSession(key, ev, profile.ID, profile)
+		val, _ = m.sessions.LoadOrStore(key, sess)
+	}
+	return val.(*Session)
+}
+
+// SessionCount returns the number of active sessions.
+func (m *Manager) SessionCount() int {
+	var count int
+	m.sessions.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
+}
+
+// KnownChat identifies an IM chat the bot can proactively push to: either a
+// live session this process is serving, or a chat explicitly attached via
+// /bind (persisted across restarts). It is the recipient set the send_message
+// tool offers when the model has no bound chat of its own (e.g. a web turn
+// asked to message the user's WeChat).
+type KnownChat struct {
+	Platform string
+	ChatID   string
+	UserID   string
+	Active   bool // a live session in this process run
+	Bound    bool // has an explicit /bind
+}
+
+// KnownChats enumerates the chats the bot can address, merging live sessions
+// with the persisted /bind table. Entries are deduplicated by session key
+// (which, under the server's BindByChatUser mode, is platform:chatID:userID); a
+// chat that is both active and bound reports both flags. Chat/user IDs are
+// recovered from the session key, whose format depends on the binding mode
+// (see sessionKeyFor).
+func (m *Manager) KnownChats() []KnownChat {
+	idx := map[SessionKey]*KnownChat{}
+	upsert := func(key SessionKey, chatID, userID string) *KnownChat {
+		if kc, ok := idx[key]; ok {
+			return kc
+		}
+		p, c, u := splitSessionKey(key)
+		if chatID == "" {
+			chatID = c
+		}
+		if userID == "" {
+			userID = u
+		}
+		kc := &KnownChat{Platform: p, ChatID: chatID, UserID: userID}
+		idx[key] = kc
+		return kc
+	}
+
+	m.sessions.Range(func(k, v any) bool {
+		key, _ := k.(SessionKey)
+		sess, _ := v.(*Session)
+		var chatID, userID string
+		if sess != nil {
+			chatID, userID = sess.ChatID, sess.UserID
+		}
+		upsert(key, chatID, userID).Active = true
+		return true
+	})
+	for _, key := range m.bindings.keys() {
+		upsert(key, "", "").Bound = true
+	}
+
+	out := make([]KnownChat, 0, len(idx))
+	for _, kc := range idx {
+		if kc.Platform == "" || kc.ChatID == "" {
+			continue
+		}
+		out = append(out, *kc)
+	}
+	return out
+}
+
+// splitSessionKey recovers (platform, chatID, userID) from a session key.
+// Keys are "platform:chatID[:userID]" (sessionKeyBase), optionally prefixed
+// with "<agentID>#" for expert agents (sessionKeyFor). The prefix is only
+// stripped when it actually looks like a profile ID — a chat ID may itself
+// contain '#' (see TestSessionStoreID_DeterministicAndSafe), so a bare
+// index-of-'#' strip would misparse those keys.
+func splitSessionKey(key SessionKey) (platform, chatID, userID string) {
+	s := string(key)
+	if i := strings.IndexByte(s, '#'); i > 0 && agentprofile.IsValidID(s[:i]) {
+		s = s[i+1:]
+	}
+	parts := strings.SplitN(s, ":", 3)
+	switch len(parts) {
+	case 3:
+		return parts[0], parts[1], parts[2]
+	case 2:
+		return parts[0], parts[1], ""
+	default:
+		return s, "", ""
+	}
+}

@@ -1,0 +1,2861 @@
+package browser
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestCompileAndRoundTrip(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "click", Selector: "#b", Tag: "BUTTON", Text: "Go"},
+		{Type: "change", Selector: "#s", Tag: "SELECT", Value: "b"},
+		{Type: "change", Selector: "#q", Tag: "INPUT", Value: "hello"},
+	}
+	s := CompileRecording("demo", "a demo", "https://example.com/start", events)
+	if len(s.Steps) != 4 {
+		t.Fatalf("want 4 steps (navigate + 3), got %d", len(s.Steps))
+	}
+	if s.Steps[0].Action != "navigate" || s.Steps[1].Action != "click" ||
+		s.Steps[2].Action != "select" || s.Steps[3].Action != "type" {
+		t.Fatalf("unexpected actions: %+v", s.Steps)
+	}
+	data, err := MarshalRecording(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "action: select") {
+		t.Fatalf("yaml missing select step:\n%s", data)
+	}
+	back, err := ParseRecording(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(back.Steps) != 4 || back.Steps[2].Value != "b" {
+		t.Fatalf("round-trip mismatch: %+v", back)
+	}
+}
+
+// TestCompileAutoParamsTypeValues: every typed value becomes a declared {{param}}
+// whose Default is the recorded value, so a no-param replay reproduces the demo
+// exactly while each input is now an overridable knob — no LLM distiller needed.
+func TestCompileAutoParamsTypeValues(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "change", Selector: "#q", Tag: "INPUT", Field: "Search query", Value: "hello world"},
+		{Type: "change", Selector: `input[name="email"]`, Tag: "INPUT", Value: "a@b.com"},
+	}
+	s := CompileRecording("demo", "", "", events)
+	if len(s.Steps) != 2 {
+		t.Fatalf("want 2 type steps, got %d: %+v", len(s.Steps), s.Steps)
+	}
+	// Values are placeholders, not the literal recorded text.
+	for _, st := range s.Steps {
+		if !strings.HasPrefix(st.Value, "{{") || strings.Contains(st.Value, "hello") {
+			t.Fatalf("value not parameterized: %+v", st)
+		}
+	}
+	byName := map[string]Param{}
+	for _, p := range s.Params {
+		byName[p.Name] = p
+	}
+	// Field hint drives the name; selector name= is the fallback.
+	if p, ok := byName["search_query"]; !ok || p.Default != "hello world" {
+		t.Fatalf("search_query param wrong: %+v (params=%+v)", p, s.Params)
+	}
+	if p, ok := byName["email"]; !ok || p.Default != "a@b.com" {
+		t.Fatalf("email param wrong: %+v (params=%+v)", p, s.Params)
+	}
+	// Round-trip: with no params, replay substitutes the defaults back in.
+	full := mergedParams(&s, nil)
+	if full["search_query"] != "hello world" || full["email"] != "a@b.com" {
+		t.Fatalf("defaults not recoverable: %+v", full)
+	}
+}
+
+// TestCompileAutoParamsSecretNoDefault: a password field is parameterized without
+// a Default, so the plaintext never lands in the YAML.
+func TestCompileAutoParamsSecretNoDefault(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "change", Selector: "#pw", Tag: "INPUT", Field: "password", Secret: true, Value: "hunter2"},
+	}
+	s := CompileRecording("demo", "", "", events)
+	if len(s.Params) != 1 {
+		t.Fatalf("want 1 param, got %+v", s.Params)
+	}
+	if s.Params[0].Default != "" {
+		t.Fatalf("secret default must be empty, got %q", s.Params[0].Default)
+	}
+	if data, _ := MarshalRecording(s); strings.Contains(string(data), "hunter2") {
+		t.Fatalf("secret leaked into yaml:\n%s", data)
+	}
+}
+
+// TestCompileAutoParamsDedup: two inputs that reduce to the same name get distinct
+// params (foo, foo2) so neither value is lost.
+func TestCompileAutoParamsDedup(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "change", Selector: "#a", Tag: "INPUT", Field: "City", Value: "SFO"},
+		{Type: "change", Selector: "#b", Tag: "INPUT", Field: "City", Value: "LAX"},
+	}
+	s := CompileRecording("demo", "", "", events)
+	if len(s.Params) != 2 || s.Params[0].Name == s.Params[1].Name {
+		t.Fatalf("want two distinct params, got %+v", s.Params)
+	}
+	if s.Steps[0].Value == s.Steps[1].Value {
+		t.Fatalf("distinct inputs must map to distinct params: %+v", s.Steps)
+	}
+}
+
+// TestCompileAutoVerifyNavigateHost: navigate steps get an auto URL verify pinned
+// to the destination host, so a redirect elsewhere fails instead of proceeding.
+func TestCompileAutoVerifyNavigateHost(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "navigate", URL: "https://shop.example.com/cart?sid=abc"},
+		{Type: "click", Selector: "#pay", Tag: "BUTTON", Text: "Pay"},
+	}
+	s := CompileRecording("demo", "", "https://shop.example.com/start", events)
+	nav := s.Steps[0]
+	if nav.Action != "navigate" || nav.Verify == nil || nav.Verify.URL != "shop.example.com" {
+		t.Fatalf("leading navigate missing host verify: %+v", nav)
+	}
+	// The click step carries no auto URL verify.
+	for _, st := range s.Steps {
+		if st.Action == "click" && st.Verify != nil && st.Verify.URL != "" {
+			t.Fatalf("click should not get a url verify: %+v", st)
+		}
+	}
+}
+
+// TestReplayVerifyURLCatchesCrossHostRedirect: a navigate whose server 302s to a
+// different host (a stand-in for an SSO/login bounce) fails the auto host verify,
+// instead of replay silently continuing on the wrong page.
+func TestReplayVerifyURLCatchesCrossHostRedirect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	// The "login" host the redirect lands on.
+	login := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!doctype html><title>login</title><h1>Sign in</h1>`))
+	}))
+	defer login.Close()
+	// The app host: /start bounces to the login host.
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, login.URL+"/login", http.StatusFound)
+	}))
+	defer app.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+
+	appHost := strings.TrimPrefix(app.URL, "http://")
+	recording := &Recording{Name: "x", Steps: []Step{
+		{Action: "navigate", URL: app.URL + "/start", Verify: &Verify{URL: appHost}},
+	}}
+	_, _, _, err = ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 5 * time.Second})
+	if err == nil {
+		t.Fatal("expected replay to fail: navigation bounced to a different host")
+	}
+	if !strings.Contains(err.Error(), "verify url") {
+		t.Fatalf("expected a url-verify failure, got: %v", err)
+	}
+}
+
+// TestCompileDedupesRepeatedType: a re-dispatched identical `change` event no
+// longer survives parameterization as a spurious extra param+step (the guard that
+// value-placeholders had defeated).
+func TestCompileDedupesRepeatedType(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "change", Selector: "#q", Tag: "INPUT", Field: "query", Value: "abc"},
+		{Type: "change", Selector: "#q", Tag: "INPUT", Field: "query", Value: "abc"}, // re-dispatched dup
+	}
+	s := CompileRecording("demo", "", "", events)
+	types := 0
+	for _, st := range s.Steps {
+		if st.Action == "type" {
+			types++
+		}
+	}
+	if types != 1 {
+		t.Fatalf("want 1 type step after dedup, got %d: %+v", types, s.Steps)
+	}
+	if len(s.Params) != 1 {
+		t.Fatalf("want 1 param after dedup, got %+v", s.Params)
+	}
+}
+
+// TestReplayVerifyURLIgnoresHostInQueryParam: a bounce to a different host whose
+// URL merely echoes the expected host in a query param must still fail the host
+// verify (exact host match, not a naive href substring).
+func TestReplayVerifyURLIgnoresHostInQueryParam(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	var app *httptest.Server
+	login := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!doctype html><title>login</title><h1>Sign in</h1>`))
+	}))
+	defer login.Close()
+	app = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Bounce to the login host, echoing the app host in a query param.
+		http.Redirect(w, r, login.URL+"/?return_to="+app.URL+"%2Fcart", http.StatusFound)
+	}))
+	defer app.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	appHost := strings.TrimPrefix(app.URL, "http://")
+	recording := &Recording{Name: "x", Steps: []Step{
+		{Action: "navigate", URL: app.URL + "/start", Verify: &Verify{URL: appHost}},
+	}}
+	_, _, _, err = ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 5 * time.Second})
+	if err == nil {
+		t.Fatal("expected failure: bounced to the login host despite the app host appearing in a query param")
+	}
+	if !strings.Contains(err.Error(), "verify url") {
+		t.Fatalf("expected a url-verify failure, got: %v", err)
+	}
+}
+
+// TestReplayRecording_UnknownParamRejected: a caller-supplied param the recording
+// doesn't declare (a typo, or params meant for a different, similarly named
+// recording) is rejected before any step runs, rather than silently ignored by
+// mergedParams — the run_skill near-miss-replay guardrail from #1050 was
+// entirely prompt-text; this is a concrete, code-enforced check on top of it.
+func TestReplayRecording_UnknownParamRejected(t *testing.T) {
+	recording := &Recording{Name: "checkout", Params: []Param{{Name: "city"}}, Steps: []Step{
+		{Action: "navigate", URL: "https://example.com/{{city}}"},
+	}}
+	_, _, _, err := ReplayRecording(context.Background(), nil, recording, map[string]string{"citee": "SFO"}, ReplayOptions{})
+	if err == nil {
+		t.Fatal("expected an error for an undeclared param")
+	}
+	if !strings.Contains(err.Error(), "unknown param") || !strings.Contains(err.Error(), `"citee"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestReplayRecording_MissingRequiredParamRejected: a {{placeholder}} referenced
+// by a step with no default and no caller-supplied value must fail fast,
+// instead of subst() silently sending the literal "{{name}}" text to the
+// browser (a navigate to ".../item/{{item_id}}", a type into a field with
+// that as its value).
+func TestReplayRecording_MissingRequiredParamRejected(t *testing.T) {
+	recording := &Recording{Name: "checkout", Params: []Param{{Name: "city"}}, Steps: []Step{
+		{Action: "navigate", URL: "https://example.com/{{city}}"},
+	}}
+	_, _, _, err := ReplayRecording(context.Background(), nil, recording, nil, ReplayOptions{})
+	if err == nil {
+		t.Fatal("expected an error for an unresolved required param")
+	}
+	if !strings.Contains(err.Error(), "missing required param") || !strings.Contains(err.Error(), "city") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestReplayRecording_DefaultAndSuppliedParamsResolve: a param with a Default
+// needs no caller value, and a caller-supplied value for a param with no
+// default is accepted — the validation added above must not reject either.
+func TestReplayRecording_DefaultAndSuppliedParamsResolve(t *testing.T) {
+	recording := &Recording{Name: "checkout", Params: []Param{
+		{Name: "city", Default: "sfo"},
+		{Name: "item"},
+	}, Steps: []Step{
+		{Action: "extract", JS: "'{{city}}/{{item}}'", Bind: "out"},
+	}}
+	if err := unknownParams(recording, map[string]string{"item": "widget"}); err != nil {
+		t.Fatalf("unknownParams: %v", err)
+	}
+	full := mergedParams(recording, map[string]string{"item": "widget"})
+	if missing := unresolvedPlaceholders(recording, full); len(missing) != 0 {
+		t.Fatalf("expected no unresolved placeholders, got %v", missing)
+	}
+}
+
+// TestMissingRequiredParams exposes the same check ReplayRecording performs
+// internally, so a caller (the tools package's replay action) can prompt for a
+// value instead of letting ReplayRecording fail outright.
+func TestMissingRequiredParams(t *testing.T) {
+	recording := &Recording{Name: "checkout", Params: []Param{
+		{Name: "city", Default: "sfo"},
+		{Name: "item"},
+	}, Steps: []Step{
+		{Action: "navigate", URL: "https://example.com/{{city}}/{{item}}"},
+	}}
+	if missing := MissingRequiredParams(recording, nil); len(missing) != 1 || missing[0] != "item" {
+		t.Fatalf("MissingRequiredParams = %v, want [item] (city has a default)", missing)
+	}
+	if missing := MissingRequiredParams(recording, map[string]string{"item": "widget"}); len(missing) != 0 {
+		t.Fatalf("MissingRequiredParams = %v, want none once item is supplied", missing)
+	}
+}
+
+// TestCompileUploadMerge: a click on the upload button followed by a file
+// selection compiles to a single upload step on the button, auto-parameterized.
+func TestCompileUploadMerge(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "click", Selector: ".upload-btn", Tag: "BUTTON", Text: "Upload affected booking list"},
+		{Type: "upload", Selector: "input[type=file]", Tag: "INPUT", Value: "C:\\fakepath\\x.xlsx"},
+	}
+	s := CompileRecording("u", "", "https://x/start", events)
+	// navigate + upload (the click was merged in)
+	if len(s.Steps) != 2 {
+		t.Fatalf("want 2 steps, got %d: %+v", len(s.Steps), s.Steps)
+	}
+	up := s.Steps[1]
+	if up.Action != "upload" || up.Selector != ".upload-btn" || up.Value != "{{file}}" {
+		t.Fatalf("bad upload step: %+v", up)
+	}
+	if len(s.Params) != 1 || s.Params[0].Name != "file" {
+		t.Fatalf("want a file param, got %+v", s.Params)
+	}
+}
+
+// TestUploadViaChooser drives the chooser-based upload: clicking a button opens
+// a (intercepted) file chooser and the file is set on the underlying input.
+func TestUploadViaChooser(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>up</title>
+<input type="file" id="f" style="display:none">
+<button id="btn" onclick="document.getElementById('f').click()">Upload</button>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.WaitFor(ctx, "#btn", testWaitTimeout); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	dir := t.TempDir()
+	xlsx := dir + "/report.xlsx"
+	if err := os.WriteFile(xlsx, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := page.UploadViaChooser(ctx, "#btn", []string{xlsx}); err != nil {
+		t.Fatalf("upload via chooser: %v", err)
+	}
+	var name string
+	if err := page.Eval(ctx, "document.querySelector('#f').files[0].name", &name); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if name != "report.xlsx" {
+		t.Fatalf("file not set via chooser: %q", name)
+	}
+}
+
+// TestCompileRecordingDropsConsecutiveDupes: a jittery double-fire of the same click
+// is collapsed to one step; distinct steps (and a legitimate repeat of the same
+// selector that is separated by another action) are preserved.
+func TestCompileRecordingDropsConsecutiveDupes(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "click", Selector: "#go", Tag: "BUTTON", Text: "Go"},
+		{Type: "click", Selector: "#go", Tag: "BUTTON", Text: "Go"}, // immediate dup → dropped
+		{Type: "change", Selector: "#q", Tag: "INPUT", Value: "x"},
+		{Type: "click", Selector: "#go", Tag: "BUTTON", Text: "Go"}, // same selector but not consecutive → kept
+	}
+	s := CompileRecording("demo", "", "", events)
+	clicks := 0
+	for _, st := range s.Steps {
+		if st.Action == "click" && st.Selector == "#go" {
+			clicks++
+		}
+	}
+	if clicks != 2 {
+		t.Fatalf("expected 2 #go clicks (one dup dropped), got %d: %+v", clicks, s.Steps)
+	}
+}
+
+// TestCompileRecordingCapturesNavigations: navigations recorded during the demo
+// become navigate steps in order; an about:blank start URL is dropped (it's the
+// throwaway tab octo opened, not where the user worked).
+func TestCompileRecordingCapturesNavigations(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "navigate", URL: "https://www.zhihu.com/hot"},
+		{Type: "navigate", URL: "https://www.zhihu.com/hot"}, // initial-load echo → collapsed
+		{Type: "click", Selector: "section a", Tag: "A", Text: "Top story"},
+	}
+	s := CompileRecording("demo", "", "about:blank", events)
+	if len(s.Steps) != 2 {
+		t.Fatalf("want navigate+click (blank dropped, echo collapsed), got %d: %+v", len(s.Steps), s.Steps)
+	}
+	if s.Steps[0].Action != "navigate" || s.Steps[0].URL != "https://www.zhihu.com/hot" {
+		t.Fatalf("step 0 = %+v, want navigate to /hot", s.Steps[0])
+	}
+	if s.Steps[1].Action != "click" {
+		t.Fatalf("step 1 = %+v, want click", s.Steps[1])
+	}
+}
+
+// TestGenerateRecordingDistill: the LLM distiller drops a fumble (a wrong click +
+// going back) and parameterizes a value — and the precision guard rejects any
+// output that invents a selector, falling back to the deterministic baseline.
+func TestGenerateRecordingDistill(t *testing.T) {
+	ctx := context.Background()
+	events := []RecordedEvent{
+		{Type: "click", Selector: "#wrong-tab", Tag: "A", Text: "Oops"}, // a detour
+		{Type: "click", Selector: "#search", Tag: "BUTTON", Text: "Search"},
+		{Type: "change", Selector: "#q", Tag: "INPUT", Value: "ORDER-123"},
+	}
+
+	// A generator that returns a cleaned recording (drops the detour, params the
+	// value). It writes the empty list fields as `{}` — the shape that used to
+	// fail parsing and discard the whole refinement (#2406).
+	clean := func(_ context.Context, _, _ string) (string, error) {
+		return "name: x\nparams: {}\noutputs: {}\nsteps:\n" +
+			"  - {action: navigate, url: 'https://x/start'}\n" +
+			"  - {action: click, selector: '#search'}\n" +
+			"  - {action: type, selector: '#q', value: '{{order}}'}\n", nil
+	}
+	s, fallback := GenerateRecording(ctx, "demo", "https://x/start", "", events, clean)
+	if fallback != "" {
+		t.Fatalf("a usable refinement must not report a fallback, got %q", fallback)
+	}
+	if len(s.Steps) != 3 { // navigate + search + type (detour dropped)
+		t.Fatalf("distill should drop the detour; got %d steps: %+v", len(s.Steps), s.Steps)
+	}
+	if s.Steps[2].Value != "{{order}}" {
+		t.Fatalf("value not parameterized: %+v", s.Steps[2])
+	}
+
+	// A generator that invents a selector not in the recording -> must be rejected,
+	// but its prose description is still trustworthy and must survive the fallback
+	// (an empty description leaves the recordings manifest with a bare, matchable name).
+	cheat := func(_ context.Context, _, _ string) (string, error) {
+		return "name: x\ndescription: open the search page\nsteps:\n  - {action: click, selector: '#invented'}\n", nil
+	}
+	s2, fallback := GenerateRecording(ctx, "demo", "https://x/start", "", events, cheat)
+	for _, st := range s2.Steps {
+		if st.Selector == "#invented" {
+			t.Fatal("precision guard failed: accepted an invented selector")
+		}
+	}
+	if s2.Description != "open the search page" {
+		t.Fatalf("guard fallback should keep the distilled description, got %q", s2.Description)
+	}
+	if !strings.Contains(fallback, "#invented") {
+		t.Fatalf("the fallback reason must name the rejected selector, got %q", fallback)
+	}
+
+	// A generator whose output has a description but no usable steps -> baseline
+	// steps, distilled description.
+	descOnly := func(_ context.Context, _, _ string) (string, error) {
+		return "name: x\ndescription: search for an order\n", nil
+	}
+	s3, fallback := GenerateRecording(ctx, "demo", "https://x/start", "", events, descOnly)
+	if len(s3.Steps) == 0 {
+		t.Fatal("steps-empty fallback should keep the baseline steps")
+	}
+	if s3.Description != "search for an order" {
+		t.Fatalf("steps-empty fallback should keep the distilled description, got %q", s3.Description)
+	}
+	if !strings.Contains(fallback, "no steps") {
+		t.Fatalf("the fallback reason must say the output had no steps, got %q", fallback)
+	}
+
+	// Output that does not parse at all: baseline steps, and a reason that
+	// carries the parse error. No generator at all is a fallback too.
+	broken := func(_ context.Context, _, _ string) (string, error) {
+		return "name: x\nparams: {a: 1}\noutputs: {b: 2}\nsteps: []\n", nil
+	}
+	if s4, fallback := GenerateRecording(ctx, "demo", "https://x/start", "", events, broken); len(s4.Steps) == 0 || !strings.Contains(fallback, "not a valid recording") || strings.Contains(fallback, "\n") {
+		t.Fatalf("unparseable output: steps=%d fallback=%q (must name the parse error on one line)", len(s4.Steps), fallback)
+	}
+	if _, fallback := GenerateRecording(ctx, "demo", "https://x/start", "", events, nil); !strings.Contains(fallback, "no model") {
+		t.Fatalf("nil generator must report why the baseline was kept, got %q", fallback)
+	}
+}
+
+// TestGenerateRecordingPromptCarriesGoal (#2406): the user's stated goal is
+// the only intent signal the distiller has — it must lead the user prompt,
+// verbatim; an empty goal adds no Goal line.
+func TestGenerateRecordingPromptCarriesGoal(t *testing.T) {
+	events := []RecordedEvent{{Type: "click", Selector: "#a", Tag: "A", Text: "Go"}}
+	var system, captured string
+	gen := func(_ context.Context, sys, user string) (string, error) {
+		system, captured = sys, user
+		return "", fmt.Errorf("stop")
+	}
+	_, _ = GenerateRecording(context.Background(), "demo", "https://x/start", "  进笔记管理，找到最新一篇，点开它的评论  ", events, gen)
+	if !strings.HasPrefix(captured, "Goal (what the user set out to do, in their own words): 进笔记管理，找到最新一篇，点开它的评论\n") {
+		t.Fatalf("goal must lead the prompt verbatim:\n%s", captured)
+	}
+	if !strings.Contains(system, "stated goal") || !strings.Contains(system, "detour") {
+		t.Fatalf("system prompt must tie rule (2) to the goal:\n%s", system)
+	}
+	_, _ = GenerateRecording(context.Background(), "demo", "https://x/start", "", events, gen)
+	if strings.Contains(captured, "Goal (") {
+		t.Fatalf("no goal given, no Goal line:\n%s", captured)
+	}
+}
+
+// TestRenderTraceEffects: the distill trace carries each gesture's URL, its
+// effects summary and the likely_noop marker — the evidence rule (2) judges by.
+func TestRenderTraceEffects(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "click", Selector: "#go", Tag: "A", Text: "笔记管理", URL: "https://x/home", Effects: &Effects{URLAfter: "https://x/notes", Requests: map[string]int{"GET": 1}}},
+		{Type: "click", Selector: "#cancel", Tag: "BUTTON", Text: "取消", URL: "https://x/notes", Effects: &Effects{}, LikelyNoop: true},
+		{Type: "click", Selector: "#legacy", Tag: "A", Text: "old"},
+	}
+	tr := renderTrace(events)
+	for _, want := range []string{
+		`url="https://x/home"  effects: url→https://x/notes GET×1`,
+		`text="取消" value="" url="https://x/notes"  effects: none  [likely_noop]`,
+	} {
+		if !strings.Contains(tr, want) {
+			t.Fatalf("trace missing %q:\n%s", want, tr)
+		}
+	}
+	if strings.Contains(strings.SplitN(tr, "\n", 3)[2], "effects:") {
+		t.Fatalf("an event without Effects (older recorder) must render no effects column:\n%s", tr)
+	}
+}
+
+// TestLikelyNoopReachesPlan: the marker rides from the events onto the compiled
+// steps, survives distillation onto refined steps with the same target, and
+// SummarizeRecording asks about exactly those steps — while a distiller that
+// dropped them leaves no question to ask.
+func TestLikelyNoopReachesPlan(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "click", Selector: "#notes", Tag: "SPAN", Text: "笔记管理", Effects: &Effects{URLAfter: "https://x/notes"}},
+		{Type: "click", Selector: "#reply", Tag: "SPAN", Text: "说点什么...", Effects: &Effects{}, LikelyNoop: true},
+		{Type: "click", Selector: "#cancel", Tag: "BUTTON", Text: "取消", Effects: &Effects{}, LikelyNoop: true},
+	}
+	base := CompileRecording("x", "", "https://x/", events)
+	if !base.Steps[2].likelyNoop || !base.Steps[3].likelyNoop || base.Steps[1].likelyNoop {
+		t.Fatalf("compile must carry the marker onto the flagged clicks only: %+v", base.Steps)
+	}
+	plan := SummarizeRecording(base)
+	if !strings.Contains(plan, "要保留吗") || !strings.Contains(plan, "3. 点击「说点什么...」") || !strings.Contains(plan, "4. 点击「取消」") || strings.Contains(plan, "2. 点击「笔记管理」\n  ") {
+		t.Fatalf("plan must list the flagged steps as a question:\n%s", plan)
+	}
+	if y, _ := MarshalRecording(base); strings.Contains(string(y), "noop") {
+		t.Fatalf("the marker must never reach the YAML:\n%s", y)
+	}
+
+	keep := func(_ context.Context, _, _ string) (string, error) {
+		return "name: x\nsteps:\n  - {action: navigate, url: 'https://x/'}\n  - {action: click, selector: '#notes'}\n  - {action: click, selector: '#reply'}\n  - {action: click, selector: '#cancel'}\n", nil
+	}
+	refined, fb := GenerateRecording(context.Background(), "x", "https://x/", "", events, keep)
+	if fb != "" || len(refined.Steps) != 4 || !refined.Steps[2].likelyNoop || !refined.Steps[3].likelyNoop || refined.Steps[1].likelyNoop {
+		t.Fatalf("marker must be re-attached onto kept refined steps: fb=%q %+v", fb, refined.Steps)
+	}
+	drop := func(_ context.Context, _, _ string) (string, error) {
+		return "name: x\nsteps:\n  - {action: navigate, url: 'https://x/'}\n  - {action: click, selector: '#notes'}\n", nil
+	}
+	refined, fb = GenerateRecording(context.Background(), "x", "https://x/", "", events, drop)
+	if fb != "" || strings.Contains(SummarizeRecording(refined), "要保留吗") {
+		t.Fatalf("nothing to ask when the distiller dropped the no-ops: fb=%q\n%s", fb, SummarizeRecording(refined))
+	}
+}
+
+// TestBackfillNoopHintsStaysTailOnly: the same element clicked legitimately
+// mid-flow and again by mistake at the end shares a selector, so the lookup
+// alone would flag both refined steps. The marker is a tail property; the
+// mid-flow click must come out unflagged, and a key step reads as a key press.
+func TestBackfillNoopHintsStaysTailOnly(t *testing.T) {
+	base := Recording{Steps: []Step{
+		{Action: "click", Selector: "#tab", Label: "评论"},
+		{Action: "click", Selector: "#note", Label: "最新笔记"},
+		{Action: "wait", Network: true},
+		{Action: "click", Selector: "#tab", Label: "评论", likelyNoop: true},
+		{Action: "key", Selector: "#q", Label: "搜索框", Value: "enter", likelyNoop: true},
+	}}
+	refined := Recording{Steps: []Step{
+		{Action: "click", Selector: "#tab", Label: "评论"},
+		{Action: "click", Selector: "#note", Label: "最新笔记"},
+		{Action: "wait", Network: true},
+		{Action: "click", Selector: "#tab", Label: "评论"},
+		{Action: "key", Selector: "#q", Label: "搜索框", Value: "enter"},
+	}}
+	backfillNoopHints(&refined, base)
+	got := []bool{}
+	for _, st := range refined.Steps {
+		got = append(got, st.likelyNoop)
+	}
+	if want := []bool{false, false, false, true, true}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("likelyNoop per step = %v, want %v", got, want)
+	}
+	plan := SummarizeRecording(refined)
+	if !strings.Contains(plan, "4. 点击「评论」") || !strings.Contains(plan, "5. 在「搜索框」中按 enter") || strings.Contains(plan, "1. 点击「评论」\n  ") {
+		t.Fatalf("plan must list only the tail, with action-aware wording:\n%s", plan)
+	}
+}
+
+// TestParseRecordingAcceptsEmptyMapLists (#2406): `params: {}` / `outputs: {}`
+// decode as empty lists, like the null / bare-key spellings always did — a
+// model writes any of these for "none". A populated mapping is still a shape
+// error, `steps: {}` is still rejected (steps are deliberately not relaxed),
+// a null inside a Param is untouched, and a real list still parses.
+func TestParseRecordingAcceptsEmptyMapLists(t *testing.T) {
+	for _, src := range []string{
+		"name: x\nparams: {}\noutputs: {}\nsteps:\n  - {action: click, selector: '#a'}\n",
+		"name: x\nparams: null\noutputs: ~\nsteps:\n  - {action: click, selector: '#a'}\n",
+		"name: x\nparams:\noutputs:\nsteps:\n  - {action: click, selector: '#a'}\n",
+	} {
+		s, err := ParseRecording([]byte(src))
+		if err != nil {
+			t.Fatalf("parse %q: %v", src, err)
+		}
+		if len(s.Params) != 0 || len(s.Outputs) != 0 || len(s.Steps) != 1 || s.Steps[0].Selector != "#a" {
+			t.Fatalf("parse %q: %+v", src, s)
+		}
+	}
+	s, err := ParseRecording([]byte("name: x\nparams:\n  - {name: order, default: '1'}\noutputs:\n  - {name: files, type: 'file[]'}\nsteps: []\n"))
+	if err != nil || len(s.Params) != 1 || s.Params[0].Name != "order" || len(s.Outputs) != 1 || s.Outputs[0].Type != "file[]" {
+		t.Fatalf("real lists must still parse: %+v (err %v)", s, err)
+	}
+	if _, err := ParseRecording([]byte("name: x\nparams: {order: {default: '1'}}\nsteps: []\n")); err == nil {
+		t.Fatal("a populated mapping is not a list and must still be rejected")
+	}
+	if _, err := ParseRecording([]byte("name: x\nparams: []\nsteps: {}\n")); err == nil {
+		t.Fatal("steps: {} must still be rejected — only params/outputs are relaxed")
+	}
+	if s, err := ParseRecording([]byte("name: x\nparams:\n  - {name: order, default: ~}\nsteps: []\n")); err != nil || len(s.Params) != 1 || s.Params[0].Name != "order" || s.Params[0].Default != "" {
+		t.Fatalf("a null inside a Param must decode as before: %+v (err %v)", s, err)
+	}
+	if s, err := ParseRecording(nil); err != nil || s.Name != "" {
+		t.Fatalf("empty input: %+v (err %v)", s, err)
+	}
+}
+
+// TestStepDigest: the digest names each step by its label (falling back to hint,
+// then selector), renders navigates as host+path, skips waits, and when long
+// keeps the head plus the FINAL step — the ending is what a bare name hides.
+func TestStepDigest(t *testing.T) {
+	s := Recording{Steps: []Step{
+		{Action: "navigate", URL: "https://www.zhihu.com/hot/"},
+		{Action: "wait", TimeoutMS: 500},
+		{Action: "click", Label: "热榜"},
+		{Action: "type", Hint: "search"},
+		{Action: "click", Selector: "#go"},
+		{Action: "click", Label: "日元跌破 1 美元兑 162 日元关口，创下近 40 年来新低，日本央行已加息"},
+	}}
+	got := s.StepDigest()
+	want := `navigate www.zhihu.com/hot → click "热榜" → type "search" → click "#go" → click "日元跌破 1 美元兑 162 日元关口，创下近 40 年来新…"`
+	if got != want {
+		t.Fatalf("digest = %q\nwant %q", got, want)
+	}
+
+	long := Recording{}
+	for i := 0; i < 11; i++ {
+		long.Steps = append(long.Steps, Step{Action: "click", Label: fmt.Sprintf("s%d", i)})
+	}
+	d := long.StepDigest()
+	if !strings.Contains(d, "…") || !strings.Contains(d, `"s10"`) {
+		t.Fatalf("long digest must elide the middle but keep the final step, got %q", d)
+	}
+
+	// Exactly 8 significant steps is the no-elision boundary.
+	eight := Recording{}
+	for i := 0; i < 8; i++ {
+		eight.Steps = append(eight.Steps, Step{Action: "click", Label: fmt.Sprintf("s%d", i)})
+	}
+	if d := eight.StepDigest(); strings.Contains(d, "…") {
+		t.Fatalf("8 steps must not be elided, got %q", d)
+	}
+
+	// A recording with only waits digests to "" (the manifest then shows a bare name).
+	if d := (Recording{Steps: []Step{{Action: "wait", TimeoutMS: 100}}}).StepDigest(); d != "" {
+		t.Fatalf("wait-only recording should digest to empty, got %q", d)
+	}
+}
+
+// TestRunStepWaitFixedDelay: a wait step with no selector sleeps the requested
+// time (the SPA-settling primitive) — and replay no longer rejects it.
+func TestRunStepWaitFixedDelay(t *testing.T) {
+	start := time.Now()
+	if _, err := runStep(context.Background(), nil, nil, &Step{Action: "wait", TimeoutMS: 80}, nil, time.Second, "", nil); err != nil {
+		t.Fatalf("wait step: %v", err)
+	}
+	if d := time.Since(start); d < 60*time.Millisecond {
+		t.Fatalf("wait returned too fast: %v", d)
+	}
+}
+
+// TestWaitForNetworkIdle: a wait{network:true} step blocks until an in-flight
+// fetch the page kicked off completes, then returns — the SPA-settle primitive.
+func TestWaitForNetworkIdle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(600 * time.Millisecond)
+		w.Write([]byte(`{"ok":true}`))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		// On load, fire a slow fetch that flips window.done when it resolves.
+		w.Write([]byte(`<!doctype html><meta charset="utf-8"><title>t</title>
+<script>window.done=false;fetch('/slow').then(function(){window.done=true;});</script>`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.Navigate(ctx, srv.URL); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+
+	recording := &Recording{Name: "x", Steps: []Step{{Action: "wait", Network: true, TimeoutMS: 10000}}}
+	start := time.Now()
+	if _, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 15 * time.Second}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	// The in-flight fetch (~600ms) must have settled before the wait returned.
+	var done bool
+	if err := page.Eval(ctx, "window.done===true", &done); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if !done {
+		t.Fatal("network-idle wait returned before the in-flight fetch completed")
+	}
+	if d := time.Since(start); d < 500*time.Millisecond {
+		t.Fatalf("network-idle wait returned suspiciously fast (%v) — did it settle?", d)
+	}
+}
+
+// TestReplayClickFollowsNewTab: a click on a target=_blank link is followed to
+// the tab it opens (the Zhihu-hot-item failure mode), and ReplayRecording returns
+// that tab as the final page.
+func TestReplayClickFollowsNewTab(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dest", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!doctype html><meta charset="utf-8"><title>dest</title><h1 id="dest">DEST</h1>`))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!doctype html><meta charset="utf-8"><title>home</title><a id="open" href="/dest" target="_blank">Open</a>`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.Navigate(ctx, srv.URL); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+
+	recording := &Recording{Name: "x", Steps: []Step{{Action: "click", Selector: "#open"}}}
+	_, fp, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 5 * time.Second, Browser: b})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if fp == page {
+		t.Fatal("replay did not follow the new tab opened by the click")
+	}
+	if err := fp.WaitFor(ctx, "#dest", testWaitTimeout); err != nil {
+		t.Fatalf("final page is not the destination tab: %v", err)
+	}
+}
+
+// TestReplayTextAnchorRecoversFromDrift: a recorded positional selector now
+// points at the WRONG element after a layout change, but the recorded text steers
+// replay to the right one — instead of silently clicking the wrong node.
+func TestReplayTextAnchorRecoversFromDrift(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!doctype html><meta charset="utf-8"><title>t</title>
+<div>
+  <button onclick="window.hit='wrong'">Cancel</button>
+  <button onclick="window.hit='right'">Book now</button>
+</div>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.Navigate(ctx, srv.URL); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+
+	// The positional selector resolves to the first button ("Cancel") — the wrong
+	// one — but the recorded Label is the second button's text.
+	recording := &Recording{Name: "x", Steps: []Step{
+		{Action: "click", Selector: "div > button:nth-of-type(1)", Label: "Book now"},
+	}}
+	if _, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 5 * time.Second}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var hit string
+	if err := page.Eval(ctx, "window.hit||''", &hit); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if hit != "right" {
+		t.Fatalf("text anchor did not override the drifted selector: window.hit=%q, want %q", hit, "right")
+	}
+}
+
+// TestReplayFieldHintRecoversFromDrift: a recorded positional selector for a text
+// input no longer resolves after a layout change, but the field's accessible-name
+// hint (its name) re-locates it — so type lands in the right box instead of failing
+// into the healer.
+func TestReplayFieldHintRecoversFromDrift(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		// The input sits at a different DOM path than the recorded positional
+		// selector expects, but keeps its name="q".
+		w.Write([]byte(`<!doctype html><meta charset="utf-8"><title>t</title>
+<header><nav><span>x</span></nav></header>
+<main><section><div><input name="q" placeholder="Search"></div></section></main>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.Navigate(ctx, srv.URL); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+
+	// A stale positional selector that matches nothing on the current page; the
+	// hint "q" (the field name) is the recovery signal.
+	recording := &Recording{Name: "x", Steps: []Step{
+		{Action: "type", Selector: "body > div:nth-of-type(9) > input", Hint: "q", Value: "hello"},
+	}}
+	if _, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 5 * time.Second}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var got string
+	if err := page.Eval(ctx, `document.querySelector('input[name="q"]').value`, &got); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if got != "hello" {
+		t.Fatalf("field hint did not recover the drifted input: value=%q, want %q", got, "hello")
+	}
+}
+
+// TestReplayDismissesOverlayDeterministically: a step's target doesn't exist
+// until a consent overlay is accepted; replay recovers by clicking the allow-list
+// "Accept" control — no healer wired — then the retry succeeds.
+func TestReplayDismissesOverlayDeterministically(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		// Accept injects the real target #go and removes itself.
+		w.Write([]byte(`<!doctype html><meta charset="utf-8"><title>t</title>
+<button id="accept" onclick="var g=document.createElement('button');g.id='go';g.textContent='Go';g.onclick=function(){window.hit=1};document.body.appendChild(g);this.remove();">Accept</button>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.Navigate(ctx, srv.URL); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+
+	// #go is absent until the overlay is dismissed; no healer is provided, so this
+	// exercises the deterministic structural recovery path.
+	recording := &Recording{Name: "x", Steps: []Step{{Action: "click", Selector: "#go"}}}
+	modified, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 2 * time.Second, Browser: b})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if modified {
+		t.Fatal("overlay dismissal is runtime-only; it must not mark the recording modified")
+	}
+	var hit int
+	if err := page.Eval(ctx, "window.hit||0", &hit); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if hit != 1 {
+		t.Fatalf("target not clicked after overlay dismissal (hit=%d)", hit)
+	}
+}
+
+// TestReplayHealBypassesStaleAnchors: a step whose recorded fingerprint no
+// longer matches the page (garbage neighbor text) fails anchored resolution;
+// the healer supplies the correct selector. The retry must not re-gate the
+// healed selector through the same dead fingerprint — otherwise an anchored
+// step can never heal (observed on Zhihu: every heal round was rejected by the
+// drifted fingerprint and replay failed). The stale anchors must be replaced
+// (here the bare button offers no anchor signal, so by none) and the written-
+// back step must replay on its own.
+func TestReplayHealBypassesStaleAnchors(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>t</title>
+<button id="real">Go</button>
+<script>window.clicks=0;document.getElementById('real').addEventListener('click',function(){window.clicks++});</script>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.WaitFor(ctx, "#real", testWaitTimeout); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+
+	recording := &Recording{Name: "x", Steps: []Step{{
+		Action:   "click",
+		Selector: "#stale",
+		Anchors:  &Anchors{Tag: "div", NeighborText: "text that exists nowhere on this page"},
+	}}}
+	heal := func(_ context.Context, _ *Page, step *Step, _ error) error {
+		step.Selector = "#real"
+		return nil
+	}
+	modified, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 2 * time.Second, Healer: heal, Browser: b})
+	if err != nil {
+		t.Fatalf("replay should succeed via the healed selector, got: %v", err)
+	}
+	if !modified {
+		t.Fatal("expected modified=true after a successful heal")
+	}
+	if recording.Steps[0].Selector != "#real" {
+		t.Fatalf("step not corrected: %q", recording.Steps[0].Selector)
+	}
+	if a := recording.Steps[0].Anchors; a != nil && a.NeighborText == "text that exists nowhere on this page" {
+		t.Fatal("stale anchors must not survive the heal — keeping them re-deadlocks the next replay")
+	}
+	var clicks int
+	if err := page.Eval(ctx, "window.clicks", &clicks); err != nil || clicks < 1 {
+		t.Fatalf("healed step did not actually click (clicks=%d, err=%v)", clicks, err)
+	}
+	// The written-back step must stand on its own: replay it again with no
+	// healer wired.
+	if _, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 2 * time.Second, Browser: b}); err != nil {
+		t.Fatalf("healed recording must replay without a healer, got: %v", err)
+	}
+	if err := page.Eval(ctx, "window.clicks", &clicks); err != nil || clicks < 2 {
+		t.Fatalf("second replay did not click (clicks=%d, err=%v)", clicks, err)
+	}
+}
+
+// healVerifyFixture is the page shape from #2404: a menu whose entries are
+// click-handled spans (no interactive tag or role), a second element with the
+// same visible text elsewhere, and a recorded fingerprint whose selector and
+// neighbor text are both stale — so anchored resolution ties on the label
+// alone and fails into the healer.
+const healVerifyFixture = `<!doctype html><title>t</title>
+<div class="nav"><div class="item"><span class="section">首页</span><span class="menu-title-wrapper">笔记管理</span></div></div>
+<div class="tabs"><div class="item"><span class="tab-title">笔记管理</span></div></div>
+<script>window.hits=[];
+document.querySelector('.menu-title-wrapper').addEventListener('click',function(){window.hits.push('nav')});
+document.querySelector('.tab-title').addEventListener('click',function(){window.hits.push('tab')});</script>`
+
+func healVerifyStep() Step {
+	return Step{
+		Action:   "click",
+		Selector: "div.list > div.nav-v2 > div.nav-item:nth-of-type(2) > span.nav-title > span.title-wrapper",
+		Label:    "笔记管理",
+		Anchors:  &Anchors{Selectors: []string{"div > div.nav-v2 > div > span > span"}, Tag: "span", NeighborText: "旧栏目"},
+	}
+}
+
+// TestReplayHealRejectsUnverifiedSelector (#2404): the healer proposes a
+// selector that matches nothing on the page — the tail of the dead selector,
+// echoed back. Before, that proposal reached the retry with the anchors
+// dropped, the label fallback clicked the right element on its own, and the
+// write-back persisted the phantom selector minus the fingerprint. Now the
+// proposal must be verified against the page first: rejected, the step is left
+// exactly as recorded (selector AND anchors), nothing is clicked, the
+// rejection reason feeds the next heal round, and replay fails honestly once
+// the rounds run out.
+func TestReplayHealRejectsUnverifiedSelector(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(healVerifyFixture))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.WaitFor(ctx, ".tab-title", testWaitTimeout); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+
+	recording := &Recording{Name: "x", Steps: []Step{healVerifyStep()}}
+	want := healVerifyStep()
+	var causes []string
+	heal := func(_ context.Context, _ *Page, step *Step, cause error) error {
+		causes = append(causes, cause.Error())
+		step.Selector = "span.title-wrapper"
+		return nil
+	}
+	modified, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 2 * time.Second, Healer: heal, Browser: b})
+	if err == nil {
+		t.Fatal("replay must fail: every proposal matched nothing, and the label fallback must not rescue an unverified heal")
+	}
+	if !strings.Contains(err.Error(), "self-heal") || !strings.Contains(err.Error(), `"span.title-wrapper"`) || !strings.Contains(err.Error(), "matches no element") {
+		t.Fatalf("error must name the rejected proposal and why, got: %v", err)
+	}
+	if modified {
+		t.Fatal("a rejected heal must not mark the recording modified — nothing verified may reach the YAML")
+	}
+	got := recording.Steps[0]
+	if got.Selector != want.Selector {
+		t.Fatalf("selector must stay as recorded, got %q", got.Selector)
+	}
+	if got.Anchors == nil || got.Anchors.NeighborText != want.Anchors.NeighborText || len(got.Anchors.Selectors) != 1 || got.Anchors.Selectors[0] != want.Anchors.Selectors[0] {
+		t.Fatalf("anchors must survive a rejected heal untouched, got %+v", got.Anchors)
+	}
+	if len(causes) != maxHealRounds {
+		t.Fatalf("expected %d heal rounds, got %d", maxHealRounds, len(causes))
+	}
+	if !strings.Contains(causes[1], "rejected") || !strings.Contains(causes[1], "span.title-wrapper") {
+		t.Fatalf("the rejection must feed the next round as its cause, got: %s", causes[1])
+	}
+	var hits []string
+	if err := page.Eval(ctx, "window.hits", &hits); err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("nothing may be clicked on an unverified proposal, got %v", hits)
+	}
+}
+
+// TestReplayHealRejectsWrongElement: a proposal that resolves — but to an
+// element whose text is not the step's recorded label (the neighbouring menu
+// entry) — is rejected on that ground, named as such, and nothing is clicked.
+// The existence check alone would have let a wrong-element heal through.
+func TestReplayHealRejectsWrongElement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(healVerifyFixture))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.WaitFor(ctx, ".tab-title", testWaitTimeout); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+
+	recording := &Recording{Name: "x", Steps: []Step{healVerifyStep()}}
+	heal := func(_ context.Context, _ *Page, step *Step, _ error) error {
+		step.Selector = "span.section" // exists, reads 首页 — not the intended entry
+		return nil
+	}
+	modified, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 2 * time.Second, Healer: heal, Browser: b})
+	if err == nil {
+		t.Fatal("replay must fail: the proposal resolves to the wrong element")
+	}
+	if !strings.Contains(err.Error(), "does not contain the recorded label") || !strings.Contains(err.Error(), "首页") {
+		t.Fatalf("error must say the element's text does not carry the label, got: %v", err)
+	}
+	if modified || recording.Steps[0].Selector != healVerifyStep().Selector {
+		t.Fatalf("a rejected heal must leave the step untouched (modified=%v, selector=%q)", modified, recording.Steps[0].Selector)
+	}
+	var hits []string
+	if err := page.Eval(ctx, "window.hits", &hits); err != nil || len(hits) != 0 {
+		t.Fatalf("nothing may be clicked, got %v (err %v)", hits, err)
+	}
+}
+
+// TestReplayHealRefingerprintsVerifiedElement (#2404): a proposal that does
+// resolve to an element carrying the recorded label is accepted — and instead
+// of the stale anchors being dropped, the verified element is fingerprinted
+// afresh with the recorder's own strategies (alternate selectors, tag, the
+// neighbor text actually beside it now). The retry clicks the intended element
+// even though a second one shares its text, and the written-back step replays
+// with no healer at all.
+func TestReplayHealRefingerprintsVerifiedElement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(healVerifyFixture))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.WaitFor(ctx, ".tab-title", testWaitTimeout); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+
+	recording := &Recording{Name: "x", Steps: []Step{healVerifyStep()}}
+	const proposed = "div.nav > div.item > span:nth-of-type(2)" // digest-style: what the healer's list would carry
+	heal := func(_ context.Context, _ *Page, step *Step, _ error) error {
+		step.Selector = proposed
+		return nil
+	}
+	modified, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 2 * time.Second, Healer: heal, Browser: b})
+	if err != nil {
+		t.Fatalf("replay should succeed via the verified selector, got: %v", err)
+	}
+	if !modified {
+		t.Fatal("expected modified=true after a verified heal")
+	}
+	got := recording.Steps[0]
+	if got.Selector != proposed {
+		t.Fatalf("step not corrected: %q", got.Selector)
+	}
+	a := got.Anchors
+	if a == nil {
+		t.Fatal("verified heal must re-fingerprint the element, not drop the anchors")
+	}
+	if a.Tag != "span" || a.NeighborText != "首页" {
+		t.Fatalf("fresh fingerprint must describe the element as it is now (tag span, neighbor 首页), got %+v", a)
+	}
+	if len(a.Selectors) == 0 {
+		t.Fatalf("fresh fingerprint must carry alternate selectors, got %+v", a)
+	}
+	for _, s := range a.Selectors {
+		if s == proposed || s == "div > div.nav-v2 > div > span > span" {
+			t.Fatalf("alternates must be fresh strategies, not the primary or the stale alternate: %+v", a.Selectors)
+		}
+	}
+	var hits []string
+	if err := page.Eval(ctx, "window.hits", &hits); err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0] != "nav" {
+		t.Fatalf("the healed step must click the intended menu entry, got %v", hits)
+	}
+	// The written-back step must stand on its own — replay again, no healer.
+	if _, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 2 * time.Second, Browser: b}); err != nil {
+		t.Fatalf("healed recording must replay without a healer, got: %v", err)
+	}
+	if err := page.Eval(ctx, "window.hits", &hits); err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 2 || hits[1] != "nav" {
+		t.Fatalf("second replay must click the same entry via the fresh fingerprint, got %v", hits)
+	}
+}
+
+// TestReplayHealFailureIsReported: when the healer runs and gives up, the
+// surfaced error must say so — a bare selector error made a failed heal
+// indistinguishable from self-heal never being configured.
+func TestReplayHealFailureIsReported(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>t</title><p>nothing to click</p>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+
+	recording := &Recording{Name: "x", Steps: []Step{{Action: "click", Selector: "#gone"}}}
+	heal := func(_ context.Context, _ *Page, _ *Step, _ error) error {
+		return fmt.Errorf("model could not identify a replacement selector")
+	}
+	_, _, _, err = ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 2 * time.Second, Healer: heal, Browser: b})
+	if err == nil {
+		t.Fatal("replay should fail")
+	}
+	if !strings.Contains(err.Error(), "self-heal") {
+		t.Fatalf("error must surface the heal attempt, got: %v", err)
+	}
+
+	// And with no healer at all, the error must say self-heal was unavailable.
+	_, _, _, err = ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 2 * time.Second, Browser: b})
+	if err == nil {
+		t.Fatal("replay should fail")
+	}
+	if !strings.Contains(err.Error(), "self-heal skipped") {
+		t.Fatalf("error must say self-heal was unavailable, got: %v", err)
+	}
+}
+
+// TestReplayMultiRoundHeal: the healer needs two rounds — the first repair is
+// still wrong, the second is correct — and replay keeps consulting it (up to the
+// cap) instead of giving up after one attempt.
+func TestReplayMultiRoundHeal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>t</title>
+<button id="real">Go</button>
+<script>window.clicks=0;document.getElementById('real').addEventListener('click',function(){window.clicks++});</script>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.Navigate(ctx, srv.URL); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+
+	recording := &Recording{Name: "x", Steps: []Step{{Action: "click", Selector: "#stale"}}}
+	rounds := 0
+	heal := func(_ context.Context, _ *Page, step *Step, _ error) error {
+		rounds++
+		if rounds == 1 {
+			step.Selector = "#still-wrong" // a repair that still won't resolve
+		} else {
+			step.Selector = "#real"
+		}
+		return nil
+	}
+	modified, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 2 * time.Second, Healer: heal, Browser: b})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if rounds < 2 {
+		t.Fatalf("expected the healer to be consulted across rounds, got %d", rounds)
+	}
+	if !modified {
+		t.Fatal("expected modified=true after a successful heal")
+	}
+	if recording.Steps[0].Selector != "#real" {
+		t.Fatalf("step not corrected: %q", recording.Steps[0].Selector)
+	}
+}
+
+// TestReplayRecordingSelfHeal: a step has a stale selector, the implicit wait fails,
+// the healer repairs the selector, replay retries and succeeds — and reports the
+// recording as modified so the caller can write the fix back.
+func TestReplayRecordingSelfHeal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>heal</title>
+<button id="real">Go</button>
+<script>window.clicks=0;document.getElementById('real').addEventListener('click',function(){window.clicks++});</script>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+
+	recording := &Recording{
+		Name: "heal-demo",
+		Steps: []Step{
+			{Action: "navigate", URL: srv.URL, Verify: &Verify{Exists: "#real"}},
+			{Action: "click", Selector: "#stale"}, // wrong selector — will fail
+		},
+	}
+
+	healed := false
+	heal := func(_ context.Context, _ *Page, step *Step, _ error) error {
+		// Stand in for the LLM healer: correct the drifted selector.
+		if step.Selector == "#stale" {
+			step.Selector = "#real"
+			healed = true
+			return nil
+		}
+		return context.DeadlineExceeded
+	}
+
+	modified, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 2 * time.Second, Healer: heal})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if !healed {
+		t.Fatal("healer was not invoked")
+	}
+	if !modified {
+		t.Fatal("expected modified=true after heal (for write-back)")
+	}
+	if recording.Steps[1].Selector != "#real" {
+		t.Fatalf("step not corrected in place: %q", recording.Steps[1].Selector)
+	}
+	var clicks int
+	if err := page.Eval(ctx, "window.clicks", &clicks); err != nil {
+		t.Fatal(err)
+	}
+	if clicks < 1 {
+		t.Fatalf("healed click did not register (clicks=%d)", clicks)
+	}
+}
+
+// TestAssembleOutputs: file[] collects every bound value in order; other types
+// take the last; a declared-but-unbound output defaults (empty slice / "").
+func TestAssembleOutputs(t *testing.T) {
+	outs := []Output{
+		{Name: "files", Type: "file[]"},
+		{Name: "id", Type: "string"},
+		{Name: "last", Type: "file"},
+		{Name: "missing", Type: "file[]"},
+	}
+	binds := map[string][]string{
+		"files": {"/a", "/b"},
+		"id":    {"RPT-1"},
+		"last":  {"/x", "/y"},
+		"stray": {"ignored"}, // undeclared → must not surface
+	}
+	got := assembleOutputs(outs, binds)
+	if f, ok := got["files"].([]string); !ok || len(f) != 2 || f[0] != "/a" || f[1] != "/b" {
+		t.Fatalf("files: %#v", got["files"])
+	}
+	if got["id"] != "RPT-1" {
+		t.Fatalf("id: %#v", got["id"])
+	}
+	if got["last"] != "/y" {
+		t.Fatalf("last (want last bound /y): %#v", got["last"])
+	}
+	if m, ok := got["missing"].([]string); !ok || len(m) != 0 {
+		t.Fatalf("missing file[] should be empty slice: %#v", got["missing"])
+	}
+	if _, ok := got["stray"]; ok {
+		t.Fatalf("undeclared bind leaked into outputs: %#v", got)
+	}
+}
+
+// TestRecordingYAMLRoundTripOutputs: the new outputs/bind/js fields survive a
+// marshal → parse round-trip (so a hand-edited recording keeps its handoff contract).
+func TestRecordingYAMLRoundTripOutputs(t *testing.T) {
+	s := Recording{
+		Name:    "r",
+		Outputs: []Output{{Name: "files", Type: "file[]"}, {Name: "url", Type: "string"}},
+		Steps: []Step{
+			{Action: "download", Selector: "#e", Bind: "files"},
+			{Action: "extract", JS: "location.href", Bind: "url"},
+		},
+	}
+	data, err := MarshalRecording(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"outputs:", "type: file[]", "action: download", "bind: files", "action: extract", "js: location.href"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("yaml missing %q:\n%s", want, data)
+		}
+	}
+	back, err := ParseRecording(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(back.Outputs) != 2 || back.Outputs[0].Type != "file[]" {
+		t.Fatalf("outputs round-trip: %#v", back.Outputs)
+	}
+	if back.Steps[0].Bind != "files" || back.Steps[1].JS != "location.href" {
+		t.Fatalf("step round-trip: %#v", back.Steps)
+	}
+}
+
+// TestReplayRecordingDownloadBindsOutputs: a download step captures the file the
+// trigger produces and binds its path into the recording's declared file[] output.
+func TestReplayRecordingDownloadBindsOutputs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/file.csv" {
+			w.Header().Set("Content-Disposition", `attachment; filename="report.csv"`)
+			w.Header().Set("Content-Type", "text/csv")
+			w.Write([]byte("a,b,c\n1,2,3\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!doctype html><title>dl</title><a id="dl" href="/file.csv" download>Export</a>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.WaitFor(ctx, "#dl", testWaitTimeout); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	recording := &Recording{
+		Name:    "dl",
+		Outputs: []Output{{Name: "files", Type: "file[]"}},
+		Steps:   []Step{{Action: "download", Selector: "#dl", Bind: "files"}},
+	}
+	_, _, outputs, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 5 * time.Second, Browser: b, DownloadDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	files, ok := outputs["files"].([]string)
+	if !ok || len(files) != 1 {
+		t.Fatalf("want 1 file in outputs, got %#v", outputs["files"])
+	}
+	if _, err := os.Stat(files[0]); err != nil {
+		t.Fatalf("downloaded file missing: %v", err)
+	}
+}
+
+// TestReplayRecordingExtractBindsOutput: an extract step evaluates JS and binds the
+// (unwrapped) string result into a declared output.
+func TestReplayRecordingExtractBindsOutput(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!doctype html><title>x</title><div id="rid">RPT-42</div>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.WaitFor(ctx, "#rid", testWaitTimeout); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	recording := &Recording{
+		Name:    "x",
+		Outputs: []Output{{Name: "report_id", Type: "string"}},
+		Steps:   []Step{{Action: "extract", JS: "document.querySelector('#rid').textContent", Bind: "report_id"}},
+	}
+	_, _, outputs, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 5 * time.Second, Browser: b})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if outputs["report_id"] != "RPT-42" {
+		t.Fatalf("want RPT-42, got %#v", outputs["report_id"])
+	}
+}
+
+// TestRunStepDownloadExtractGuards: the up-front validation on download/extract
+// fires before touching the page, so it needs no browser.
+func TestRunStepDownloadExtractGuards(t *testing.T) {
+	// download without a Browser session.
+	if _, err := runStep(context.Background(), nil, nil, &Step{Action: "download", Selector: "#x", Bind: "f"}, nil, time.Second, "/tmp", nil); err == nil || !strings.Contains(err.Error(), "no browser session") {
+		t.Fatalf("want no-browser-session error, got %v", err)
+	}
+	// extract with no JS.
+	if _, err := runStep(context.Background(), nil, nil, &Step{Action: "extract", Bind: "v"}, nil, time.Second, "", nil); err == nil || !strings.Contains(err.Error(), "js is required") {
+		t.Fatalf("want js-required error, got %v", err)
+	}
+}
+
+// TestListRecordings: reads *.yaml recordings sorted by name, skipping a nameless
+// recording and non-yaml files; a missing dir yields nil.
+func TestListRecordings(t *testing.T) {
+	dir := t.TempDir()
+	if err := SaveRecording(dir+"/bravo.yaml", Recording{Name: "bravo", Steps: []Step{{Action: "navigate", URL: "x"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveRecording(dir+"/alpha.yaml", Recording{Name: "alpha", Steps: []Step{{Action: "navigate", URL: "x"}}}); err != nil {
+		t.Fatal(err)
+	}
+	// A parseable YAML with no name (skipped) and a non-yaml file (ignored).
+	if err := os.WriteFile(dir+"/noname.yaml", []byte("description: has no name\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/notes.txt", []byte("ignore me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := ListRecordings(dir)
+	if len(got) != 2 {
+		t.Fatalf("want 2 recordings (nameless + non-yaml skipped), got %d: %+v", len(got), got)
+	}
+	if got[0].Name != "alpha" || got[1].Name != "bravo" {
+		t.Fatalf("want sorted [alpha bravo], got [%s %s]", got[0].Name, got[1].Name)
+	}
+	if ListRecordings(dir+"/nope") != nil {
+		t.Fatal("missing dir should yield nil")
+	}
+}
+
+// TestReplayRecordingDownloadNoDoubleBindOnHeal: a download step whose Verify fails
+// first, then passes after a heal, must bind the file exactly once — recoverStep
+// re-runs the whole step, so binding before Verify would double-count the output.
+func TestReplayRecordingDownloadNoDoubleBindOnHeal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/file.csv" {
+			w.Header().Set("Content-Disposition", `attachment; filename="report.csv"`)
+			w.Header().Set("Content-Type", "text/csv")
+			w.Write([]byte("a,b\n1,2\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!doctype html><title>dl</title><a id="dl" href="/file.csv" download>Export</a>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.WaitFor(ctx, "#dl", testWaitTimeout); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	// The Verify requires #done, which doesn't exist yet; the healer injects it so
+	// the retry's Verify passes. (The healer leaves the step unchanged.)
+	heal := func(ctx context.Context, p *Page, _ *Step, _ error) error {
+		return p.Eval(ctx, "(function(){var d=document.createElement('div');d.id='done';document.body.appendChild(d);})()", nil)
+	}
+	recording := &Recording{
+		Name:    "dl",
+		Outputs: []Output{{Name: "files", Type: "file[]"}},
+		Steps:   []Step{{Action: "download", Selector: "#dl", Bind: "files", Verify: &Verify{Exists: "#done"}}},
+	}
+	_, _, outputs, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 5 * time.Second, Browser: b, DownloadDir: t.TempDir(), Healer: heal})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	files, ok := outputs["files"].([]string)
+	if !ok || len(files) != 1 {
+		t.Fatalf("download must bind exactly once across a heal retry, got %#v", outputs["files"])
+	}
+}
+
+// TestSubstURLEscapesValues: navigate params are substituted as data, not URL
+// structure — a value holding spaces, query metacharacters or a slash must not
+// reshape the URL, while the template's own structure stays intact.
+func TestSubstURLEscapesValues(t *testing.T) {
+	got := substURL("https://x/s?q={{q}}&page={{p}}&tag={{tag}}", map[string]string{
+		"q": "foo bar&baz=1", "p": "2", "tag": "热榜",
+	})
+	want := "https://x/s?q=foo%20bar%26baz%3D1&page=2&tag=%E7%83%AD%E6%A6%9C"
+	if got != want {
+		t.Fatalf("substURL = %q, want %q", got, want)
+	}
+	if p := substURL("https://x/item/{{id}}", map[string]string{"id": "a/b c"}); p != "https://x/item/a%2Fb%20c" {
+		t.Fatalf("path-position value not encoded as data: %q", p)
+	}
+}
+
+// TestSubstJSEscapesValues: extract params land inside JS string literals, so
+// quotes, backslashes and newlines are escaped — \' and \" both evaluate to the
+// bare quote in either quote style, so this is safe however the template quotes.
+func TestSubstJSEscapesValues(t *testing.T) {
+	got := substJS("f('{{v}}', \"{{v}}\")", map[string]string{"v": "it's a \"q\" \\ test\nline"})
+	want := `f('it\'s a \"q\" \\ test\nline', "it\'s a \"q\" \\ test\nline")`
+	if got != want {
+		t.Fatalf("substJS = %q, want %q", got, want)
+	}
+}
+
+// TestReplayNavigateEncodesParams end to end: the server must receive the exact
+// original value (properly encoded on the wire), proving replay navigates to the
+// intended URL rather than a value-corrupted one.
+func TestReplayNavigateEncodesParams(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	var gotQ, gotURI string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Capture only the navigation target — Chromium may also fetch
+		// /favicon.ico after load, whose empty query would otherwise clobber
+		// the recorded values and flake the assertions (seen on windows).
+		if strings.HasPrefix(r.URL.Path, "/item/") {
+			gotQ, gotURI = r.URL.Query().Get("q"), r.RequestURI
+		}
+		w.Write([]byte(`<!doctype html><title>echo</title>ok`))
+	}))
+	defer srv.Close()
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	recording := &Recording{
+		Name:   "x",
+		Params: []Param{{Name: "id"}, {Name: "q"}},
+		Steps:  []Step{{Action: "navigate", URL: srv.URL + "/item/{{id}}?q={{q}}"}},
+	}
+	params := map[string]string{"id": "a/b c", "q": "foo bar&baz=1"}
+	if _, _, _, err := ReplayRecording(ctx, page, recording, params, ReplayOptions{StepTimeout: 5 * time.Second}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if gotQ != "foo bar&baz=1" {
+		t.Fatalf("server received q = %q, want the exact original value", gotQ)
+	}
+	if gotURI != "/item/a%2Fb%20c?q=foo%20bar%26baz%3D1" {
+		t.Fatalf("wire RequestURI = %q, value was not encoded as data", gotURI)
+	}
+}
+
+// TestReplayExtractEscapesParams: a param holding quotes and a backslash used
+// inside a JS string literal evaluates to the exact original value, not a
+// broken (or altered) expression.
+func TestReplayExtractEscapesParams(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>x</title>ok`))
+	}))
+	defer srv.Close()
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	recording := &Recording{
+		Name:    "x",
+		Params:  []Param{{Name: "v"}},
+		Outputs: []Output{{Name: "v", Type: "string"}},
+		Steps:   []Step{{Action: "extract", JS: `'{{v}}'`, Bind: "v"}},
+	}
+	original := `it's a "q" \ test`
+	_, _, outputs, err := ReplayRecording(ctx, page, recording, map[string]string{"v": original}, ReplayOptions{StepTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if outputs["v"] != original {
+		t.Fatalf("extract = %#v, want the exact original %#v", outputs["v"], original)
+	}
+}
+
+// TestCompileEnterFlow: an Enter event compiles to a key step, preceded by a
+// type step when the value only exists as the event's snapshot (no blur → no
+// change). A field typed just before (blur → change → Enter) must not be
+// typed twice; a password's snapshot is empty, so its type step takes a
+// defaultless secret param.
+func TestCompileEnterFlow(t *testing.T) {
+	// Plain: value only from the enter snapshot.
+	s := CompileRecording("x", "", "", []RecordedEvent{
+		{Type: "enter", Selector: "#q", Tag: "INPUT", Field: "query", Value: "hello"},
+	})
+	if len(s.Steps) != 2 || s.Steps[0].Action != "type" || s.Steps[1].Action != "key" {
+		t.Fatalf("want [type, key], got %+v", s.Steps)
+	}
+	if s.Steps[1].Value != "enter" || len(s.Params) != 1 || s.Params[0].Default != "hello" {
+		t.Fatalf("key step / param wrong: %+v %+v", s.Steps[1], s.Params)
+	}
+	// Blur-then-Enter on the same field: the change already typed it.
+	s = CompileRecording("x", "", "", []RecordedEvent{
+		{Type: "change", Selector: "#q", Tag: "INPUT", Field: "query", Value: "hello"},
+		{Type: "enter", Selector: "#q", Tag: "INPUT", Field: "query", Value: "hello"},
+	})
+	nTypes := 0
+	for _, st := range s.Steps {
+		if st.Action == "type" {
+			nTypes++
+		}
+	}
+	if len(s.Steps) != 2 || nTypes != 1 || s.Steps[1].Action != "key" {
+		t.Fatalf("want [type, key] without a duplicate type, got %+v", s.Steps)
+	}
+	// Secret: snapshot is empty, so the type step needs a replay-time param.
+	s = CompileRecording("x", "", "", []RecordedEvent{
+		{Type: "enter", Selector: "#pw", Tag: "INPUT", Field: "password", Secret: true},
+	})
+	if len(s.Steps) != 2 || len(s.Params) != 1 || s.Params[0].Default != "" {
+		t.Fatalf("secret enter should declare a defaultless param: %+v %+v", s.Steps, s.Params)
+	}
+}
+
+// TestReplayKeyEnter: replay types the value, focuses the field with a real
+// click, and presses Enter — the form actually submits.
+func TestReplayKeyEnter(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>k</title>
+<form onsubmit="event.preventDefault();window.submits=(window.submits||0)+1"><input id="q"></form>`))
+	}))
+	defer srv.Close()
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.WaitFor(ctx, "#q", testWaitTimeout); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	recording := &Recording{
+		Name:   "x",
+		Params: []Param{{Name: "q"}},
+		Steps: []Step{
+			{Action: "type", Selector: "#q", Value: "{{q}}"},
+			{Action: "key", Selector: "#q", Value: "enter"},
+		},
+	}
+	if _, _, _, err := ReplayRecording(ctx, page, recording, map[string]string{"q": "hello"}, ReplayOptions{StepTimeout: 5 * time.Second}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var submits int
+	if err := page.Eval(ctx, "window.submits||0", &submits); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if submits != 1 {
+		t.Fatalf("form should have submitted exactly once, got %d", submits)
+	}
+}
+
+// TestCompileParamSecretFlag: the Param.Secret marker — not the absence of a
+// default — is what tags a password param, and it survives on the param:
+// password change/enter params carry secret:true; upload's {{file}} param is
+// defaultless but NOT secret (a missing file path stays a plain error, never
+// a masked prompt).
+func TestCompileParamSecretFlag(t *testing.T) {
+	s := CompileRecording("demo", "", "", []RecordedEvent{
+		{Type: "change", Selector: "#pw", Tag: "INPUT", Field: "password", Secret: true},
+	})
+	if len(s.Params) != 1 || !s.Params[0].Secret {
+		t.Fatalf("password change param must be marked secret: %+v", s.Params)
+	}
+
+	s = CompileRecording("demo", "", "", []RecordedEvent{
+		{Type: "enter", Selector: "#pw", Tag: "INPUT", Field: "password", Secret: true},
+	})
+	if len(s.Params) != 1 || !s.Params[0].Secret {
+		t.Fatalf("password enter-snapshot param must be marked secret: %+v", s.Params)
+	}
+
+	s = CompileRecording("demo", "", "", []RecordedEvent{
+		{Type: "click", Selector: ".up", Tag: "BUTTON", Text: "Upload"},
+		{Type: "upload", Selector: "input[type=file]", Tag: "INPUT", Value: `C:\fakepath\x.xlsx`},
+	})
+	if len(s.Params) != 1 || s.Params[0].Name != "file" || s.Params[0].Secret {
+		t.Fatalf("upload file param must be defaultless but NOT secret: %+v", s.Params)
+	}
+
+	// A plain input keeps its default and stays non-secret.
+	s = CompileRecording("demo", "", "", []RecordedEvent{
+		{Type: "change", Selector: "#q", Tag: "INPUT", Field: "query", Value: "hello"},
+	})
+	if len(s.Params) != 1 || s.Params[0].Secret || s.Params[0].Default != "hello" {
+		t.Fatalf("plain param keeps default, not secret: %+v", s.Params)
+	}
+}
+
+// TestGenerateRecordingDistillKeepsSecretFlag: the distiller rewrites the param
+// list from prose and can drop the secret marker; the merge backfills Secret
+// onto refined params by name from the deterministic baseline, so a password
+// param is still secret after distillation.
+func TestGenerateRecordingDistillKeepsSecretFlag(t *testing.T) {
+	ctx := context.Background()
+	events := []RecordedEvent{
+		{Type: "change", Selector: "#u", Tag: "INPUT", Field: "username", Value: "roy"},
+		{Type: "change", Selector: "#pw", Tag: "INPUT", Field: "password", Secret: true},
+		{Type: "click", Selector: "#go", Tag: "BUTTON", Text: "Sign in"},
+	}
+	// The distiller re-declares both params but drops secret:true.
+	dropSecret := func(_ context.Context, _, _ string) (string, error) {
+		return "name: x\nparams:\n" +
+			"  - {name: username}\n" +
+			"  - {name: password}\n" +
+			"steps:\n" +
+			"  - {action: type, selector: '#u', value: '{{username}}'}\n" +
+			"  - {action: type, selector: '#pw', value: '{{password}}'}\n" +
+			"  - {action: click, selector: '#go'}\n", nil
+	}
+	s, _ := GenerateRecording(ctx, "demo", "", "", events, dropSecret)
+	var user, pw *Param
+	for i := range s.Params {
+		switch s.Params[i].Name {
+		case "username":
+			user = &s.Params[i]
+		case "password":
+			pw = &s.Params[i]
+		}
+	}
+	if pw == nil || !pw.Secret {
+		t.Fatalf("distilled password param lost its secret flag: %+v", s.Params)
+	}
+	if user == nil || user.Secret {
+		t.Fatalf("non-secret param must not gain the secret flag: %+v", s.Params)
+	}
+}
+
+// TestGenerateRecordingDistillRestoresDroppedSecretParam: the distiller may
+// keep the {{password}} placeholder while dropping the param declaration
+// entirely. Left alone, replay would treat it as a non-secret missing param —
+// the plaintext-in-conversation leak #1566 closes. The merge re-attaches the
+// baseline declaration (with its secret flag) for any baseline secret param
+// still referenced by the refined steps.
+func TestGenerateRecordingDistillRestoresDroppedSecretParam(t *testing.T) {
+	ctx := context.Background()
+	events := []RecordedEvent{
+		{Type: "change", Selector: "#u", Tag: "INPUT", Field: "username", Value: "roy"},
+		{Type: "change", Selector: "#pw", Tag: "INPUT", Field: "password", Secret: true},
+		{Type: "click", Selector: "#go", Tag: "BUTTON", Text: "Sign in"},
+	}
+	// The distiller declares only username; password survives as a bare placeholder.
+	dropDecl := func(_ context.Context, _, _ string) (string, error) {
+		return "name: x\nparams:\n" +
+			"  - {name: username}\n" +
+			"steps:\n" +
+			"  - {action: type, selector: '#u', value: '{{username}}'}\n" +
+			"  - {action: type, selector: '#pw', value: '{{password}}'}\n" +
+			"  - {action: click, selector: '#go'}\n", nil
+	}
+	s, _ := GenerateRecording(ctx, "demo", "", "", events, dropDecl)
+	var pw *Param
+	for i := range s.Params {
+		if s.Params[i].Name == "password" {
+			pw = &s.Params[i]
+		}
+	}
+	if pw == nil {
+		t.Fatalf("dropped secret param declaration must be restored: %+v", s.Params)
+	}
+	if !pw.Secret || pw.Default != "" {
+		t.Fatalf("restored declaration must keep secret:true and no default: %+v", *pw)
+	}
+}
+
+// TestReplayVerifyErrorRedactsSecret: a hand-written step may legitimately
+// reference a secret param in its verify (verify.text is a subst() field). A
+// verify failure's error text must name the placeholder — never carry the
+// resolved value, which would flow into the tool result and the conversation.
+func TestReplayVerifyErrorRedactsSecret(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>v</title><form><input id="pw" type="password"></form>`))
+	}))
+	defer srv.Close()
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	recording := &Recording{
+		Name:   "x",
+		Params: []Param{{Name: "password", Secret: true}},
+		Steps: []Step{{
+			Action: "type", Selector: "#pw", Value: "{{password}}",
+			// The typed value lives in the input, not body.innerText, so this
+			// verify is guaranteed to time out.
+			Verify: &Verify{Text: "{{password}}"},
+		}},
+	}
+	_, _, _, err = ReplayRecording(ctx, page, recording, map[string]string{"password": "hunter2"}, ReplayOptions{StepTimeout: testWaitTimeout})
+	if err == nil {
+		t.Fatal("verify should have failed")
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Fatalf("secret value leaked into the verify error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "{{password}}") {
+		t.Fatalf("error should name the placeholder, got: %v", err)
+	}
+}
+
+// TestCompressEventsOverwrite: consecutive type/change on the same selector with
+// no side effect between is compressed to the last one (the earlier value is
+// overwritten).
+func TestCompressEventsOverwrite(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "navigate", URL: "https://x/start"},
+		{Type: "click", Selector: "#field", Tag: "INPUT"},
+		{Type: "change", Selector: "#field", Tag: "INPUT", Value: "A"},
+		{Type: "change", Selector: "#field", Tag: "INPUT", Value: "AB"},
+		{Type: "change", Selector: "#field", Tag: "INPUT", Value: "ABC"},
+		{Type: "click", Selector: "#submit", Tag: "BUTTON"},
+	}
+	got := compressEvents(events)
+	// navigate + click #field + 1 change (#field ends up ABC) + click #submit
+	if len(got) != 4 {
+		t.Fatalf("expected 4 events after overwrite compression, got %d: %+v", len(got), got)
+	}
+	if got[2].Value != "ABC" {
+		t.Fatalf("expected surviving field value to be ABC, got %q", got[2].Value)
+	}
+}
+
+// TestCompressEventsABABacktrack: click A → click B → click A is compressed to a
+// single click A (the detour and return click are dropped).
+func TestCompressEventsABABacktrack(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "click", Selector: "#tab-climate", Tag: "A"},
+		{Type: "click", Selector: "#tab-weather", Tag: "A"},
+		{Type: "click", Selector: "#tab-climate", Tag: "A"},
+		{Type: "click", Selector: "#submit", Tag: "BUTTON"},
+	}
+	got := compressEvents(events)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 events (climate + submit), got %d: %+v", len(got), got)
+	}
+	if got[0].Selector != "#tab-climate" || got[1].Selector != "#submit" {
+		t.Fatalf("wrong selectors after A-B-A compression: %+v", got)
+	}
+}
+
+// TestCompressEventsPreservesSideEffects: a type → navigate → type on the same
+// selector is NOT compressed — the navigate is a side effect.
+func TestCompressEventsPreservesSideEffects(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "change", Selector: "#q", Tag: "INPUT", Value: "wrong"},
+		{Type: "navigate", URL: "https://x/other"},
+		{Type: "change", Selector: "#q", Tag: "INPUT", Value: "right"},
+	}
+	got := compressEvents(events)
+	if len(got) != 3 {
+		t.Fatalf("side-effect event should block compression, got %d: %+v", len(got), got)
+	}
+}
+
+// TestSummarizeRecording: each step is rendered as a numbered line with its
+// verification check, and navigate auto-attaches a URL check.
+func TestSummarizeRecording(t *testing.T) {
+	r := Recording{
+		Description: "demo report",
+		Steps: []Step{
+			{Action: "navigate", URL: "https://example.com/report?report_id=118240"},
+			{Action: "click", Selector: "#date-input", Label: "打开日期选择器"},
+			{Action: "wait", Network: true, TimeoutMS: 10000},
+			{Action: "download", Selector: "#dl-btn", Bind: "report_file"},
+		},
+	}
+	out := SummarizeRecording(r)
+	// Has description header.
+	if !strings.Contains(out, "demo report") {
+		t.Fatalf("summary missing description, got %q", out)
+	}
+	// Step numbering 1..4.
+	for _, n := range []string{"1.", "2.", "3.", "4."} {
+		if !strings.Contains(out, n) {
+			t.Fatalf("summary missing step %s, got %q", n, out)
+		}
+	}
+	// Navigate line has URL check.
+	if !strings.Contains(out, "example.com") {
+		t.Fatalf("navigate summary missing URL check, got %q", out)
+	}
+	// Wait network line describes network settle.
+	if !strings.Contains(out, "网络") {
+		t.Fatalf("wait summary missing network check, got %q", out)
+	}
+	// Download line mentions file binding.
+	if !strings.Contains(out, "report_file") {
+		t.Fatalf("download summary missing bind, got %q", out)
+	}
+	// Asks user to confirm.
+	if !strings.Contains(out, "确认") {
+		t.Fatalf("summary missing confirmation prompt, got %q", out)
+	}
+}
+
+// TestScoreAnchorCandidate: the fingerprint-match scoring — exact text beats
+// contains, each signal contributes its weight, absent fingerprint signals
+// contribute nothing.
+func TestScoreAnchorCandidate(t *testing.T) {
+	a := &Anchors{Role: "gridcell", Tag: "td", NeighborText: "开始日期"}
+	cases := []struct {
+		name string
+		c    anchorCandidate
+		want int
+	}{
+		{"full match", anchorCandidate{Text: "20", Role: "gridcell", Tag: "td", Neighbor: true}, 4 + 2 + 2 + 1},
+		{"contains text", anchorCandidate{Text: "x20x", Role: "gridcell", Tag: "td", Neighbor: true}, 2 + 2 + 2 + 1},
+		{"wrong everything", anchorCandidate{Text: "删除", Role: "button", Tag: "a", Neighbor: false}, 0},
+		{"tag only", anchorCandidate{Text: "删除", Tag: "TD"}, 1}, // tag compare is case-insensitive
+		{"neighbor only", anchorCandidate{Neighbor: true}, 2},
+	}
+	for _, tc := range cases {
+		if got := scoreAnchorCandidate(tc.c, "20", a); got != tc.want {
+			t.Errorf("%s: score=%d want %d", tc.name, got, tc.want)
+		}
+	}
+	// Empty label: text contributes nothing even on a would-be match.
+	if got := scoreAnchorCandidate(anchorCandidate{Text: "20", Tag: "td"}, "", a); got != 1 {
+		t.Errorf("empty label should skip text scoring, got %d", got)
+	}
+}
+
+// TestPickAnchorCandidate: threshold (must EXCEED half the achievable max),
+// tie-breaking toward primary/alt-found candidates, and ambiguity failure.
+func TestPickAnchorCandidate(t *testing.T) {
+	a := &Anchors{Tag: "button", NeighborText: "操作"}
+	label := "导出" // max = 4 + 2 + 1 = 7, acceptance needs score >= 4
+
+	// The right element wins over a positional impostor.
+	right := anchorCandidate{Sel: "#right", Text: "导出", Tag: "button", Neighbor: true, Via: "scan"}
+	wrong := anchorCandidate{Sel: "#wrong", Text: "删除", Tag: "button", Neighbor: true, Via: "primary"}
+	sel, ok := pickAnchorCandidate([]anchorCandidate{wrong, right}, label, a)
+	if !ok || sel != "#right" {
+		t.Fatalf("expected #right to win, got %q ok=%v", sel, ok)
+	}
+
+	// Below threshold: tag+neighbor (3) does not exceed 7/2 rounded — refuse.
+	weak := anchorCandidate{Sel: "#weak", Text: "删除", Tag: "button", Neighbor: true, Via: "primary"}
+	if sel, ok := pickAnchorCandidate([]anchorCandidate{weak}, label, a); ok {
+		t.Fatalf("weak candidate should be refused, got %q", sel)
+	}
+
+	// Score tie between primary and scan: primary wins.
+	p := anchorCandidate{Sel: "#p", Text: "导出", Tag: "button", Neighbor: true, Via: "primary"}
+	s := anchorCandidate{Sel: "#s", Text: "导出", Tag: "button", Neighbor: true, Via: "scan"}
+	sel, ok = pickAnchorCandidate([]anchorCandidate{s, p}, label, a)
+	if !ok || sel != "#p" {
+		t.Fatalf("tie should break toward primary, got %q ok=%v", sel, ok)
+	}
+
+	// Tie between two scan-found candidates: ambiguous, refuse.
+	s2 := anchorCandidate{Sel: "#s2", Text: "导出", Tag: "button", Neighbor: true, Via: "scan"}
+	if sel, ok := pickAnchorCandidate([]anchorCandidate{s, s2}, label, a); ok {
+		t.Fatalf("scan tie should be ambiguous, got %q", sel)
+	}
+
+	// Empty fingerprint: nothing to score against, refuse.
+	if sel, ok := pickAnchorCandidate([]anchorCandidate{right}, "", &Anchors{}); ok {
+		t.Fatalf("empty fingerprint should refuse, got %q", sel)
+	}
+}
+
+// TestAnchorsCompileIntoSteps: captured anchor facts land on the compiled step
+// (tag lowercased); an event without anchor facts compiles with nil Anchors so
+// replay keeps the legacy resolution path.
+func TestAnchorsCompileIntoSteps(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "click", Selector: "td.cell", Tag: "TD", Text: "20",
+			AltSelectors: []string{"td:nth-of-type(2)"}, Role: "gridcell", NeighborText: "开始日期"},
+		{Type: "click", Selector: "#plain", Tag: "BUTTON", Text: "Go"},
+	}
+	s := CompileRecording("demo", "", "", events)
+	if len(s.Steps) != 2 {
+		t.Fatalf("want 2 steps, got %d: %+v", len(s.Steps), s.Steps)
+	}
+	a := s.Steps[0].Anchors
+	if a == nil {
+		t.Fatal("anchored event should compile with Anchors")
+	}
+	if a.Role != "gridcell" || a.Tag != "td" || a.NeighborText != "开始日期" || len(a.Selectors) != 1 {
+		t.Fatalf("anchors wrong: %+v", a)
+	}
+	if s.Steps[1].Anchors != nil {
+		t.Fatalf("plain event should compile with nil Anchors: %+v", s.Steps[1].Anchors)
+	}
+}
+
+// TestAnchorsYAMLRoundTrip: anchors survive Marshal/Parse; YAML written before
+// anchors existed parses to nil Anchors (legacy path preserved).
+func TestAnchorsYAMLRoundTrip(t *testing.T) {
+	s := Recording{Name: "demo", Steps: []Step{{
+		Action: "click", Selector: "td.cell", Label: "20",
+		Anchors: &Anchors{Selectors: []string{"td:nth-of-type(2)"}, Role: "gridcell", Tag: "td", NeighborText: "开始日期"},
+	}}}
+	data, err := MarshalRecording(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := ParseRecording(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := back.Steps[0].Anchors
+	if a == nil || a.Role != "gridcell" || a.NeighborText != "开始日期" || len(a.Selectors) != 1 {
+		t.Fatalf("anchors did not round-trip: %+v", a)
+	}
+
+	legacy := []byte("name: old\nsteps:\n  - action: click\n    selector: \"#b\"\n")
+	old, err := ParseRecording(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.Steps[0].Anchors != nil {
+		t.Fatalf("legacy yaml should parse with nil Anchors: %+v", old.Steps[0].Anchors)
+	}
+}
+
+// TestGenerateRecordingBackfillsAnchors: the distiller routinely drops anchors
+// blocks when rewriting steps; GenerateRecording re-attaches them from the
+// baseline by frame+selector, so replay still gets the fingerprint.
+func TestGenerateRecordingBackfillsAnchors(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "click", Selector: "td.cell", Tag: "TD", Text: "20",
+			AltSelectors: []string{"td:nth-of-type(2)"}, Role: "gridcell", NeighborText: "开始日期"},
+	}
+	gen := func(_ context.Context, _, _ string) (string, error) {
+		// A refined recording using only baseline selectors but WITHOUT anchors.
+		return "name: demo\ndescription: picks a date\nsteps:\n  - action: click\n    selector: td.cell\n    label: \"20\"\n", nil
+	}
+	out, _ := GenerateRecording(context.Background(), "demo", "", "", events, gen)
+	if out.Description != "picks a date" {
+		t.Fatalf("distilled description lost: %+v", out)
+	}
+	a := out.Steps[0].Anchors
+	if a == nil || a.Role != "gridcell" || a.NeighborText != "开始日期" {
+		t.Fatalf("anchors not backfilled from baseline: %+v", a)
+	}
+}
+
+// TestGenerateRecordingBackfillsLabelAndHint: the distiller returned steps
+// with no label / hint (observed live on qwen: every step bare) and one with
+// a reworded label. Both fields are restored from the baseline step with the
+// same selector — they are matched literally by the fingerprint scorer, the
+// drifted-click fallback and the heal verifier, so the recorded text wins
+// over the model's rewording; a model label survives only where the baseline
+// has none. Anchors ride along on the same step.
+func TestGenerateRecordingBackfillsLabelAndHint(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "click", Selector: "#notes", Tag: "SPAN", Text: "笔记管理", Role: "menuitem"},
+		{Type: "change", Selector: "#q", Tag: "INPUT", Field: "搜索关键词", Value: "octo"},
+		{Type: "click", Selector: "#go", Tag: "BUTTON", Text: "搜索"},
+		{Type: "click", Selector: "#icon", Tag: "I"}, // no visible text
+	}
+	gen := func(_ context.Context, _, _ string) (string, error) {
+		return "name: demo\nsteps:\n" +
+			"  - {action: click, selector: '#notes'}\n" +
+			"  - {action: type, selector: '#q', value: '{{搜索关键词}}', hint: 关键词}\n" +
+			"  - {action: click, selector: '#go', label: 搜索按钮}\n" +
+			"  - {action: click, selector: '#icon', label: 设置图标}\n", nil
+	}
+	out, fb := GenerateRecording(context.Background(), "demo", "", "", events, gen)
+	if fb != "" || len(out.Steps) != 4 {
+		t.Fatalf("refinement not applied: fb=%q steps=%+v", fb, out.Steps)
+	}
+	if out.Steps[0].Label != "笔记管理" || out.Steps[0].Anchors == nil || out.Steps[0].Anchors.Role != "menuitem" {
+		t.Fatalf("bare click must get label and anchors back: %+v", out.Steps[0])
+	}
+	if out.Steps[1].Hint != "搜索关键词" {
+		t.Fatalf("recorded hint must win over the model's rewording: %+v", out.Steps[1])
+	}
+	if out.Steps[2].Label != "搜索" {
+		t.Fatalf("recorded label must win over the model's rewording: %+v", out.Steps[2])
+	}
+	if out.Steps[3].Label != "设置图标" {
+		t.Fatalf("with no recorded text the model's label may stand: %+v", out.Steps[3])
+	}
+	if !strings.Contains(SummarizeRecording(out), "点击「笔记管理」") {
+		t.Fatalf("plan must name the step by its restored label:\n%s", SummarizeRecording(out))
+	}
+}
+
+// TestBackfillTargetFactsMergesSharedTargets: several baseline steps can share
+// a selector — a wait-for-element on the button just clicked (no facts at
+// all), or the type + key pair an Enter produces (hint on one, not the other).
+// Each fact comes from the last baseline step that HAS it, so a fact-less
+// later step cannot blank out an earlier one; navigate steps are untouched.
+func TestBackfillTargetFactsMergesSharedTargets(t *testing.T) {
+	base := Recording{Steps: []Step{
+		{Action: "navigate", URL: "https://x/"},
+		{Action: "click", Selector: "#save", Label: "保存", Anchors: &Anchors{Tag: "button"}},
+		{Action: "wait", Selector: "#save"}, // element-wait: selector, no facts
+		{Action: "type", Selector: "#q", Hint: "q", Value: "{{q}}"},
+		{Action: "key", Selector: "#q", Value: "enter"}, // Enter's key step: no hint
+	}}
+	refined := Recording{Steps: []Step{
+		{Action: "navigate", URL: "https://x/"},
+		{Action: "click", Selector: "#save"},
+		{Action: "type", Selector: "#q", Value: "{{q}}"},
+		{Action: "key", Selector: "#q", Value: "enter"},
+		{Action: "click", Selector: "#unknown", Label: "?"}, // not in the baseline: left alone
+	}}
+	backfillTargetFacts(&refined, base)
+	if s := refined.Steps[1]; s.Label != "保存" || s.Anchors == nil || s.Anchors.Tag != "button" {
+		t.Fatalf("the fact-less wait must not blank the click's facts: %+v", s)
+	}
+	if refined.Steps[2].Hint != "q" || refined.Steps[3].Hint != "q" {
+		t.Fatalf("hint must reach both steps on the shared input: %+v", refined.Steps[2:4])
+	}
+	if refined.Steps[0].Label != "" || refined.Steps[4].Label != "?" {
+		t.Fatalf("navigate and unknown-target steps must be untouched: %+v", refined.Steps)
+	}
+}
+
+// TestReplayAnchorsSurviveClassDrift: the recording was made against build A
+// (hashed CSS-in-JS classes, buttons in one order); the live page is build B —
+// every class hash changed AND the buttons swapped order, so both the primary
+// selector and the positional alternate now point at the WRONG button. The
+// fingerprint (visible text + tag + neighbor text) must still land the click on
+// the right one.
+func TestReplayAnchorsSurviveClassDrift(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>drift</title>
+<div><span>操作</span><button class="css-z9y8x7" onclick="window.__hit='delete'">删除</button><button class="css-q5w6e7" onclick="window.__hit='export'">导出</button></div>`))
+	}))
+	defer srv.Close()
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	rec := Recording{Name: "drift", Steps: []Step{{
+		Action:   "click",
+		Selector: "button.css-a1b2c3", // record-time hash — matches nothing now
+		Label:    "导出",
+		Anchors: &Anchors{
+			Selectors:    []string{"div > button:nth-of-type(1)"}, // positional alternate — now the WRONG button
+			Tag:          "button",
+			NeighborText: "操作",
+		},
+	}}}
+	if _, _, _, err := ReplayRecording(ctx, page, &rec, nil, ReplayOptions{Browser: b, StepTimeout: 10 * time.Second}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var hit string
+	if err := page.Eval(ctx, "window.__hit||''", &hit); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if hit != "export" {
+		t.Fatalf("expected the 导出 button to be clicked, got %q", hit)
+	}
+}
+
+// TestReplayAnchorsRefuseWrongElement: the primary selector still MATCHES an
+// element — but the wrong one (the recorded 导出 button is gone). Legacy replay
+// would click it silently; anchored replay must refuse with a fingerprint error
+// and must not click anything.
+func TestReplayAnchorsRefuseWrongElement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>wrong</title>
+<div><button class="btn-main" onclick="window.__hit='delete'">删除</button></div>`))
+	}))
+	defer srv.Close()
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	rec := Recording{Name: "wrong", Steps: []Step{{
+		Action:   "click",
+		Selector: "button.btn-main", // matches — but it's 删除 now, not 导出
+		Label:    "导出",
+		Anchors:  &Anchors{Tag: "button", NeighborText: "下载区"},
+	}}}
+	_, _, _, err = ReplayRecording(ctx, page, &rec, nil, ReplayOptions{Browser: b, StepTimeout: 2 * time.Second})
+	if err == nil {
+		t.Fatal("replay should have refused the fingerprint mismatch")
+	}
+	if !strings.Contains(err.Error(), "fingerprint") {
+		t.Fatalf("error should describe the fingerprint mismatch, got: %v", err)
+	}
+	// The timeout error must carry the poll diagnostics (page state, candidate
+	// count, best score) so a flake report distinguishes "page never loaded"
+	// from "loaded but genuinely drifted".
+	if !strings.Contains(err.Error(), "readyState=") || !strings.Contains(err.Error(), "candidates=") {
+		t.Fatalf("error should carry resolver diagnostics, got: %v", err)
+	}
+	var hit string
+	if err := page.Eval(ctx, "window.__hit||''", &hit); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if hit != "" {
+		t.Fatalf("nothing should have been clicked, got %q", hit)
+	}
+}
+
+// TestGenerateRecordingDistillRetriesOnInvalidSelector: the first distill
+// attempt uses a selector outside the baseline; instead of silently discarding
+// the refinement, the distiller is re-asked once with the violations named,
+// and a corrected second attempt is accepted.
+func TestGenerateRecordingDistillRetriesOnInvalidSelector(t *testing.T) {
+	ctx := context.Background()
+	events := []RecordedEvent{
+		{Type: "click", Selector: "#search", Tag: "BUTTON", Text: "Search"},
+	}
+	calls := 0
+	var secondPrompt string
+	gen := func(_ context.Context, _, user string) (string, error) {
+		calls++
+		if calls == 1 {
+			return "name: x\nsteps:\n  - {action: click, selector: '#invented'}\n", nil
+		}
+		secondPrompt = user
+		return "name: x\nsteps:\n  - {action: click, selector: '#search'}\n", nil
+	}
+	s, _ := GenerateRecording(ctx, "demo", "", "", events, gen)
+	if calls != 2 {
+		t.Fatalf("expected exactly one retry (2 calls), got %d", calls)
+	}
+	if !strings.Contains(secondPrompt, "#invented") {
+		t.Fatalf("retry prompt must name the invalid selector, got: %q", secondPrompt)
+	}
+	if len(s.Steps) != 1 || s.Steps[0].Selector != "#search" {
+		t.Fatalf("corrected second attempt should be accepted: %+v", s.Steps)
+	}
+}
+
+// TestCollapseNewTabDetours: the click chain that spawned a new tab (whose
+// first navigation is tagged NewTab) is dropped — the navigate reaches the
+// same page directly, and the menu-hop clicks were the least replayable steps
+// (Zhihu: popover toggle → 写文章). State-bearing events end the walk-back,
+// and an untagged navigate (a tab the user opened by hand) keeps everything.
+func TestCollapseNewTabDetours(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "change", Selector: "#q", Tag: "INPUT", Value: "keep me"},
+		{Type: "click", Selector: "#menu-toggle", Tag: "BUTTON"},
+		{Type: "wait", WaitKind: "network"},
+		{Type: "click", Selector: "#menu-item", Tag: "BUTTON"},
+		{Type: "navigate", URL: "https://x/editor", NewTab: true},
+		{Type: "click", Selector: "#after", Tag: "BUTTON"},
+	}
+	s := CompileRecording("x", "", "", events)
+	var actions []string
+	for _, st := range s.Steps {
+		actions = append(actions, st.Action+":"+st.Selector+st.URL)
+	}
+	want := []string{"type:#q", "navigate:https://x/editor", "click:#after"}
+	if strings.Join(actions, "|") != strings.Join(want, "|") {
+		t.Fatalf("detour not collapsed to %v, got %v", want, actions)
+	}
+
+	// Untagged navigate (user-opened tab): the clicks must survive.
+	for i := range events {
+		events[i].NewTab = false
+	}
+	s2 := CompileRecording("x", "", "", events)
+	sawMenuClick := false
+	for _, st := range s2.Steps {
+		if st.Action == "click" && st.Selector == "#menu-toggle" {
+			sawMenuClick = true
+		}
+	}
+	if !sawMenuClick {
+		t.Fatal("untagged navigate must not eat preceding clicks")
+	}
+}
+
+// TestCompileUploadMergeThroughWaits: the chooser-opening click is usually
+// separated from the file-pick event by auto-inserted waits; the merge must
+// look back past them, and carry the click's hint/fingerprint onto the merged
+// upload step — otherwise the recording keeps a separate click AND an upload
+// targeting a hidden <input type=file> that has no clickable box to replay.
+func TestCompileUploadMergeThroughWaits(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "click", Selector: "div[role=\"button\"]", Tag: "DIV", Text: "选择文件", Role: "button", NeighborText: "文档最大 30MB"},
+		{Type: "wait", WaitKind: "network"},
+		{Type: "upload", Selector: "input[type=file]", Tag: "INPUT", Value: "C:\\fakepath\\x.md"},
+	}
+	s := CompileRecording("x", "", "", events)
+	var uploads, clicks int
+	var up Step
+	for _, st := range s.Steps {
+		switch st.Action {
+		case "upload":
+			uploads++
+			up = st
+		case "click":
+			clicks++
+		}
+	}
+	if uploads != 1 || clicks != 0 {
+		t.Fatalf("expected the click merged into one upload step, got %d uploads / %d clicks: %+v", uploads, clicks, s.Steps)
+	}
+	if up.Selector != "div[role=\"button\"]" {
+		t.Fatalf("upload must target the visible trigger, got %q", up.Selector)
+	}
+	if up.Anchors == nil || up.Anchors.Role != "button" || up.Anchors.NeighborText != "文档最大 30MB" {
+		t.Fatalf("upload must carry the click's fingerprint, got %+v", up.Anchors)
+	}
+}
+
+// TestReplayEmitsProgress: replay reports each step on the Progress callback as
+// it starts — a multi-minute replay must not be a black box that only speaks on
+// failure — and self-heal announces itself when it intervenes.
+func TestReplayEmitsProgress(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>p</title><button id="real">Go</button>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+
+	recording := &Recording{
+		Name: "p",
+		Steps: []Step{
+			{Action: "navigate", URL: srv.URL},
+			{Action: "click", Selector: "#stale"},
+		},
+	}
+	heal := func(_ context.Context, _ *Page, step *Step, _ error) error {
+		step.Selector = "#real"
+		return nil
+	}
+	var mu sync.Mutex
+	var lines []string
+	progress := func(line string) {
+		mu.Lock()
+		lines = append(lines, line)
+		mu.Unlock()
+	}
+	if _, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 2 * time.Second, Healer: heal, Browser: b, Progress: progress}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	joined := strings.Join(lines, "\n")
+	for _, want := range []string{"[1/2] navigate " + srv.URL, "[2/2] click #stale", "self-heal", "recovered"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("progress missing %q; got:\n%s", want, joined)
+		}
+	}
+}
+
+// TestReplayNavigateSkipsReloadWhenAlreadyThere: a navigate step whose target
+// is the page's CURRENT URL must not reload — in-page state set up by earlier
+// steps (an SPA tab selection) would be wiped, breaking every step after it.
+func TestReplayNavigateSkipsReloadWhenAlreadyThere(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>skip</title>
+<button id="b">Go</button>
+<script>window.marker=0;document.getElementById('b').addEventListener('click',function(){window.marker=1;});</script>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+
+	recording := &Recording{Name: "skip", Steps: []Step{
+		{Action: "navigate", URL: srv.URL},
+		{Action: "click", Selector: "#b"},
+		{Action: "navigate", URL: srv.URL}, // recorded echo of the click's in-page transition
+	}}
+	if _, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 3 * time.Second, Browser: b}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var marker int
+	if err := page.Eval(ctx, "window.marker", &marker); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if marker != 1 {
+		t.Fatal("the same-URL navigate reloaded the page and wiped the click's state")
+	}
+}
+
+// TestRecordingDirectoryLayout: a recording is a directory (recording.yaml +
+// events.json) so its artifacts live and die together; legacy flat files are
+// still resolved, listed, edited in place — and deleted with their sidecars.
+func TestRecordingDirectoryLayout(t *testing.T) {
+	root := t.TempDir()
+
+	// New name → directory layout for creation.
+	p := RecordingYAMLPath(root, "fresh")
+	if p != filepath.Join(root, "fresh", "recording.yaml") {
+		t.Fatalf("creation path should use the directory layout, got %s", p)
+	}
+
+	// Directory layout resolves, and its events sidecar sits inside.
+	if err := os.MkdirAll(filepath.Join(root, "dirrec"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveRecording(filepath.Join(root, "dirrec", "recording.yaml"), Recording{Name: "dirrec", Steps: []Step{{Action: "navigate", URL: "https://x"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := RecordingYAMLPath(root, "dirrec"); got != filepath.Join(root, "dirrec", "recording.yaml") {
+		t.Fatalf("dir layout not resolved: %s", got)
+	}
+	if got := RecordingEventsPath(root, "dirrec"); got != filepath.Join(root, "dirrec", "events.json") {
+		t.Fatalf("dir events path wrong: %s", got)
+	}
+
+	// Legacy flat file resolves, with its flat sidecar.
+	if err := SaveRecording(filepath.Join(root, "old.yaml"), Recording{Name: "old", Steps: []Step{{Action: "navigate", URL: "https://y"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := RecordingYAMLPath(root, "old"); got != filepath.Join(root, "old.yaml") {
+		t.Fatalf("legacy layout not resolved: %s", got)
+	}
+	if got := RecordingEventsPath(root, "old"); got != filepath.Join(root, "old.events.json") {
+		t.Fatalf("legacy events path wrong: %s", got)
+	}
+
+	// Both layouts list.
+	names := []string{}
+	for _, r := range ListRecordings(root) {
+		names = append(names, r.Name)
+	}
+	if strings.Join(names, "|") != "dirrec|old" {
+		t.Fatalf("list should cover both layouts, got %v", names)
+	}
+
+	// Delete removes the whole directory, and legacy files with their sidecar.
+	if err := os.WriteFile(filepath.Join(root, "old.events.json"), []byte("[]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteRecording(root, "dirrec"); err != nil {
+		t.Fatalf("delete dir layout: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "dirrec")); !os.IsNotExist(err) {
+		t.Fatal("recording directory not removed")
+	}
+	if err := DeleteRecording(root, "old"); err != nil {
+		t.Fatalf("delete legacy layout: %v", err)
+	}
+	for _, f := range []string{"old.yaml", "old.events.json"} {
+		if _, err := os.Stat(filepath.Join(root, f)); !os.IsNotExist(err) {
+			t.Fatalf("legacy artifact %s not removed", f)
+		}
+	}
+	if err := DeleteRecording(root, "gone"); !os.IsNotExist(err) {
+		t.Fatalf("deleting a missing recording should report not-exist, got %v", err)
+	}
+}
+
+// TestReplayNavigateWaitsForAsyncSPAURL: an SPA updates location.href a beat
+// AFTER the click that caused the transition (Xiaohongshu appends
+// &from=tab_switch asynchronously). The recorded navigate that follows the
+// click must give the page a grace window to arrive on its own instead of
+// immediately force-loading — the reload resets the in-page state the click
+// just set up.
+func TestReplayNavigateWaitsForAsyncSPAURL(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>spa</title>
+<button id="tab">Tab</button>
+<script>
+window.marker=0;
+document.getElementById('tab').addEventListener('click',function(){
+  window.marker=1;
+  setTimeout(function(){ history.pushState({},'',location.pathname+'?tab=long'); }, 600);
+});
+</script>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+
+	recording := &Recording{Name: "spa", Steps: []Step{
+		{Action: "navigate", URL: srv.URL},
+		{Action: "click", Selector: "#tab"},
+		{Action: "navigate", URL: srv.URL + "/?tab=long"}, // async echo of the click
+	}}
+	if _, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 3 * time.Second, Browser: b}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var marker int
+	if err := page.Eval(ctx, "window.marker", &marker); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if marker != 1 {
+		t.Fatal("the navigate raced the SPA's async URL update and reloaded, wiping the click's state")
+	}
+}
+
+// TestCompileDropsSameDocNavigates: a same-document navigation (pushState
+// after a tab click — Xiaohongshu appends &from=tab_switch) is an effect of
+// the preceding click, not a user action. Compiling it into a navigate step
+// force-reloads the page on replay and resets the state the click set up.
+func TestCompileDropsSameDocNavigates(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "navigate", URL: "https://x/publish"},
+		{Type: "click", Selector: "#tab-long", Tag: "SPAN", Text: "写长文"},
+		{Type: "navigate", URL: "https://x/publish?from=tab_switch", SameDoc: true},
+		{Type: "click", Selector: "#new-draft", Tag: "BUTTON", Text: "新的创作"},
+	}
+	s := CompileRecording("x", "", "", events)
+	for _, st := range s.Steps {
+		if st.Action == "navigate" && strings.Contains(st.URL, "tab_switch") {
+			t.Fatalf("same-doc navigation must not compile to a navigate step: %+v", s.Steps)
+		}
+	}
+	var clicks int
+	for _, st := range s.Steps {
+		if st.Action == "click" {
+			clicks++
+		}
+	}
+	if clicks != 2 {
+		t.Fatalf("both real clicks must survive, got %d: %+v", clicks, s.Steps)
+	}
+}
+
+// TestCompileCapturesClickPointAndEndURL: the click's press position (box
+// fractions) and the demonstration's final URL survive compilation — the
+// fractions replay shadow-host clicks at the real spot, and EndURL is the
+// ground truth that catches a decisive click that silently did nothing.
+func TestCompileCapturesClickPointAndEndURL(t *testing.T) {
+	events := []RecordedEvent{
+		{Type: "navigate", URL: "https://x/publish"},
+		{Type: "click", Selector: "xhs-publish-btn", Tag: "XHS-PUBLISH-BTN", ClickX: 0.87, ClickY: 0.42},
+		{Type: "navigate", URL: "https://x/publish?published=true", SameDoc: true},
+	}
+	s := CompileRecording("x", "", "", events)
+	var click *Step
+	for i := range s.Steps {
+		if s.Steps[i].Action == "click" {
+			click = &s.Steps[i]
+		}
+	}
+	if click == nil || click.ClickX != 0.87 || click.ClickY != 0.42 {
+		t.Fatalf("click point not carried: %+v", s.Steps)
+	}
+	if s.EndURL != "https://x/publish?published=true" {
+		t.Fatalf("EndURL must record the demonstration's final URL (same-doc redirects included), got %q", s.EndURL)
+	}
+	// And it round-trips through YAML.
+	data, err := MarshalRecording(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, err := ParseRecording(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rt.EndURL != s.EndURL || rt.Steps[len(rt.Steps)-1].ClickX == 0 {
+		t.Fatalf("yaml round-trip lost fields: end_url=%q steps=%+v", rt.EndURL, rt.Steps)
+	}
+}
+
+// TestClickAtFraction: ClickAt presses at the requested fraction of the
+// element's box, not its center — a shadow-DOM host's center can be dead
+// space while the real control sits at the recorded spot.
+func TestClickAtFraction(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>frac</title>
+<div id="host" style="position:absolute;left:0;top:0;width:400px;height:100px;background:#eee"></div>
+<script>
+window.hits=[];
+document.getElementById('host').addEventListener('mousedown',function(e){window.hits.push({x:e.clientX,y:e.clientY});},true);
+</script>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.WaitFor(ctx, "#host", testWaitTimeout); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if err := page.ClickAt(ctx, "#host", 0.9, 0.5); err != nil {
+		t.Fatalf("click: %v", err)
+	}
+	var hits []struct{ X, Y float64 }
+	if err := page.Eval(ctx, "window.hits", &hits); err != nil || len(hits) == 0 {
+		t.Fatalf("no mousedown recorded (err=%v)", err)
+	}
+	if hits[0].X < 340 || hits[0].X > 380 {
+		t.Fatalf("click should land at ~90%% of the 400px box (x≈360), got x=%.0f", hits[0].X)
+	}
+}
+
+// TestReplayReclicksWhenClickHadNoEffect: the demonstrated click caused
+// network activity (the recording has a wait-network step right after it); a
+// replayed click on a not-yet-hydrated element causes none — the engine must
+// re-click instead of letting the following idle-wait pass instantly and read
+// as success. Models the Xiaohongshu publish button: a custom element whose
+// handler attaches a beat after the element renders.
+func TestReplayReclicksWhenClickHadNoEffect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api", func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>hydrate</title>
+<button id="pub">Publish</button>
+<script>
+window.published=0;
+// The handler hydrates LATE: clicks in the first ~1.5s do nothing.
+setTimeout(function(){
+  document.getElementById('pub').addEventListener('click',function(){
+    window.published++;
+    fetch('/api');
+  });
+}, 1500);
+</script>`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+
+	recording := &Recording{Name: "h", Steps: []Step{
+		{Action: "navigate", URL: srv.URL},
+		{Action: "click", Selector: "#pub"},
+		{Action: "wait", Network: true, TimeoutMS: 5000},
+	}}
+	if _, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 3 * time.Second, Browser: b}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var published int
+	if err := page.Eval(ctx, "window.published", &published); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if published != 1 {
+		t.Fatalf("expected the re-click to land exactly once after hydration, got %d", published)
+	}
+}
+
+// TestReplayWaitsForDisabledStateToClear: a click on an element still
+// advertising a disabled/loading state (native disabled, aria-disabled, or a
+// web-component *-disabled attribute — Xiaohongshu's <xhs-publish-btn
+// submit-disabled="true">) is swallowed silently; replay must wait for the
+// state to clear before dispatching. The demonstration only ever worked
+// because no human clicks faster than the component enables itself.
+func TestReplayWaitsForDisabledStateToClear(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>dis</title>
+<div id="host" submit-disabled="true" style="width:200px;height:40px">
+  <button id="pub" style="width:100%;height:100%">发布</button>
+</div>
+<script>
+window.published=0;
+document.getElementById('pub').addEventListener('click',function(){
+  if(document.getElementById('host').getAttribute('submit-disabled')==='true') return; // component guard
+  window.published++;
+});
+setTimeout(function(){ document.getElementById('host').setAttribute('submit-disabled','false'); }, 1200);
+</script>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+
+	recording := &Recording{Name: "d", Steps: []Step{
+		{Action: "navigate", URL: srv.URL},
+		{Action: "click", Selector: "#pub"},
+	}}
+	if _, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 5 * time.Second, Browser: b}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var published int
+	if err := page.Eval(ctx, "window.published", &published); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if published != 1 {
+		t.Fatalf("click must wait out the disabled state and land once, got %d", published)
+	}
+}
+
+// TestReplayRetriesDecisiveClickUntilItLands: the demonstration's last click
+// navigated (EndURL differs), but on replay the click is accepted yet BLOCKED
+// by a transient validation (an async upload still in progress) that clears
+// itself — the URL stays put. Replay must wait and re-click until the page
+// moves. Models Xiaohongshu's publish rejected by "图片正在上传".
+func TestReplayRetriesDecisiveClickUntilItLands(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<!doctype html><title>pub</title>
+<button id="pub" style="width:120px;height:40px">Publish</button>
+<script>
+var here = location.href;
+// Constant background traffic (heartbeats / telemetry) — this is what defeats
+// the network-activity dud-retry on a real page, so the decisive URL-based
+// retry is the only thing that can save the click.
+setInterval(function(){ fetch('/beacon'); }, 150);
+// "Cover image" still uploading for the first 1.2s; publish is blocked until then.
+window.uploading = true;
+setTimeout(function(){ window.uploading = false; }, 1200);
+document.getElementById('pub').addEventListener('click', function(){
+  if (window.uploading) return;           // blocked — URL stays put
+  history.pushState({}, '', here + '?published=true');
+});
+</script>`))
+	}))
+	defer srv.Close()
+
+	b := newBrowser(t, ctx)
+	defer b.Close()
+	page, err := b.NewPage(ctx, "about:blank")
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	if err := page.Navigate(ctx, srv.URL); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+
+	recording := &Recording{
+		Name:   "pub",
+		EndURL: srv.URL + "/?published=true",
+		Steps: []Step{
+			{Action: "navigate", URL: srv.URL},
+			{Action: "click", Selector: "#pub"},
+			{Action: "wait", Network: true, TimeoutMS: 5000},
+		},
+	}
+	if _, _, _, err := ReplayRecording(ctx, page, recording, nil, ReplayOptions{StepTimeout: 4 * time.Second, Browser: b}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var href string
+	if err := page.Eval(ctx, "location.href", &href); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if !strings.Contains(href, "published=true") {
+		t.Fatalf("decisive click was not retried until it landed; url=%s", href)
+	}
+}

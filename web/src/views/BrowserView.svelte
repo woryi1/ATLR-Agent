@@ -1,0 +1,253 @@
+<script lang="ts">
+  import { onMount } from 'svelte'
+  import { showToast, openAgentSession } from '../lib/stores'
+  import { t, tr } from '../lib/i18n'
+  import { confirmDialog } from '../lib/confirm'
+  import * as api from '../lib/api'
+  import type { BrowserRecording, BrowserStatus, BrowserVerifyResult } from '../lib/api'
+  import BrowserSetupForm from '../components/settings/BrowserSetupForm.svelte'
+  import StatusTag from '../components/ui/StatusTag.svelte'
+
+  let recordings = $state<BrowserRecording[]>([])
+  let loading = $state(false)
+
+  // Connection status (moved here from Settings — the Browser view owns it now).
+  let browser   = $state<BrowserStatus | null>(null)
+  let setupOpen = $state(false)
+  let setupModalEl = $state<HTMLDivElement | null>(null)
+
+  // Focus trap so Esc doesn't leak past the modal (#1112).
+  $effect(() => {
+    if (setupOpen) setupModalEl?.focus()
+  })
+
+  function closeSetup() {
+    setupOpen = false
+  }
+
+  async function loadBrowserStatus() {
+    try {
+      browser = await api.getBrowserStatus()
+    } catch { /* leave as null */ }
+  }
+
+  async function onSetupVerified(res: BrowserVerifyResult) {
+    showToast(tr('settings.browser.verify_ok') + (res.detail ? ` (${res.detail})` : ''), 'success')
+    setupOpen = false
+    await loadBrowserStatus()
+  }
+
+  async function reload() {
+    loading = true
+    try {
+      recordings = await api.listBrowserRecordings()
+    } catch (e: any) {
+      showToast(e?.message ?? tr('browser.rec.load_fail'), 'error')
+    } finally {
+      loading = false
+    }
+  }
+
+  onMount(() => {
+    reload()
+    loadBrowserStatus()
+  })
+
+  async function del(name: string) {
+    if (!(await confirmDialog(tr('browser.rec.delete_confirm').replace('{name}', name)))) return
+    try {
+      await api.deleteBrowserRecording(name)
+      showToast(tr('browser.rec.deleted'), 'success')
+      await reload()
+    } catch (e: any) {
+      showToast(e?.message ?? tr('browser.rec.delete_fail'), 'error')
+    }
+  }
+
+  // Replay reuses the full agent path (replay action + self-heal): open a session
+  // and let the model drive it, rather than a server-side replay endpoint. The
+  // declared param names ride along in the prompt — without them the model
+  // paraphrases ("title" for a param named value) and the replay call rejects.
+  function run(name: string) {
+    let prompt = tr('browser.rec.run_prompt').replace('{name}', name)
+    const rec = recordings.find(r => r.name === name)
+    if (rec?.params?.length) {
+      prompt += ' ' + tr('browser.rec.run_prompt_params').replace('{params}', rec.params.join(', '))
+    }
+    openAgentSession(prompt, '▶ ' + name).catch(() => {})
+  }
+
+  // Start a recording: open a fresh session whose first message kicks off the
+  // record flow (record_start → hand control to the user → record_stop).
+  function record() {
+    openAgentSession(tr('browser.rec.record_prompt'), '● ' + tr('browser.rec.record')).catch(() => {})
+  }
+
+  // Edit conversationally (agentic, like Replay/Record) rather than a raw YAML
+  // textarea modal — consistent with the rest of the app.
+  function edit(name: string) {
+    openAgentSession(tr('browser.rec.edit_prompt').replace('{name}', name), '✎ ' + name).catch(() => {})
+  }
+</script>
+
+<div class="view">
+  <div class="view-head">
+    <h1>{$t('nav.browser')}</h1>
+    <p class="sub">{$t('browser.view.sub')}</p>
+  </div>
+
+  <!-- Connection -->
+  <section class="card">
+    <div class="conn-head">
+      <div class="conn-info">
+        <h2 class="sec-title">{$t('browser.view.connect_title')}</h2>
+        <span class="conn-desc">{$t('settings.browser.desc')}</span>
+      </div>
+      <div class="conn-right">
+        {#if !browser}
+          <span class="muted">{$t('common.loading')}</span>
+        {:else}
+          {#if browser.connected}
+            <StatusTag status="success">{$t('settings.browser.connected')}</StatusTag>
+          {:else if browser.configured}
+            <StatusTag status="warning">{$t('settings.browser.unreachable')}</StatusTag>
+          {:else}
+            <StatusTag status="default">{$t('settings.browser.not_setup')}</StatusTag>
+          {/if}
+          {#if browser.configured}
+            <span class="muted mono">{$t('settings.browser.port')} {browser.port}</span>
+          {/if}
+          <button class="ghost-btn" onclick={() => (setupOpen = true)}>
+            <iconify-icon icon="ant-design:setting-outlined" width="13"></iconify-icon>
+            {browser.configured ? $t('settings.browser.reconfigure') : $t('settings.browser.setup')}
+          </button>
+        {/if}
+      </div>
+    </div>
+    {#if browser && !browser.chrome_available}
+      <div class="conn-note">
+        <iconify-icon icon="ant-design:warning-outlined" width="14"></iconify-icon>
+        {$t('settings.browser.no_chrome')}
+      </div>
+    {/if}
+  </section>
+
+  <!-- Recordings -->
+  <section class="card">
+    <div class="sec-head">
+      <h2 class="sec-title">{$t('browser.view.recordings_title')}</h2>
+      <div class="rec-head-actions">
+        <button class="primary-btn" onclick={record}>
+          <iconify-icon icon="ant-design:video-camera-outlined" width="13"></iconify-icon>
+          {$t('browser.rec.record')}
+        </button>
+        <button class="ghost-btn" onclick={reload} aria-label={$t('common.refresh')}>
+          <iconify-icon icon="ant-design:reload-outlined" width="14"></iconify-icon>
+        </button>
+      </div>
+    </div>
+    <p class="hint">{$t('browser.rec.how')}</p>
+
+    {#if loading}
+      <p class="muted">{$t('common.loading')}</p>
+    {:else if recordings.length === 0}
+      <p class="muted">{$t('browser.rec.empty')}</p>
+    {:else}
+      <ul class="rec-list">
+        {#each recordings as r (r.name)}
+          <li class="rec">
+            <div class="rec-main">
+              <div class="rec-name">{r.name}</div>
+              {#if r.description}<div class="rec-desc">{r.description}</div>{/if}
+              <div class="rec-meta">
+                <span>{r.steps} {$t('browser.rec.steps')}</span>
+                {#if r.params && r.params.length}<span>· {r.params.join(', ')}</span>{/if}
+              </div>
+            </div>
+            <div class="rec-actions">
+              <button class="ghost-btn" onclick={() => run(r.name)}>{$t('browser.rec.run')}</button>
+              <button class="ghost-btn" onclick={() => edit(r.name)}>{$t('common.edit')}</button>
+              <button class="ghost-btn danger" onclick={() => del(r.name)}>{$t('common.delete')}</button>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  </section>
+</div>
+
+{#if setupOpen}
+  <!-- #1112: overlay is inert (no dismiss-on-click) — a stray click used to
+       silently discard the in-progress setup form. Esc closes explicitly. -->
+  <div class="modal-overlay" role="presentation">
+    <div class="modal" bind:this={setupModalEl} onkeydown={(e) => { if (e.key === 'Escape') { e.preventDefault(); closeSetup() } }} role="dialog" aria-modal="true" tabindex="-1">
+      <div class="modal-header">
+        <span class="modal-title">{$t('settings.browser.modal_title')}</span>
+        <button class="modal-close" onclick={closeSetup} aria-label={$t('common.close')}>
+          <iconify-icon icon="ant-design:close-outlined" width="14"></iconify-icon>
+        </button>
+      </div>
+      <div class="modal-body">
+        <BrowserSetupForm
+          secondaryLabel={$t('common.cancel')}
+          onSecondary={closeSetup}
+          onVerified={onSetupVerified}
+        />
+      </div>
+    </div>
+  </div>
+{/if}
+
+<style>
+  .view { padding: 26px 28px 40px; max-width: 880px; margin: 0 auto; overflow-y: auto; background: var(--bg-layout); }
+  .view-head h1 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -0.01em; color: var(--text-heading); }
+  .sub { color: var(--text-secondary); margin: 4px 0 20px; font-size: 13px; }
+  .card { background: var(--bg-container); border: 1px solid var(--border); border-radius: var(--radius-card); box-shadow: var(--card-shadow); padding: 18px; margin-bottom: 18px; }
+  .sec-head { display: flex; align-items: center; justify-content: space-between; }
+  .sec-title { margin: 0 0 12px; font-size: 15px; }
+  .conn-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+  .conn-info { display: flex; flex-direction: column; gap: 4px; }
+  .conn-info .sec-title { margin: 0; }
+  .conn-desc { font-size: 12px; color: var(--text-secondary); }
+  .conn-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+  .conn-note { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 10px 12px; border-radius: 8px; font-size: 12px; color: var(--warning); background: var(--warning-bg); }
+  .mono { font-family: var(--font-mono); }
+  .hint { color: var(--text-secondary); font-size: 12px; margin: 0 0 14px; }
+  .muted { color: var(--text-secondary); font-size: 13px; }
+  .rec-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .rec { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border: 1px solid var(--border-secondary); border-radius: 8px; }
+  .rec-name { font-weight: 600; font-size: 14px; }
+  .rec-desc { color: var(--text-secondary); font-size: 12px; margin-top: 2px; }
+  .rec-meta { color: var(--text-tertiary); font-size: 11px; margin-top: 4px; }
+  .rec-actions { display: flex; gap: 6px; flex-shrink: 0; }
+  .ghost-btn { background: transparent; border: 1px solid var(--border); border-radius: 8px; padding: 5px 10px; font-size: 12px; font-weight: 500; cursor: pointer; color: var(--text); }
+  .ghost-btn:hover { background: var(--hover-neutral); border-color: var(--text-quaternary); }
+  .ghost-btn.danger { color: var(--error); }
+  .ghost-btn.danger:hover { background: var(--error-bg); border-color: var(--error-border); }
+  .rec-head-actions { display: flex; align-items: center; gap: 8px; }
+  .primary-btn { display: inline-flex; align-items: center; gap: 5px; background: var(--blue-6); color: var(--on-accent); border: none; border-radius: 8px; padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer; box-shadow: 0 1px 2px rgba(0,122,255,0.35); }
+  .primary-btn:hover:not(:disabled) { background: var(--blue-5); }
+  .primary-btn:disabled { opacity: 0.6; cursor: default; }
+  .modal-overlay {
+    position: fixed; inset: 0; background: var(--scrim);
+    display: flex; align-items: flex-start; justify-content: center; z-index: 200;
+    padding: 48px 16px; overflow-y: auto;
+  }
+  .modal {
+    width: 520px; max-width: 100%;
+    background: var(--bg-container); border-radius: 16px; box-shadow: 0 24px 48px rgba(15,23,42,0.18);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .modal:focus { outline: none; }
+  .modal-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 24px 16px; border-bottom: 1px solid var(--border-table);
+  }
+  .modal-title { font-size: 16px; font-weight: 600; color: var(--text-heading); }
+  .modal-close {
+    width: 28px; height: 28px; border: none; background: transparent; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center; cursor: pointer; color: var(--text-tertiary);
+  }
+  .modal-close:hover { background: var(--hover-neutral); color: var(--text); }
+  .modal-body { padding: 20px 24px; }
+</style>

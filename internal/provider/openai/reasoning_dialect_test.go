@@ -1,0 +1,255 @@
+package openai
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/open-octo/octo-agent/internal/agent"
+	"github.com/open-octo/octo-agent/internal/provider"
+)
+
+// captureRequest stands up a server that records the decoded request body and
+// returns a minimal valid chat.completion so Send succeeds.
+func captureRequest(t *testing.T, dialect, effort string, stream bool) apiRequest {
+	t.Helper()
+	return captureRequestModel(t, dialect, "deepseek-v4-pro", effort, stream)
+}
+
+// captureRequestModel is captureRequest with an explicit model id, for
+// dialects (Kimi) whose reasoning shape is model-dependent.
+func captureRequestModel(t *testing.T, dialect, model, effort string, stream bool) apiRequest {
+	t.Helper()
+	var got apiRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("decode req: %v", err)
+		}
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}`+"\n\n")
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","model":"` + model + `","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer srv.Close()
+
+	c, err := New("k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.BaseURL = srv.URL
+	c.Dialect = dialect
+
+	req := provider.Request{
+		Model:           model,
+		Messages:        []agent.Message{agent.NewUserMessage("hi")},
+		ReasoningEffort: effort,
+	}
+	if stream {
+		if _, err := c.SendStream(context.Background(), req, provider.StreamCallbacks{}); err != nil {
+			t.Fatalf("SendStream: %v", err)
+		}
+	} else {
+		if _, err := c.Send(context.Background(), req); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+	}
+	return got
+}
+
+// DeepSeek separates enabling thinking from tuning its effort, so an effort
+// must travel with thinking.type=enabled, and "off" must send
+// thinking.type=disabled explicitly (DeepSeek leaves thinking on by default).
+func TestDeepSeekDialect_ThinkingToggle(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		got := captureRequest(t, DialectDeepSeek, "high", stream)
+		if got.Thinking == nil || got.Thinking.Type != "enabled" {
+			t.Errorf("stream=%v: thinking = %+v, want type=enabled", stream, got.Thinking)
+		}
+		if got.ReasoningEffort != "high" {
+			t.Errorf("stream=%v: reasoning_effort = %q, want high", stream, got.ReasoningEffort)
+		}
+
+		off := captureRequest(t, DialectDeepSeek, "", stream)
+		if off.Thinking == nil || off.Thinking.Type != "disabled" {
+			t.Errorf("stream=%v: off thinking = %+v, want type=disabled", stream, off.Thinking)
+		}
+		if off.ReasoningEffort != "" {
+			t.Errorf("stream=%v: off reasoning_effort = %q, want empty", stream, off.ReasoningEffort)
+		}
+	}
+}
+
+// DeepSeek accepts "max" natively, so it must pass through verbatim with
+// thinking enabled.
+func TestDeepSeekDialect_MaxPassesThrough(t *testing.T) {
+	got := captureRequest(t, DialectDeepSeek, "max", false)
+	if got.ReasoningEffort != "max" {
+		t.Errorf("reasoning_effort = %q, want max", got.ReasoningEffort)
+	}
+	if got.Thinking == nil || got.Thinking.Type != "enabled" {
+		t.Errorf("thinking = %+v, want type=enabled", got.Thinking)
+	}
+}
+
+// The OpenAI dialect maps "max" → "xhigh" (gpt-5.x's real top tier; it has no
+// "max"), passes "xhigh" and lower through, and never sends the thinking toggle.
+func TestOpenAIDialect_MaxMapsToXHigh(t *testing.T) {
+	cases := map[string]string{"low": "low", "high": "high", "xhigh": "xhigh", "max": "xhigh"}
+	for in, want := range cases {
+		got := captureRequest(t, DialectOpenAI, in, false)
+		if got.ReasoningEffort != want {
+			t.Errorf("OpenAI effort %q → %q, want %q", in, got.ReasoningEffort, want)
+		}
+		if got.Thinking != nil {
+			t.Errorf("OpenAI effort %q: thinking = %+v, want omitted", in, got.Thinking)
+		}
+	}
+}
+
+// OpenRouter has no reasoning_effort field at all — only a nested
+// reasoning:{effort:...} object — so the flat field must stay empty and the
+// value must pass through verbatim (its enum is a superset of ours, no
+// clamping needed). Empty effort omits the reasoning object entirely rather
+// than sending an empty one.
+func TestOpenRouterDialect_UsesNestedReasoningObject(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		got := captureRequest(t, DialectOpenRouter, "max", stream)
+		if got.ReasoningEffort != "" {
+			t.Errorf("stream=%v: reasoning_effort = %q, want empty (must use nested reasoning object)", stream, got.ReasoningEffort)
+		}
+		if got.Reasoning == nil || got.Reasoning.Effort != "max" {
+			t.Errorf("stream=%v: reasoning = %+v, want {Effort:max}", stream, got.Reasoning)
+		}
+		if got.Thinking != nil {
+			t.Errorf("stream=%v: thinking = %+v, want omitted", stream, got.Thinking)
+		}
+
+		off := captureRequest(t, DialectOpenRouter, "", stream)
+		if off.Reasoning != nil {
+			t.Errorf("stream=%v: off reasoning = %+v, want omitted", stream, off.Reasoning)
+		}
+	}
+}
+
+// Bailian (DashScope) has no reasoning_effort field at all — only a plain
+// enable_thinking boolean, sent explicitly in both directions since per-model
+// defaults vary.
+func TestBailianDialect_UsesEnableThinkingBoolean(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		got := captureRequest(t, DialectBailian, "high", stream)
+		if got.ReasoningEffort != "" {
+			t.Errorf("stream=%v: reasoning_effort = %q, want empty (must use enable_thinking)", stream, got.ReasoningEffort)
+		}
+		if got.EnableThinking == nil || !*got.EnableThinking {
+			t.Errorf("stream=%v: enable_thinking = %v, want true", stream, got.EnableThinking)
+		}
+		if got.Thinking != nil {
+			t.Errorf("stream=%v: thinking = %+v, want omitted (bailian uses enable_thinking, not thinking)", stream, got.Thinking)
+		}
+
+		off := captureRequest(t, DialectBailian, "", stream)
+		if off.EnableThinking == nil || *off.EnableThinking {
+			t.Errorf("stream=%v: off enable_thinking = %v, want explicit false", stream, off.EnableThinking)
+		}
+	}
+}
+
+// Kimi's reasoning shape is split by model generation: k3 gets a top-level
+// reasoning_effort clamped to its only supported value, "max"; every other
+// kimi model gets DeepSeek's nested toggle (no reasoning_effort).
+func TestKimiDialect_ModelDependentShape(t *testing.T) {
+	// k2.5 pins that the default branch (any non-k3 kimi model) gets the
+	// nested-toggle shape.
+	t.Run("non-k3 toggles like DeepSeek", func(t *testing.T) {
+		for _, stream := range []bool{false, true} {
+			on := captureRequestModel(t, DialectKimi, "kimi-k2.5", "high", stream)
+			if on.Thinking == nil || on.Thinking.Type != "enabled" {
+				t.Errorf("stream=%v: thinking = %+v, want type=enabled", stream, on.Thinking)
+			}
+			if on.ReasoningEffort != "" {
+				t.Errorf("stream=%v: reasoning_effort = %q, want empty (non-k3 kimi has no such field)", stream, on.ReasoningEffort)
+			}
+
+			off := captureRequestModel(t, DialectKimi, "kimi-k2.5", "", stream)
+			if off.Thinking == nil || off.Thinking.Type != "disabled" {
+				t.Errorf("stream=%v: off thinking = %+v, want type=disabled", stream, off.Thinking)
+			}
+		}
+	})
+
+	t.Run("k3 clamps to reasoning_effort=max", func(t *testing.T) {
+		for _, stream := range []bool{false, true} {
+			got := captureRequestModel(t, DialectKimi, "k3", "low", stream)
+			if got.ReasoningEffort != "max" {
+				t.Errorf("stream=%v: reasoning_effort = %q, want max (k3's only supported value)", stream, got.ReasoningEffort)
+			}
+			if got.Thinking != nil {
+				t.Errorf("stream=%v: thinking = %+v, want omitted (k3 uses reasoning_effort)", stream, got.Thinking)
+			}
+
+			// Off must be explicit: k3 reasons by default when both fields
+			// are omitted, and it accepts the nested toggle for turning off.
+			off := captureRequestModel(t, DialectKimi, "k3", "", stream)
+			if off.ReasoningEffort != "" {
+				t.Errorf("stream=%v: off reasoning_effort = %q, want empty", stream, off.ReasoningEffort)
+			}
+			if off.Thinking == nil || off.Thinking.Type != "disabled" {
+				t.Errorf("stream=%v: off thinking = %+v, want {type: disabled}", stream, off.Thinking)
+			}
+		}
+	})
+
+	// k3.1 always reasons and 400s on the "disabled" toggle, so "off" is
+	// its lightest effort instead.
+	t.Run("k3.1 off sends reasoning_effort=low", func(t *testing.T) {
+		for _, stream := range []bool{false, true} {
+			on := captureRequestModel(t, DialectKimi, "kimi-k3.1-pro", "high", stream)
+			if on.ReasoningEffort != "max" {
+				t.Errorf("stream=%v: reasoning_effort = %q, want max", stream, on.ReasoningEffort)
+			}
+
+			off := captureRequestModel(t, DialectKimi, "kimi-k3.1-pro", "", stream)
+			if off.ReasoningEffort != "low" {
+				t.Errorf("stream=%v: off reasoning_effort = %q, want low", stream, off.ReasoningEffort)
+			}
+			if off.Thinking != nil {
+				t.Errorf("stream=%v: off thinking = %+v, want omitted (k3.1 rejects disabled)", stream, off.Thinking)
+			}
+		}
+	})
+}
+
+// A generic (unknown) backend must never see the thinking toggle, and tops out
+// at "high" — both "xhigh" and "max" clamp down since it rejects unknown enums.
+func TestGenericDialect_OmitsThinkingAndClampsHigh(t *testing.T) {
+	got := captureRequest(t, "", "high", false)
+	if got.Thinking != nil {
+		t.Errorf("thinking = %+v, want omitted for generic OpenAI", got.Thinking)
+	}
+	if got.ReasoningEffort != "high" {
+		t.Errorf("reasoning_effort = %q, want high", got.ReasoningEffort)
+	}
+
+	// Both "xhigh" and "max" clamp down to "high" for generic backends.
+	for _, in := range []string{"xhigh", "max"} {
+		clamped := captureRequest(t, "", in, false)
+		if clamped.ReasoningEffort != "high" {
+			t.Errorf("%q reasoning_effort = %q, want clamped to high", in, clamped.ReasoningEffort)
+		}
+		if clamped.Thinking != nil {
+			t.Errorf("%q thinking = %+v, want omitted", in, clamped.Thinking)
+		}
+	}
+
+	// Empty effort on a generic backend omits both fields entirely.
+	off := captureRequest(t, "", "", false)
+	if off.Thinking != nil || off.ReasoningEffort != "" {
+		t.Errorf("off: thinking=%+v effort=%q, want both omitted", off.Thinking, off.ReasoningEffort)
+	}
+}

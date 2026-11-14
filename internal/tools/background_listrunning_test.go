@@ -1,0 +1,84 @@
+package tools
+
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+func TestBackgroundManager_ListRunning(t *testing.T) {
+	m := NewBackgroundManager()
+	id, err := m.Start(context.Background(), "sleep 2", BgModeAsync)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	run := m.ListRunning()
+	if len(run) != 1 {
+		t.Fatalf("ListRunning = %d entries, want 1: %+v", len(run), run)
+	}
+	if run[0].ID != id || run[0].Command != "sleep 2" {
+		t.Errorf("running entry = %+v, want id=%s command='sleep 2'", run[0], id)
+	}
+	if run[0].Mode != BgModeAsync {
+		t.Errorf("running entry mode = %q, want %q", run[0].Mode, BgModeAsync)
+	}
+	if run[0].Start.IsZero() {
+		t.Error("running entry has no Start time")
+	}
+
+	// Killing it makes it drop off the running list once the waiter records exit.
+	m.Kill(id)
+	waitFor(t, "process to leave the running list", func() bool {
+		return len(m.ListRunning()) == 0
+	})
+}
+
+func TestBackgroundManager_ListRunning_ExcludesExited(t *testing.T) {
+	m := NewBackgroundManager()
+	id, err := m.Start(context.Background(), "echo done", BgModeAsync)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Wait for it to finish (Read reports exited), then it must not be listed.
+	waitFor(t, "process to exit", func() bool {
+		_, status, _, _, _ := m.Read(id)
+		return strings.HasPrefix(status, "exited")
+	})
+	if run := m.ListRunning(); len(run) != 0 {
+		t.Errorf("exited process should not be listed as running; got %+v", run)
+	}
+}
+
+func TestRunningBackground_DefaultManagerDelegates(t *testing.T) {
+	// Smoke: the package-level helper reads the default manager without panicking.
+	_ = RunningBackground()
+}
+
+// TestBackgroundManager_ListRunning_ExcludesInvisible verifies that processes
+// started with visible=false do not appear in ListRunning until Promoted.
+func TestBackgroundManager_ListRunning_ExcludesInvisible(t *testing.T) {
+	m := NewBackgroundManager()
+	id, err := m.Start(context.Background(), "sleep 2", BgModeAsync, WithVisible(false))
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Invisible processes should not be listed.
+	if run := m.ListRunning(); len(run) != 0 {
+		t.Errorf("invisible process should not be listed; got %+v", run)
+	}
+
+	// After promotion it appears.
+	if !m.Promote(id) {
+		t.Fatal("Promote returned false for a live process")
+	}
+	if run := m.ListRunning(); len(run) != 1 {
+		t.Fatalf("after promote ListRunning = %d entries, want 1: %+v", len(run), run)
+	}
+
+	// Promote of unknown id returns false.
+	if m.Promote("bg_does_not_exist") {
+		t.Error("Promote of unknown id should return false")
+	}
+}

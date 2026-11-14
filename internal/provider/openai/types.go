@@ -1,0 +1,316 @@
+// Package openai implements provider.Provider against OpenAI's Chat
+// Completions API (POST /v1/chat/completions).
+//
+// API reference: https://platform.openai.com/docs/api-reference/chat
+//
+// The package is interchangeable with any OpenAI-compatible service —
+// DeepSeek's main endpoint, Kimi, Together, OpenRouter, vLLM, etc. — by
+// pointing Client.BaseURL at the alternative host.
+package openai
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+// apiFunction describes the callable function part of a tool.
+type apiFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+// apiTool wraps an apiFunction with a type discriminator (always "function").
+type apiTool struct {
+	Type     string      `json:"type"` // "function"
+	Function apiFunction `json:"function"`
+}
+
+// apiRequest is the wire-level JSON body of POST /v1/chat/completions.
+type apiRequest struct {
+	Model     string       `json:"model"`
+	Messages  []apiMessage `json:"messages"`
+	MaxTokens int          `json:"max_tokens,omitempty"`
+	Stream    bool         `json:"stream,omitempty"`
+	Tools     []apiTool    `json:"tools,omitempty"`
+	// StreamOptions carries stream-only flags. We set include_usage on streaming
+	// requests so the server emits a final usage chunk — DashScope (and real
+	// OpenAI) send no usage at all without it. Omitted on non-streaming requests.
+	StreamOptions *apiStreamOptions `json:"stream_options,omitempty"`
+	// PromptCacheKey routes the request to a consistent prompt cache. Stable
+	// across a conversation's turns → higher cache hit-rate. Omitted when empty.
+	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
+	// ReasoningEffort tunes how much a reasoning model deliberates before
+	// answering ("low" | "medium" | "high" | "xhigh" | "max"). Omitted when
+	// empty so non-reasoning models are unaffected. Set via
+	// Client.applyReasoning, which normalises the value per dialect (DeepSeek
+	// verbatim, OpenAI "max"→"xhigh", generic clamps "xhigh"/"max"→"high").
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// Reasoning is OpenRouter's own reasoning-tuning shape: a nested object
+	// rather than the flat reasoning_effort field above. OpenRouter's schema
+	// has no reasoning_effort field at all — sending it there is silently
+	// ignored — so the openrouter dialect populates this instead (see
+	// Client.applyReasoning and https://openrouter.ai/docs/use-cases/reasoning-tokens).
+	Reasoning *apiReasoning `json:"reasoning,omitempty"`
+	// Thinking is the nested on/off toggle for thinking mode used by DeepSeek
+	// and Kimi's non-k3 models (see Client.applyReasoning). Both separate
+	// enabling thinking from tuning its effort, and leave thinking on by
+	// default — so reasoning_effort alone may not engage/disengage it, and
+	// "disabled" must be sent explicitly. nil (omitted) for every other
+	// OpenAI-compatible backend.
+	Thinking *apiThinking `json:"thinking,omitempty"`
+	// EnableThinking is DashScope's (Alibaba Bailian) on/off toggle — a plain
+	// boolean rather than DeepSeek/Kimi's {type: "enabled"|"disabled"} object.
+	// Set only for the bailian dialect (see Client.applyReasoning). DashScope
+	// has no reasoning_effort field at all.
+	EnableThinking *bool `json:"enable_thinking,omitempty"`
+}
+
+// apiReasoning is OpenRouter's nested reasoning-tuning object. Effort accepts
+// "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" — a
+// superset of our own effort vocabulary, so values pass through unchanged.
+type apiReasoning struct {
+	Effort string `json:"effort,omitempty"`
+}
+
+// apiThinking is DeepSeek's thinking-mode toggle. Type is "enabled" or
+// "disabled".
+type apiThinking struct {
+	Type string `json:"type"`
+}
+
+// apiStreamOptions is the stream_options object on a streaming request.
+type apiStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+// apiMessage is one element of apiRequest.Messages.
+//
+// For plain turns Content is a string. For assistant turns with tool calls
+// ToolCalls is populated and Content may be empty. For tool result turns
+// Role is "tool" and ToolCallID identifies which call is being answered.
+//
+// When image blocks are present, ContentParts carries the array of text/image
+// content items and Content is left empty. The JSON serialization uses
+// "content" for both shapes (string or array) via custom MarshalJSON/UnmarshalJSON.
+type apiMessage struct {
+	Role       string        `json:"role"`
+	Content    string        `json:"-"`
+	ToolCalls  []apiToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string        `json:"tool_call_id,omitempty"`
+	// ReasoningContent is the thinking trace returned by reasoning models
+	// (deepseek-v4 etc.). It must be echoed back on the assistant message that
+	// carries tool_calls, or the next request is rejected. DeepSeek V4 goes
+	// further: once a tool call happened in thinking mode, EVERY later
+	// assistant message must carry the field — empty string when that turn has
+	// no trace. A pointer distinguishes "send empty" (non-nil "") from "omit
+	// entirely" (nil), which matters for models that reject the field outright
+	// on plain text turns (R1) — see toAPIMessages.
+	ReasoningContent *string `json:"reasoning_content,omitempty"`
+	// ContentParts is the array form of content used for vision/multimodal
+	// messages. When non-empty it overrides Content in JSON serialization.
+	ContentParts []apiContentPart `json:"-"`
+}
+
+// apiContentPart is one element of a multimodal content array.
+type apiContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL *struct {
+		URL string `json:"url"`
+	} `json:"image_url,omitempty"`
+}
+
+// MarshalJSON emits Content as a string when ContentParts is empty, or as
+// an array when ContentParts is populated. This matches the OpenAI wire
+// format where "content" can be either shape.
+func (m apiMessage) MarshalJSON() ([]byte, error) {
+	type alias apiMessage // prevent recursion
+	raw := struct {
+		alias
+		Content any `json:"content,omitempty"`
+	}{
+		alias: alias(m),
+	}
+	if len(m.ContentParts) > 0 {
+		raw.Content = m.ContentParts
+	} else {
+		raw.Content = m.Content
+	}
+	return json.Marshal(raw)
+}
+
+// UnmarshalJSON reads "content" as either a string or an array of content
+// parts, populating Content or ContentParts accordingly.
+func (m *apiMessage) UnmarshalJSON(data []byte) error {
+	type alias apiMessage
+	var raw struct {
+		alias
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*m = apiMessage(raw.alias)
+
+	if len(raw.Content) == 0 || string(raw.Content) == "null" {
+		return nil
+	}
+	// Try string first.
+	var s string
+	if err := json.Unmarshal(raw.Content, &s); err == nil {
+		m.Content = s
+		return nil
+	}
+	// Fall back to array of content parts.
+	var parts []apiContentPart
+	if err := json.Unmarshal(raw.Content, &parts); err == nil {
+		m.ContentParts = parts
+		return nil
+	}
+	return fmt.Errorf("apiMessage.content: unsupported type: %s", string(raw.Content))
+}
+
+// apiToolCall is one element of apiMessage.ToolCalls (assistant turns).
+type apiToolCall struct {
+	ID       string              `json:"id"`
+	Type     string              `json:"type"` // "function"
+	Function apiToolCallFunction `json:"function"`
+}
+
+// apiToolCallFunction carries the name and JSON-encoded arguments.
+type apiToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"` // JSON string, needs json.Unmarshal to a map
+}
+
+// apiResponse is the wire-level JSON body of a successful 200 response.
+type apiResponse struct {
+	ID      string      `json:"id"`
+	Object  string      `json:"object"`
+	Model   string      `json:"model"`
+	Choices []apiChoice `json:"choices"`
+	Usage   apiUsage    `json:"usage"`
+}
+
+// apiChoice is one element of apiResponse.Choices.
+type apiChoice struct {
+	Index        int        `json:"index"`
+	Message      apiMessage `json:"message"`
+	FinishReason string     `json:"finish_reason"`
+}
+
+// apiUsage is the token-count block OpenAI returns. Field names differ from
+// Anthropic (prompt_tokens / completion_tokens vs input_tokens / output_tokens);
+// the adapter normalises them onto provider.Response.{InputTokens,OutputTokens}.
+type apiUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+
+	// Cache accounting. DeepSeek reports prompt_cache_hit_tokens /
+	// prompt_cache_miss_tokens at the top level; OpenAI reports cached input
+	// under prompt_tokens_details.cached_tokens. We read whichever is present.
+	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+	PromptTokensDetails   *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details,omitempty"`
+}
+
+// cachedTokens returns the number of cached (read-hit) prompt tokens this
+// usage block reports, preferring DeepSeek's explicit hit count and falling
+// back to OpenAI's prompt_tokens_details.cached_tokens.
+func (u apiUsage) cachedTokens() int {
+	if u.PromptCacheHitTokens > 0 {
+		return u.PromptCacheHitTokens
+	}
+	if u.PromptTokensDetails != nil {
+		return u.PromptTokensDetails.CachedTokens
+	}
+	return 0
+}
+
+// nonCachedInput returns prompt tokens excluding the cached (read-hit) portion.
+// OpenAI/DeepSeek report prompt_tokens as the WHOLE input (cached + uncached),
+// with cached_tokens as a subset; Anthropic instead reports input_tokens as the
+// uncached remainder with cache_read separate. The agent treats InputTokens and
+// CacheReadTokens as non-overlapping buckets (so context occupancy is their sum
+// and they price independently), so we subtract here to match that convention.
+// Clamped at zero in case a backend ever reports cached > prompt.
+func (u apiUsage) nonCachedInput() int {
+	if n := u.PromptTokens - u.cachedTokens(); n > 0 {
+		return n
+	}
+	return 0
+}
+
+// apiError is the body of an OpenAI error response (4xx/5xx).
+type apiError struct {
+	Error struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Code    string `json:"code"`
+	} `json:"error"`
+}
+
+// streamChunk is one element of an OpenAI streaming response. Each chunk
+// arrives as a single SSE `data:` line carrying this JSON, terminated by a
+// final `data: [DONE]` sentinel.
+//
+// Reference: https://platform.openai.com/docs/api-reference/chat-streaming
+type streamChunk struct {
+	ID      string         `json:"id"`
+	Object  string         `json:"object"`
+	Model   string         `json:"model"`
+	Choices []streamChoice `json:"choices"`
+	// Usage is populated only on the final chunk when the request was sent
+	// with stream_options.include_usage=true. We don't send that option so
+	// most chunks have Usage zero; we keep the field so an upstream that
+	// chooses to emit it anyway still gets parsed.
+	Usage *apiUsage `json:"usage,omitempty"`
+	// Error is set when an OpenAI-compatible server reports a failure mid-stream
+	// (after a 200) as a `data: {"error": {...}}` line rather than a normal
+	// chunk. Without this the line parses as a chunk with zero choices and is
+	// silently skipped, so the turn returns empty as if it succeeded.
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	} `json:"error,omitempty"`
+}
+
+// streamChoice mirrors apiChoice but with Delta in place of Message.
+type streamChoice struct {
+	Index        int         `json:"index"`
+	Delta        streamDelta `json:"delta"`
+	FinishReason string      `json:"finish_reason,omitempty"`
+	// Usage is populated by some compatible backends (e.g. Kimi) inside the
+	// final choice object rather than at the chunk level. We read it here as
+	// a fallback when the top-level chunk.Usage is absent.
+	Usage *apiUsage `json:"usage,omitempty"`
+}
+
+// streamDelta carries the incremental fields of an assistant message.
+// ToolCalls carries incremental tool call fragments (index-keyed).
+type streamDelta struct {
+	Role             string                `json:"role,omitempty"`
+	Content          string                `json:"content,omitempty"`
+	ReasoningContent string                `json:"reasoning_content,omitempty"`
+	ToolCalls        []streamToolCallDelta `json:"tool_calls,omitempty"`
+}
+
+// streamToolCallDelta is one incremental fragment of a tool call in a stream
+// chunk. Fragments for the same call share the same Index; ID and Type are
+// only present in the first fragment.
+type streamToolCallDelta struct {
+	Index    int                 `json:"index"`
+	ID       string              `json:"id,omitempty"`
+	Type     string              `json:"type,omitempty"` // "function"
+	Function streamFunctionDelta `json:"function"`
+}
+
+// streamFunctionDelta carries incremental name and arguments fragments.
+type streamFunctionDelta struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+}

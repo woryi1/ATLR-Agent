@@ -1,0 +1,165 @@
+---
+title: 定时任务
+description: 按计划自动触发的 agent prompt，由 octo serve 负责跑。
+---
+
+cron 任务是一个按计划自动触发的 agent prompt——"每 5 分钟查一次队列"、"每天早上 9 点写一份
+日报"——只要 `octo serve` 在跑，没人盯着它也会自己触发。
+
+```bash
+octo serve
+```
+
+## 工作原理
+
+每个任务是 `~/.octo/tasks/` 下的一个 JSON 文件，由 `octo serve` 内部的调度器加载。任务触发时，
+调度器会用任务的 prompt 跑一轮 agent。每次运行都有一个 **30 分钟的墙钟超时**——唯一的硬上限。
+
+**任务只有在 `octo serve` 跑着的时候才会触发。** 没有 serve 就没有运行——服务器关着期间错过
+的那次计划，重启后也不会补跑。
+
+## 任务字段
+
+| 字段 | 是否必填 | 含义 |
+|---|---|---|
+| `name` | 是 | 人类可读的任务名 |
+| `cron` | 是 | 调度表达式——见下文 |
+| `prompt` | 是 | 每次运行发给 agent 的 prompt |
+| `model` | 否 | 模型覆盖；不填就用 server 的默认模型 |
+| `agent_id` | 否 | 运行时使用的专家 id；留空 = Default Agent |
+| `directory` | 否 | 运行时所在的工作目录 |
+| `notify` | 否 | 每次运行的最终回复（或失败信息）要推送到哪些 IM 会话 |
+| `permission_mode` | 是 | 运行中遇到需要审批的工具调用怎么处理：`auto` 直接放行，`strict` 直接拒绝。两种模式下 deny 规则都照样生效。运行时没人在场，所以永远不会弹审批。这个字段出现之前建的任务，全局 `permission_mode` 是 `strict` 的补成 `strict`，否则补成 `auto` |
+| `enabled` | 是 | 这个计划当前是否处于启用状态 |
+
+这个 prompt 是在自己独立的会话里跑的，拿不到创建这个任务的那个对话的任何上下文，所以它必须
+自成一体：做什么、在哪做、输出该长什么样都要写清楚。也要给它一个明确的停止条件——一个开放式
+的 prompt 会让模型一直反复确认下去，直到撞上 30 分钟超时，而不是"没什么可汇报的"就自己收尾。
+
+## 会话，以及一任务一项目
+
+每次运行都会**新建一个会话**，标题就是这次运行的本地日期和时间（如 `2026-07-22 15:04`），
+从空白记录开始——各次运行之间从不共享会话。
+
+每个任务还会自动拥有**自己的项目**，以任务名命名，工作目录是 `<workspace_dir>/<任务名>`
+（默认就是 `~/Octo/每日播报` 这样），首次需要时创建。任务的每次运行都在那里跑工具；又因为记忆是
+按项目划分作用域的，这个任务自己的笔记也积累在那里，和机器上其他任务互不干扰。想指到别处，
+在任务上设 `directory`。
+
+目录在创建时由任务名派生一次，之后就属于这个项目：**改任务名只改项目名，不动目录。**
+搬目录要么把任务已经写下的东西留在原地，要么得整体搬走，而改名的人要的都不是这个。
+
+这个项目和别的项目一样出现在侧边栏「项目」区，带一个小时钟标记，可以改名、配置、删除。
+删掉它，运行产生的会话作为普通任务留在磁盘上；下次运行会重新建出这个项目。
+
+## cron 表达式——6 个字段，秒在最前面
+
+调度器用的是 [robfig/cron](https://github.com/robfig/cron)，**带一个秒字段**——标准的 5 字段
+crontab 写法在这里是非法的，永远要在最前面加一个秒字段：
+
+```
+seconds minutes hours day-of-month month day-of-week
+```
+
+| 想要 | 表达式 |
+|---|---|
+| 每天 09:00 | `0 0 9 * * *` |
+| 每 30 分钟 | `0 */30 * * * *` |
+| 工作日 18:30 | `0 30 18 * * 1-5` |
+| 每月 1 号 08:00 | `0 0 8 1 * *` |
+
+也支持描述符写法：`@hourly`、`@daily`、`@weekly`、`@every 90m`。时间用的是 server 所在的
+本地时区。
+
+## 在 Web UI 中编辑任务
+
+在调度器面板里点任务的编辑按钮。新会话会直接给出一张预填了当前值的编辑表单：名称、
+cron 表达式（附一句大白话说明是什么时间）、prompt、模型、工作目录、是否启用。
+
+- 直接改想改的字段，点保存，改动立即生效。cron 写错或者间隔不到 1 小时会被拒绝，
+  不会保存。
+- 或者在表单最下面的输入框里用一句话描述想怎么改（例如"改到工作日早上 8 点"），
+  由 agent 替你调整。通知目标、任务使用的专家也通过这里修改。
+
+内容过长的字段（例如很长的 prompt）不会放进表单，以免被截断，这类改动通过最下面的
+输入框描述即可。
+
+## 通过 API 管理任务
+
+只要 `octo serve` 在跑，所有走 API 的改动都会立刻让正在运行的进程重新调度——这是推荐路径。
+
+```bash
+# 创建——返回 {"id":"task_..."}。任何可选字段（directory、model、
+# agent、notify）都可以直接放进创建时的请求体里。
+curl -s -X POST http://127.0.0.1:8088/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"daily-report","cron":"0 0 9 * * *","prompt":"Summarize ...","permission_mode":"auto","directory":"/srv/repo"}'
+
+curl -s http://127.0.0.1:8088/api/tasks                # 列表
+curl -s -X DELETE http://127.0.0.1:8088/api/tasks/{id} # 删除
+
+# 立即跑一次，跳出计划
+curl -s -X POST http://127.0.0.1:8088/api/tasks/{id}/run
+
+# 改任意一部分字段——启用/禁用也是走这条路
+curl -s -X PATCH http://127.0.0.1:8088/api/tasks/{id} \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"new prompt ...","enabled":false}'
+```
+
+`PATCH /api/tasks/{id}` 接受 `name`、`enabled`、`cron`、`prompt`、`model`、`agent_id`、
+`directory`、`notify`、`permission_mode`——只发你要改的那部分就行；用 `name` 改名也会同步重命名任务的项目（目录不动）。Web UI 里的调度器面板就是这套 API 的一个
+客户端，所以用 `curl` 创建的任务会出现在面板里，反过来也一样；面板也是**试跑一个新任务的
+`Run` 按钮**推荐用的地方，而不是从聊天会话里直接触发 `/api/tasks/{id}/run`——一次运行是在这
+个任务**自己的**会话里跑一整轮 agent（最多 30 分钟），从对话里触发只会把那个对话卡住，而真
+正的输出落在了没人看着的地方。
+
+### 没有运行中的 server 时
+
+直接写 `~/.octo/tasks/<id>.json`（`id` 格式是 `task_<unix-millis>`；文件名必须等于
+`<id>.json`）：
+
+```json
+{
+  "id": "task_1717999999999",
+  "name": "daily-report",
+  "cron": "0 0 9 * * *",
+  "prompt": "Summarize ...",
+  "directory": "/srv/repo",
+  "permission_mode": "auto",
+  "enabled": true,
+  "created_at": "2026-06-10T09:00:00Z"
+}
+```
+
+这个文件会在 `octo serve` 下次启动时被读取。手写的文件如果 cron 表达式写错了，加载时会
+静默失败（只会打到 stderr）。**server 已经在跑的时候，对文件的修改会被忽略，直到重启为止**——
+一旦起来了，就应该改走 API。
+
+## 保存任务采集的数据
+
+每次运行都会采集点东西的任务，比如一个价格、一个计数、几条新内容，可以用 `sqlite` 工具把结果追加进一个
+**具名数据库**（`~/.octo/databases/<name>.db` 这个 SQLite 文件，第一次写入时自动创建）。[轻应用](/docs/zh/guides/light-apps/)
+按库名读同一个库、画成图表；任务本身不需要知道是哪个应用在展示这些数据。
+
+如果这个任务每次运行都不需要判断，比如抓一个网页、解析、写入几行，可以让 Agent 把它写成脚本，交给操作系统的定时任务
+（cron、launchd、Windows 任务计划程序）去跑。这样每次运行不消耗 token，octo 没开着也照样执行。脚本写的是同一个库，
+Agent 会让它把每次运行记进一张 `runs` 表，轻应用就能显示上次什么时候跑的、有没有失败。操作系统的定时任务出错时不会有任何提示，
+这张表就是唯一能看到的地方。
+
+## 通知
+
+`notify` 是一个 IM 目标的列表（单个裸对象也接受）；每一条都会在运行成功后收到最终回复，
+或者在出错时收到一条简短的失败提示。推送失败会记在 server 端日志里，但不会影响这次运行本身。
+
+| 平台 | `chat_id` | 说明 |
+|---|---|---|
+| `feishu` | `oc_…` chat id | 需要在 `channels.yml` 里配好应用凭证；id 可以从会话设置里拿，或者给 bot 发条消息后去看 server 日志 |
+| `dingtalk` | 单聊用 staff id，群聊用 `cid…` conversation id | 单聊的 conversation id 用不了——要用 staff id |
+| `weixin`（iLink） | user id | 用户必须至少给 bot 发过一次消息 |
+| `telegram` | chat id（用户/群组/频道） | bot 必须已经能给它发消息 |
+| `discord` | channel id | bot 需要有那个频道的 Send Messages 权限 |
+| `wecom` | 忽略 | 推送走的是绑定到某个群的群机器人 webhook，而不是这个字段 |
+
+下一步：如果只是想要一个更短生命周期、不需要扛过重启的会话内重复任务，看看
+[`/loop`](/docs/zh/guides/loop/)。

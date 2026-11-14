@@ -1,0 +1,237 @@
+package skills
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// TestMain neutralizes the default-skills root for the whole package so tests
+// never read the real ~/.octo/skills-default (which an installed binary
+// populates). Tests that exercise defaults opt in via useDefaultRoot.
+func TestMain(m *testing.M) {
+	tmp, _ := os.MkdirTemp("", "octo-skills-default-empty")
+	defaultSkillsRoot = func() string { return tmp }
+	// Redirected for the same reason: MaterializeDefaults writes both roots,
+	// and a test must never touch the real ~/.octo.
+	tmpExpert, _ := os.MkdirTemp("", "octo-skills-expert-empty")
+	expertSkillsRoot = func() string { return tmpExpert }
+	code := m.Run()
+	if tmp != "" {
+		_ = os.RemoveAll(tmp)
+	}
+	if tmpExpert != "" {
+		_ = os.RemoveAll(tmpExpert)
+	}
+	os.Exit(code)
+}
+
+// useDefaultRoot points defaultSkillsRoot at dir for the test's duration.
+func useDefaultRoot(t *testing.T, dir string) {
+	t.Helper()
+	orig := defaultSkillsRoot
+	defaultSkillsRoot = func() string { return dir }
+	t.Cleanup(func() { defaultSkillsRoot = orig })
+}
+
+// useExpertRoot points expertSkillsRoot at dir for the test's duration.
+func useExpertRoot(t *testing.T, dir string) {
+	t.Helper()
+	orig := expertSkillsRoot
+	expertSkillsRoot = func() string { return dir }
+	t.Cleanup(func() { expertSkillsRoot = orig })
+}
+
+func TestMaterializeDefaults_WritesEmbeddedAndStamps(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "skills-default")
+	useDefaultRoot(t, root)
+	useExpertRoot(t, t.TempDir())
+
+	if err := MaterializeDefaults("v1"); err != nil {
+		t.Fatalf("MaterializeDefaults: %v", err)
+	}
+	// The shipped worktree-isolate skill must land on disk.
+	if _, err := os.Stat(filepath.Join(root, "worktree-isolate", "SKILL.md")); err != nil {
+		t.Fatalf("expected worktree-isolate/SKILL.md materialized: %v", err)
+	}
+	// The implement skill ships in the default set.
+	if _, err := os.Stat(filepath.Join(root, "implement", "SKILL.md")); err != nil {
+		t.Fatalf("expected implement/SKILL.md materialized: %v", err)
+	}
+	// The workflow-creator skill ships in the default set.
+	// The office-xlsx skill ships in the default set.
+	if _, err := os.Stat(filepath.Join(root, "office-xlsx", "SKILL.md")); err != nil {
+		t.Fatalf("expected office-xlsx/SKILL.md materialized: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "workflow-creator", "SKILL.md")); err != nil {
+		t.Fatalf("expected workflow-creator/SKILL.md materialized: %v", err)
+	}
+	// ppt-master ships with a bundled Python engine — SKILL.md and a nested
+	// script must both materialize.
+	for _, f := range []string{"SKILL.md", filepath.Join("scripts", "project_manager.py")} {
+		if _, err := os.Stat(filepath.Join(root, "ppt-master", f)); err != nil {
+			t.Fatalf("expected ppt-master/%s materialized: %v", f, err)
+		}
+	}
+	// image-gen (the image-acquisition capability split out of ppt-master)
+	// ships as its own default skill.
+	for _, f := range []string{"SKILL.md", filepath.Join("scripts", "image_gen.py")} {
+		if _, err := os.Stat(filepath.Join(root, "image-gen", f)); err != nil {
+			t.Fatalf("expected image-gen/%s materialized: %v", f, err)
+		}
+	}
+	// code-review bundles a companion template — both files must materialize.
+	for _, f := range []string{"SKILL.md", "code-reviewer.md"} {
+		if _, err := os.Stat(filepath.Join(root, "code-review", f)); err != nil {
+			t.Fatalf("expected code-review/%s materialized: %v", f, err)
+		}
+	}
+	// Stamp records the version.
+	b, err := os.ReadFile(filepath.Join(root, defaultStampFile))
+	if err != nil || string(b) != "v1" {
+		t.Fatalf("stamp = %q, %v; want v1", string(b), err)
+	}
+}
+
+func TestMaterializeDefaults_NoOpWhenCurrent(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "skills-default")
+	useDefaultRoot(t, root)
+	useExpertRoot(t, t.TempDir())
+	if err := MaterializeDefaults("v1"); err != nil {
+		t.Fatal(err)
+	}
+	// Drop a sentinel; a no-op (same version) must not wipe the dir.
+	sentinel := filepath.Join(root, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := MaterializeDefaults("v1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Errorf("same-version call should be a no-op, but the dir was rewritten")
+	}
+
+	// A version bump (or UpdateDefaults force) re-materializes, wiping stale files.
+	if err := MaterializeDefaults("v2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Errorf("version bump should wipe-and-rewrite the default root")
+	}
+}
+
+func TestMaterializeDefaults_UnderscorePrefixedFilesShip(t *testing.T) {
+	// Regression: a plain //go:embed defaults silently skips files whose
+	// names start with "." or "_", which used to drop Python package markers
+	// (__init__.py), underscore-prefixed modules (_dispatcher.py, _batch.py,
+	// _conversion_profile.py), and the _index.md catalogs several skills'
+	// instructions read — all absent from the binary even though they exist
+	// in the repo tree. The all: prefix must include them.
+	root := filepath.Join(t.TempDir(), "skills-default")
+	useDefaultRoot(t, root)
+	useExpertRoot(t, t.TempDir())
+	if err := MaterializeDefaults("v1"); err != nil {
+		t.Fatalf("MaterializeDefaults: %v", err)
+	}
+
+	want := []string{
+		filepath.Join("ppt-master", "scripts", "source_to_md", "_dispatcher.py"),
+		filepath.Join("ppt-master", "scripts", "source_to_md", "_conversion_profile.py"),
+		filepath.Join("ppt-master", "scripts", "source_to_md", "_batch.py"),
+		filepath.Join("ppt-master", "scripts", "svg_to_pptx", "native_objects", "__init__.py"),
+		filepath.Join("ppt-master", "references", "modes", "_index.md"),
+		filepath.Join("ppt-master", "references", "visual-styles", "_index.md"),
+		filepath.Join("image-gen", "references", "image-palettes", "_index.md"),
+		filepath.Join("image-gen", "scripts", "image_backends", "__init__.py"),
+	}
+	for _, f := range want {
+		if _, err := os.Stat(filepath.Join(root, f)); err != nil {
+			t.Errorf("expected %s materialized (was it embedded?): %v", f, err)
+		}
+	}
+}
+
+func TestMaterializeDefaults_RescuesLegacySitePatterns(t *testing.T) {
+	// Earlier web-access versions had the agent write per-domain
+	// site-experience notes inside the managed default root, which the
+	// version-bump wipe destroyed. The rewrite must move them to the
+	// persistent sibling ~/.octo/site-patterns first.
+	octoDir := t.TempDir()
+	root := filepath.Join(octoDir, "skills-default")
+	useDefaultRoot(t, root)
+	useExpertRoot(t, t.TempDir())
+	if err := MaterializeDefaults("v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := filepath.Join(root, "web-access", "references", "site-patterns")
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(legacy, "example.com.md"), "legacy notes")
+	mustWrite(t, filepath.Join(legacy, "stale.com.md"), "older notes")
+
+	// A file already in the persistent directory wins over the legacy copy.
+	dest := filepath.Join(octoDir, "site-patterns")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(dest, "stale.com.md"), "current notes")
+
+	if err := MaterializeDefaults("v2"); err != nil {
+		t.Fatal(err)
+	}
+
+	if b, err := os.ReadFile(filepath.Join(dest, "example.com.md")); err != nil || string(b) != "legacy notes" {
+		t.Errorf("example.com.md = %q, %v; want rescued legacy notes", string(b), err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dest, "stale.com.md")); err != nil || string(b) != "current notes" {
+		t.Errorf("stale.com.md = %q, %v; want the persistent copy kept", string(b), err)
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Errorf("legacy site-patterns dir should be gone after the rewrite")
+	}
+}
+
+func TestDiscover_DefaultSkillSurfacesAndIsOverridable(t *testing.T) {
+	defaultRoot := filepath.Join(t.TempDir(), "skills-default")
+	useDefaultRoot(t, defaultRoot)
+	useExpertRoot(t, t.TempDir())
+	if err := MaterializeDefaults("v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	userRoot := t.TempDir()
+	useUserRoot(t, userRoot)
+
+	// Default-only: worktree-isolate is discovered with source "default".
+	reg := Discover()
+	s, ok := reg.Get("worktree-isolate")
+	if !ok {
+		t.Fatal("default worktree-isolate not discovered")
+	}
+	if s.Source != "default" {
+		t.Errorf("source = %q, want default", s.Source)
+	}
+
+	// A user skill of the same name overrides the default.
+	dir := filepath.Join(userRoot, "worktree-isolate")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(dir, "SKILL.md"), "---\nname: worktree-isolate\ndescription: my override\n---\nbody")
+
+	reg = Discover()
+	s, _ = reg.Get("worktree-isolate")
+	if s.Source != "user" || s.Description != "my override" {
+		t.Errorf("user skill should override default, got source=%q desc=%q", s.Source, s.Description)
+	}
+}
+
+func mustWrite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
