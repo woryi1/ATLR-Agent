@@ -20,6 +20,11 @@
   import { confirmDialog } from '../../lib/confirm'
   import { ago, clockTick } from '../../lib/relTime'
   import * as api from '../../lib/api'
+  import {
+    backupSections, exportBackup, previewBackup, applyBackup, openBackupFolder,
+    isBackupFile, formatBytes,
+    type BackupSection, type BackupSummary, type ExportResult, type ApplyResult,
+  } from '../../lib/backup'
 
   const LICENSE_URL = 'https://github.com/open-octo/octo-agent/blob/main/LICENSE.txt'
   const RELEASES_URL = 'https://github.com/open-octo/octo-agent/releases'
@@ -86,7 +91,7 @@
   // files). Reset whenever the category (or the whole modal) changes, so
   // leaving and returning to 数据管理 always lands on the list, not wherever
   // you left off.
-  let dataSubView = $state<'none' | 'archived' | 'trash' | 'memory' | 'profiles'>('none')
+  let dataSubView = $state<'none' | 'archived' | 'trash' | 'memory' | 'profiles' | 'backup'>('none')
   let archiveSearch = $state('')
   // '' = every project, 'none' = no project, else a project's group id.
   let archiveProjectFilter = $state('')
@@ -97,6 +102,122 @@
     archiveSearch = ''
     archiveProjectFilter = ''
     archiveSel = {}
+  }
+
+  // ── 数据备份 / 恢复 ──────────────────────────────────────────────────────
+  // The password lives only in these variables and in the request body; it is
+  // cleared after use and never written anywhere.
+  let backupCatalog = $state<BackupSection[]>([])
+  let backupMode = $state<'export' | 'import'>('export')
+  let exportSel = $state<Record<string, boolean>>({ user: true, records: true, tools: true, work: false })
+  let exportPwd = $state('')
+  let exportPwd2 = $state('')
+  let exportBusy = $state(false)
+  let exportDone = $state<ExportResult | null>(null)
+  let importFile = $state<File | null>(null)
+  let importPwd = $state('')
+  let importBusy = $state(false)
+  let importSummary = $state<BackupSummary | null>(null)
+  let importSel = $state<Record<string, boolean>>({})
+  let importDone = $state<ApplyResult | null>(null)
+  let importError = $state('')
+  let dropActive = $state(false)
+  let backupLoaded = false
+  let backupInput = $state<HTMLInputElement | null>(null)
+
+  async function loadBackupCatalog(): Promise<void> {
+    if (backupLoaded) return
+    try {
+      backupCatalog = await backupSections()
+      backupLoaded = true
+    } catch {
+      // Keep the panel usable if the sections call fails.
+      backupCatalog = [
+        { id: 'user', label: '设置与凭据', hint: 'API Key、模型配置、登录态、主题、上传附件' },
+        { id: 'records', label: '会话与记忆', hint: '聊天记录、项目记忆、定时任务、工作流日志' },
+        { id: 'tools', label: '技能与智能体', hint: '技能、子智能体、MCP 配置与令牌' },
+        { id: 'work', label: '工作目录', hint: 'Work 下的项目文件，可能很大' },
+      ]
+    }
+  }
+
+  function sectionLabel(id: string): string {
+    return backupCatalog.find(s => s.id === id)?.label ?? id
+  }
+
+  async function runExport(): Promise<void> {
+    const ids = Object.keys(exportSel).filter(id => exportSel[id])
+    if (ids.length === 0) { showToast('至少选择一项要导出的数据', 'error'); return }
+    if (exportPwd.length < 6) { showToast('密码至少 6 位', 'error'); return }
+    if (exportPwd !== exportPwd2) { showToast('两次输入的密码不一致', 'error'); return }
+    exportBusy = true
+    exportDone = null
+    try {
+      exportDone = await exportBackup(ids, exportPwd)
+      exportPwd = ''
+      exportPwd2 = ''
+      showToast('加密备份已导出', 'success')
+    } catch (e: any) {
+      showToast(e?.message || '导出失败', 'error')
+    } finally {
+      exportBusy = false
+    }
+  }
+
+  /** Accept a picked or dropped package and jump straight to the import form. */
+  function acceptPackage(file: File | null | undefined): void {
+    if (!file) return
+    if (!isBackupFile(file)) { showToast('这不是 ATLR 备份包（.atlrbak）', 'error'); return }
+    importFile = file
+    importPwd = ''
+    importSummary = null
+    importDone = null
+    importError = ''
+    backupMode = 'import'
+    cat = 'data'
+    dataSubView = 'backup'
+    void loadBackupCatalog()
+  }
+
+  async function runPreview(): Promise<void> {
+    if (!importFile) { showToast('请选择备份包', 'error'); return }
+    if (!importPwd) { showToast('请输入备份密码', 'error'); return }
+    importBusy = true
+    importError = ''
+    try {
+      const sum = await previewBackup(importFile, importPwd)
+      importSummary = sum
+      const sel: Record<string, boolean> = {}
+      for (const id of sum.restorable ?? []) sel[id] = true
+      importSel = sel
+    } catch (e: any) {
+      importSummary = null
+      importError = e?.message || '解析失败'
+    } finally {
+      importBusy = false
+    }
+  }
+
+  async function runImport(): Promise<void> {
+    if (!importFile || !importSummary) return
+    const ids = Object.keys(importSel).filter(id => importSel[id])
+    if (ids.length === 0) { showToast('至少选择一项要恢复的数据', 'error'); return }
+    if (!(await confirmDialog('导入会覆盖所选数据；现有数据会先备份到 Cache\\pre-restore-*。继续吗？'))) return
+    importBusy = true
+    try {
+      importDone = await applyBackup(importFile, importPwd, ids)
+      showToast('数据已恢复，请重启程序生效', 'success')
+    } catch (e: any) {
+      showToast(e?.message || '恢复失败', 'error')
+    } finally {
+      importBusy = false
+    }
+  }
+
+  function onBackupDrop(e: DragEvent): void {
+    e.preventDefault()
+    dropActive = false
+    acceptPackage(e.dataTransfer?.files?.[0])
   }
 
   const archivedSessions = $derived($sessions.filter(s => $collapsedSessions.includes(s.id)))
@@ -482,6 +603,9 @@
     aria-modal="true"
     tabindex="-1"
     onclick={(e) => e.stopPropagation()}
+    ondragover={(e) => { e.preventDefault(); dropActive = true }}
+    ondragleave={() => (dropActive = false)}
+    ondrop={onBackupDrop}
     onkeydown={(e) => { if (e.key === 'Escape') { e.preventDefault(); close() } }}
   >
     <div class="modal-header">
@@ -490,6 +614,12 @@
         <iconify-icon icon="ant-design:close-outlined" width="14"></iconify-icon>
       </button>
     </div>
+    {#if dropActive}
+      <div class="backup-drop-overlay">
+        <iconify-icon icon="lucide:package-open" width="34"></iconify-icon>
+        <span>松开以导入备份包</span>
+      </div>
+    {/if}
 
     <div class="modal-body">
       <div class="rail">
@@ -739,6 +869,13 @@
                  needs recovering. -->
             <div class="data-row">
               <div class="data-row-main">
+                <iconify-icon icon="lucide:package-open" width="15"></iconify-icon>
+                <span class="setl">数据备份</span>
+              </div>
+              <button class="link-btn" onclick={() => { dataSubView = 'backup'; void loadBackupCatalog() }}>{$t('settings.data.manage')}</button>
+            </div>
+            <div class="data-row">
+              <div class="data-row-main">
                 <iconify-icon icon="ant-design:user-outlined" width="15"></iconify-icon>
                 <span class="setl">{$t('nav.memory')}</span>
               </div>
@@ -772,10 +909,112 @@
                 <iconify-icon icon="ant-design:left-outlined" width="14"></iconify-icon>
               </button>
               <span class="data-subtitle">
-                {dataSubView === 'archived' ? $t('settings.data.archived') : dataSubView === 'memory' ? $t('nav.memory') : dataSubView === 'profiles' ? $t('settings.profiles.title') : $t('nav.file_recall')}
+                {dataSubView === 'backup' ? '数据备份' : dataSubView === 'archived' ? $t('settings.data.archived') : dataSubView === 'memory' ? $t('nav.memory') : dataSubView === 'profiles' ? $t('settings.profiles.title') : $t('nav.file_recall')}
               </span>
             </div>
-            {#if dataSubView === 'archived'}
+            {#if dataSubView === 'backup'}
+              <div class="backup-panel">
+                <div class="backup-tabs">
+                  <button class:on={backupMode === 'export'} onclick={() => { backupMode = 'export'; void loadBackupCatalog() }}>导出数据</button>
+                  <button class:on={backupMode === 'import'} onclick={() => { backupMode = 'import'; void loadBackupCatalog() }}>导入数据</button>
+                </div>
+
+                {#if backupMode === 'export'}
+                  <p class="backup-note">备份包使用你输入的密码加密（AES-256-GCM），密码不会被保存，忘记就无法恢复。</p>
+                  <div class="backup-sections">
+                    {#each backupCatalog as s (s.id)}
+                      <label class="backup-check">
+                        <input
+                          type="checkbox"
+                          checked={exportSel[s.id] ?? false}
+                          onchange={(e) => (exportSel[s.id] = e.currentTarget.checked)}
+                        />
+                        <span><b>{s.label}</b><em>{s.hint}</em></span>
+                      </label>
+                    {/each}
+                  </div>
+                  <div class="backup-fields">
+                    <input class="sinput" type="password" placeholder="设置密码（至少 6 位）" bind:value={exportPwd} />
+                    <input class="sinput" type="password" placeholder="再输入一次密码" bind:value={exportPwd2} />
+                  </div>
+                  <div class="backup-actions">
+                    <button class="link-btn" disabled={exportBusy} onclick={runExport}>
+                      {exportBusy ? '正在打包…' : '加密导出'}
+                    </button>
+                  </div>
+                  {#if exportDone}
+                    <div class="backup-result">
+                      <div>已导出：{exportDone.name}</div>
+                      <div class="backup-dim">{exportDone.files} 个文件 · {formatBytes(exportDone.size)}</div>
+                      <div class="backup-dim backup-path">{exportDone.path}</div>
+                      <button class="link-btn" onclick={() => void openBackupFolder(exportDone?.path)}>打开文件夹</button>
+                    </div>
+                  {/if}
+                {:else}
+                  <input
+                    bind:this={backupInput}
+                    type="file"
+                    accept=".atlrbak"
+                    style="display:none"
+                    onchange={(e) => { acceptPackage(e.currentTarget.files?.[0]); e.currentTarget.value = '' }}
+                  />
+                  <div
+                    class="backup-drop"
+                    role="button"
+                    tabindex="0"
+                    onclick={() => backupInput?.click()}
+                    onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') backupInput?.click() }}
+                  >
+                    <iconify-icon icon="lucide:package-open" width="22"></iconify-icon>
+                    <div class="backup-drop-title">{importFile ? importFile.name : '拖入 .atlrbak 备份包，或点击选择'}</div>
+                    <div class="backup-dim">{importFile ? formatBytes(importFile.size) : '密码只用于解密，不会保存在任何地方'}</div>
+                  </div>
+                  {#if importFile}
+                    <div class="backup-fields">
+                      <input class="sinput" type="password" placeholder="备份密码" bind:value={importPwd} />
+                    </div>
+                    <div class="backup-actions">
+                      <button class="link-btn" disabled={importBusy} onclick={runPreview}>
+                        {importBusy ? '正在解析…' : '解析备份包'}
+                      </button>
+                    </div>
+                    {#if importError}<div class="backup-error">{importError}</div>{/if}
+                    {#if importSummary}
+                      <div class="backup-summary">
+                        <div>备份时间：{new Date(importSummary.created_at).toLocaleString()} · {importSummary.app || 'ATLR-Agent'}</div>
+                        <div class="backup-dim">{importSummary.files} 个文件 · {formatBytes(importSummary.bytes)}</div>
+                        <div class="backup-sections">
+                          {#each importSummary.restorable as id (id)}
+                            <label class="backup-check">
+                              <input
+                                type="checkbox"
+                                checked={importSel[id] ?? true}
+                                onchange={(e) => (importSel[id] = e.currentTarget.checked)}
+                              />
+                              <span><b>{sectionLabel(id)}</b></span>
+                            </label>
+                          {/each}
+                        </div>
+                        <p class="backup-note">导入会覆盖所选数据；现有内容会先移到 Cache\pre-restore-时间。完成后需要重启程序。</p>
+                        <div class="backup-actions">
+                          <button class="link-btn" disabled={importBusy} onclick={runImport}>
+                            {importBusy ? '正在恢复…' : '开始恢复'}
+                          </button>
+                        </div>
+                      </div>
+                    {/if}
+                    {#if importDone}
+                      <div class="backup-result">
+                        <div>已恢复：{importDone.sections.map(sectionLabel).join('、')}</div>
+                        <div class="backup-dim">{importDone.files} 个文件</div>
+                        <div class="backup-dim backup-path">旧数据已备份到：{importDone.backup_dir}</div>
+                        <button class="link-btn" onclick={() => void openBackupFolder(importDone?.backup_dir)}>打开备份目录</button>
+                      </div>
+                    {/if}
+                  {/if}
+                {/if}
+              </div>
+            {:else if dataSubView === 'archived'}
               {#if archivedSessions.length === 0}
                 <div class="data-empty">{$t('settings.data.archived_empty')}</div>
               {:else}
@@ -887,12 +1126,55 @@
      different content lengths (关于 vs 端点) never resizes the modal itself
      — each pane scrolls internally instead. */
   width: 100%; max-width: 760px; height: calc(78vh / var(--font-zoom));
+  position: relative;
   background: var(--bg-container); border: 1px solid var(--border); border-radius: var(--radius-card);
   box-shadow: 0 24px 48px rgba(15,23,42,0.18);
   display: flex; flex-direction: column; overflow: hidden;
   animation: octo-fadein 0.16s ease;
 }
 .modal:focus { outline: none; }
+
+/* ── 数据备份 ─────────────────────────────────────────────────────────── */
+.backup-panel { display: flex; flex-direction: column; gap: 12px; padding: 2px 2px 10px; }
+.backup-tabs { display: flex; gap: 6px; }
+.backup-tabs button {
+  border: none; background: transparent; cursor: pointer; font-size: 12.5px;
+  padding: 6px 12px; border-radius: 8px; color: var(--text-tertiary);
+}
+.backup-tabs button:hover { background: var(--hover-neutral); color: var(--text); }
+.backup-tabs button.on { background: var(--hover-neutral); color: var(--text); font-weight: 600; }
+.backup-note { margin: 0; font-size: 12px; line-height: 1.65; color: var(--text-tertiary); }
+.backup-sections { display: flex; flex-direction: column; gap: 9px; }
+.backup-check { display: flex; align-items: flex-start; gap: 9px; font-size: 13px; color: var(--text); cursor: pointer; }
+.backup-check input { margin: 3px 0 0; accent-color: var(--blue-6); }
+.backup-check b { font-weight: 600; }
+.backup-check em { display: block; margin-top: 2px; font-style: normal; font-size: 11.5px; color: var(--text-quaternary); }
+.backup-fields { display: flex; gap: 8px; flex-wrap: wrap; }
+.backup-fields .sinput { flex: 1; min-width: 170px; }
+.backup-actions { display: flex; gap: 10px; }
+.backup-actions .link-btn[disabled] { opacity: 0.55; pointer-events: none; }
+.backup-result, .backup-summary {
+  display: flex; flex-direction: column; gap: 8px; padding: 12px;
+  border: 1px solid var(--border-secondary); border-radius: 10px; font-size: 12.5px;
+}
+.backup-dim { font-size: 11.5px; color: var(--text-tertiary); }
+.backup-path { word-break: break-all; }
+.backup-error { font-size: 12px; color: #d4380d; }
+.backup-drop {
+  display: flex; flex-direction: column; align-items: center; gap: 7px;
+  padding: 22px 14px; border: 1px dashed var(--border-secondary); border-radius: 12px;
+  color: var(--text-tertiary); cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.backup-drop:hover { border-color: var(--blue-6); background: var(--hover-neutral); }
+.backup-drop-title { font-size: 13px; color: var(--text); text-align: center; word-break: break-all; }
+.backup-drop-overlay {
+  position: absolute; inset: 0; z-index: 5; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 10px; border-radius: inherit;
+  border: 2px dashed var(--blue-6); color: var(--blue-6); font-size: 14px;
+  background: color-mix(in srgb, var(--bg-container) 84%, transparent);
+  pointer-events: none;
+}
 .modal-header {
   display: flex; align-items: center; justify-content: space-between; flex: 0 0 auto;
   padding: 16px 20px; border-bottom: 1px solid var(--border);

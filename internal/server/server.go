@@ -1007,6 +1007,12 @@ func (s *Server) registerRoutes() {
 	s.api("PUT /api/config/coauthor", s.handlePutCoauthor)
 	s.api("PUT /api/config/language", s.handlePutLanguage)
 	s.api("PUT /api/config/workspace_dir", s.handlePutWorkspaceDir)
+	// Encrypted data backup / restore (Settings → 数据管理 → 数据备份).
+	s.api("GET /api/data/backup/sections", s.handleBackupSections)
+	s.api("POST /api/data/backup/export", s.handleBackupExport)
+	s.api("POST /api/data/backup/preview", s.handleBackupPreview)
+	s.api("POST /api/data/backup/apply", s.handleBackupApply)
+	s.api("POST /api/data/backup/open", s.handleBackupOpen)
 	s.api("PUT /api/config/reasoning_effort", s.handlePutReasoningEffort)
 	s.api("PUT /api/config/permission_mode", s.handlePutPermissionMode)
 	s.api("POST /api/config/test", s.handleTestConfig)
