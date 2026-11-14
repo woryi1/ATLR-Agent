@@ -17,6 +17,10 @@ func tempHome(t *testing.T) string {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
+	// The data root is anchored to the directory holding the executable, which
+	// for a test binary is the go-build temp dir. Pin it to the test's own
+	// directory so every case gets an isolated Data / Data-work tree.
+	t.Setenv(datahome.PortableRootEnv, home)
 	t.Setenv(datahome.ProfileEnv, "")
 	return home
 }
@@ -24,16 +28,24 @@ func tempHome(t *testing.T) string {
 // The remembered choice has to live outside every profile root — a file that
 // says which profile to open cannot be inside the profile it selects.
 func TestDesktopProfileFileIsMachineScoped(t *testing.T) {
-	home := tempHome(t)
+	tempHome(t)
 	t.Setenv(datahome.ProfileEnv, "work")
 	if err := writeDesktopProfile("work"); err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(home, ".octo", desktopProfileFile)
+	shared, err := datahome.DirFor("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(shared, desktopProfileFile)
 	if _, err := os.Stat(want); err != nil {
 		t.Errorf("choice should be recorded at %s: %v", want, err)
 	}
-	if _, err := os.Stat(filepath.Join(home, ".octo-work", desktopProfileFile)); err == nil {
+	workRoot, err := datahome.DirFor("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(workRoot, desktopProfileFile)); err == nil {
 		t.Error("choice must not be written inside the profile it selects")
 	}
 }
@@ -72,11 +84,15 @@ func TestSelectDesktopProfile_FlagWinsAndIsNotPersisted(t *testing.T) {
 // A profile the user deleted must not stop the app from coming up — the tray is
 // where they'd pick another one.
 func TestSelectDesktopProfile_UnreadableChoiceFallsBackToDefault(t *testing.T) {
-	home := tempHome(t)
-	if err := os.MkdirAll(filepath.Join(home, ".octo"), 0o755); err != nil {
+	tempHome(t)
+	root, err := datahome.DirFor("")
+	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(home, ".octo", desktopProfileFile)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, desktopProfileFile)
 	if err := os.WriteFile(path, []byte("../escape\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -121,8 +137,12 @@ func TestAddProfileRow(t *testing.T) {
 	bridge := &nativeBridge{}
 
 	t.Run("lone default profile adds nothing", func(t *testing.T) {
-		home := tempHome(t)
-		os.MkdirAll(filepath.Join(home, ".octo"), 0o755)
+		tempHome(t)
+		root, err := datahome.DirFor("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.MkdirAll(root, 0o755)
 		m := application.NewMenu()
 		addProfileRow(m, bridge)
 		if n := countItems(m); n != 0 {
@@ -131,8 +151,12 @@ func TestAddProfileRow(t *testing.T) {
 	})
 
 	t.Run("named profile with nothing to switch to is a disabled line", func(t *testing.T) {
-		home := tempHome(t)
-		os.MkdirAll(filepath.Join(home, ".octo-work"), 0o755)
+		tempHome(t)
+		workRoot, err := datahome.DirFor("work")
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.MkdirAll(workRoot, 0o755)
 		t.Setenv(datahome.ProfileEnv, "work")
 		m := application.NewMenu()
 		addProfileRow(m, bridge)
@@ -149,9 +173,17 @@ func TestAddProfileRow(t *testing.T) {
 	})
 
 	t.Run("two profiles make a submenu titled with the current one", func(t *testing.T) {
-		home := tempHome(t)
-		os.MkdirAll(filepath.Join(home, ".octo"), 0o755)
-		os.MkdirAll(filepath.Join(home, ".octo-work"), 0o755)
+		tempHome(t)
+		defaultRoot, err := datahome.DirFor("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		workRoot, err := datahome.DirFor("work")
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.MkdirAll(defaultRoot, 0o755)
+		os.MkdirAll(workRoot, 0o755)
 		t.Setenv(datahome.ProfileEnv, "work")
 		m := application.NewMenu()
 		addProfileRow(m, bridge)

@@ -12,6 +12,7 @@ func TestBundledUvTargetUsesSharedBinDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
+	t.Setenv(datahome.PortableRootEnv, home)
 	name := "uv"
 	if runtime.GOOS == "windows" {
 		name = "uv.exe"
@@ -19,10 +20,9 @@ func TestBundledUvTargetUsesSharedBinDir(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		profile string
-		root    string
 	}{
-		{"default profile", "", ".octo"},
-		{"work profile", "work", ".octo"},
+		{"default profile", ""},
+		{"work profile", "work"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(datahome.ProfileEnv, tc.profile)
@@ -30,7 +30,9 @@ func TestBundledUvTargetUsesSharedBinDir(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := filepath.Join(home, tc.root, "bin", name)
+			// Helper binaries are machine-scoped: every profile shares the
+			// default tree's Tools\bin.
+			want := filepath.Join(home, "Data", datahome.RegionTools, "bin", name)
 			if got != want {
 				t.Errorf("bundled uv target = %q, want %q", got, want)
 			}

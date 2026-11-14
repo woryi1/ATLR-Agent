@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
+
+	"github.com/open-octo/octo-agent/internal/datahome"
 )
 
 // The tray's profile submenu is rebuilt only when trayMenuSignature changes,
@@ -16,18 +18,19 @@ func TestTrayMenuSignatureFollowsProfileList(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home) // Windows: os.UserHomeDir reads %USERPROFILE%
+	t.Setenv(datahome.PortableRootEnv, home)
 	bridge := &nativeBridge{}
 
 	before := trayMenuSignature(bridge)
 
-	if err := os.Mkdir(filepath.Join(home, ".octo-work"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(home, "Data-work"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if after := trayMenuSignature(bridge); after == before {
 		t.Fatal("signature must change when a profile appears on disk")
 	}
 
-	if err := os.RemoveAll(filepath.Join(home, ".octo-work")); err != nil {
+	if err := os.RemoveAll(filepath.Join(home, "Data-work")); err != nil {
 		t.Fatal(err)
 	}
 	if got := trayMenuSignature(bridge); got != before {

@@ -31,6 +31,7 @@ func TestSelectDesktopProfile(t *testing.T) {
 			home := t.TempDir()
 			t.Setenv("HOME", home)
 			t.Setenv("USERPROFILE", home)
+			t.Setenv(datahome.PortableRootEnv, home)
 			err := selectDesktopProfile(tc.args)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("selectDesktopProfile(%q) error = %v, want error %v", tc.args, err, tc.wantErr)
@@ -93,13 +94,13 @@ func TestDesktopSettingsPathUsesProfileDataHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
+	t.Setenv(datahome.PortableRootEnv, home)
 	for _, tc := range []struct {
 		name    string
 		profile string
-		root    string
 	}{
-		{"default profile", "", ".octo"},
-		{"work profile", "work", ".octo-work"},
+		{"default profile", ""},
+		{"work profile", "work"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(datahome.ProfileEnv, tc.profile)
@@ -107,7 +108,11 @@ func TestDesktopSettingsPathUsesProfileDataHome(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := filepath.Join(home, tc.root, "desktop.json")
+			root, err := datahome.DirFor(tc.profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := filepath.Join(root, datahome.RegionUser, "desktop.json")
 			if got != want {
 				t.Errorf("desktop settings path = %q, want %q", got, want)
 			}
