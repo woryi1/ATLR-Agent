@@ -62,7 +62,6 @@ __pycache__/
 # reference, never part of the product or the repository.
 /.audit/
 /reports/
-/位置与配置研究报告.md
 /build-desktop.log
 /cleanup-*.log
 /serve-check.*

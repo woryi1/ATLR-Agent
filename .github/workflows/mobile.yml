@@ -40,7 +40,7 @@ jobs:
           # 22 is @capacitor/cli 8's floor (engines.node >=22.0.0). It has been
           # the installed cli major for a while, so 20 was already below the
           # floor — npm only warns, it doesn't fail, which is why nothing caught
-          # it. Matches the Go/desktop/pages workflows, which are all on 22.
+          # it. Matches the Go/desktop workflows, which are both on 22.
           node-version: '22'
           cache: npm
           cache-dependency-path: mobile/package-lock.json
