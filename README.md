@@ -10,6 +10,8 @@
 
 > **Notice:** this project is built with heavy AI assistance. Bundled artwork and music belong to their original owners (music is streamed from Bilibili) — see [NOTICE.md](NOTICE.md) for attribution, third-party assets and contact.
 
+> **Platform support:** Windows is the only maintained target — the portable single EXE and the per-user installer. The macOS and Linux packaging under `packaging/` and `scripts/` is kept for reference and upstream parity; it is not built or tested here, so adapt it yourself if you want those builds.
+
 A coding agent on par with Claude Code; as a personal assistant, lighter than OpenClaw — one MIT-licensed Go binary, no Node / Python / Ruby, running on **any model** (DeepSeek, Kimi, Anthropic, OpenAI, or anything compatible), with the server and your data staying on your own machine.
 
 [![Go CI](https://img.shields.io/github/actions/workflow/status/open-octo/octo-agent/go.yml?label=ci&style=flat-square)](https://github.com/open-octo/octo-agent/actions)

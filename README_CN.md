@@ -10,6 +10,8 @@
 
 > **声明**：本项目在开发过程中大量使用 AI 辅助。内置的美术素材与音乐版权归原作者所有（音乐来自哔哩哔哩），详见 [NOTICE.md](NOTICE.md)。
 
+> **平台支持**：本项目只维护 Windows —— 单文件便携 EXE 与按用户安装的 SET 版。`packaging/` 与 `scripts/` 下的 macOS、Linux 打包脚本是为对齐上游而保留的参考实现，本仓库不构建、不测试；需要请自行适配。
+
 coding agent 能力对标 Claude Code；作为个人助手，它比 OpenClaw 更轻量 —— 一个 MIT 开源的 Go 二进制，无需 Node / Python / Ruby，接入**任意模型**（DeepSeek、Kimi、Anthropic、OpenAI 或任何兼容端点），服务和数据都留在你自己的机器上。
 
 [![Go CI](https://img.shields.io/github/actions/workflow/status/open-octo/octo-agent/go.yml?label=ci&style=flat-square)](https://github.com/open-octo/octo-agent/actions)

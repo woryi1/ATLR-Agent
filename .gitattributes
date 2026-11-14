@@ -2,3 +2,13 @@
 # Collapse it in diffs and keep it out of language stats — reviewing it by eye
 # is neither possible nor useful; icons.generated.test.ts is what checks it.
 web/src/lib/icons.generated.ts linguist-generated=true
+
+# This fork builds and ships the Windows target only. The macOS/Linux packaging
+# is kept for upstream parity and reference; keep it out of GitHub's language
+# breakdown so the repo doesn't read as a multi-platform delivery.
+packaging/launchd/** linguist-documentation
+packaging/macos/** linguist-documentation
+packaging/systemd/** linguist-documentation
+packaging/windows/** linguist-documentation
+scripts/package-desktop-macos.sh linguist-detectable=false
+scripts/package-desktop-linux.sh linguist-detectable=false
