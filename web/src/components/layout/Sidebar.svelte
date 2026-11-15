@@ -49,7 +49,7 @@
   let biliQrKey = $state('')
   let biliQrStatus = $state<'waiting' | 'scanned' | 'expired' | 'ok'>('waiting')
   let biliAccountOpen = $state(false)
-  // 歌词：仅在当前视频有字幕轨时出现。
+  // 歌词：面板常驻，当前视频没有字幕轨时显示占位文案。
   let lyricsOpen = $state(false)
   const lyricIndex = $derived.by(() => {
     const lines = $musicLyrics
@@ -1402,11 +1402,15 @@
               </div>
             </div>
           {/if}
-          {#if lyricsOpen && $musicLyrics.length}
+          {#if lyricsOpen}
             <div class="mp-lyrics" aria-live="polite">
-              <div class="ly">{$musicLyrics[Math.max(0, lyricIndex - 1)]?.text ?? ''}</div>
-              <div class="ly now">{$musicLyrics[Math.max(0, lyricIndex)]?.text ?? ''}</div>
-              <div class="ly">{$musicLyrics[lyricIndex + 1]?.text ?? ''}</div>
+              {#if $musicLyrics.length}
+                <div class="ly">{$musicLyrics[Math.max(0, lyricIndex - 1)]?.text ?? ''}</div>
+                <div class="ly now">{$musicLyrics[Math.max(0, lyricIndex)]?.text ?? ''}</div>
+                <div class="ly">{$musicLyrics[lyricIndex + 1]?.text ?? ''}</div>
+              {:else}
+                <div class="ly now mp-lyrics-empty">{$t('sidebar.music_no_lyrics')}</div>
+              {/if}
             </div>
           {/if}
           <div class="mp-head">
@@ -1422,17 +1426,15 @@
               <div class="mp-sub">{currentTrack?.artist || $t('sidebar.music_ui_only')}</div>
             </div>
             <div class="mp-controls">
-              {#if $musicLyrics.length}
-                <button
-                  class="mp-lyric-btn"
-                  class:on={lyricsOpen}
-                  title="歌词"
-                  aria-label="lyrics"
-                  onclick={() => { lyricsOpen = !lyricsOpen }}
-                >
-                  <iconify-icon icon="lucide:captions" width="14"></iconify-icon>
-                </button>
-              {/if}
+              <button
+                class="mp-lyric-btn"
+                class:on={lyricsOpen}
+                title="歌词"
+                aria-label="lyrics"
+                onclick={() => { lyricsOpen = !lyricsOpen }}
+              >
+                <iconify-icon icon="lucide:captions" width="14"></iconify-icon>
+              </button>
               <button title="previous" aria-label="previous" onclick={() => prevMusic()}>
                 <iconify-icon icon="lucide:skip-back" width="14"></iconify-icon>
               </button>

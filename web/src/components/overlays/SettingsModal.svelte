@@ -5,6 +5,7 @@
   import EndpointsSection from '../settings/EndpointsSection.svelte'
   import MobileSection from '../settings/MobileSection.svelte'
   import { storageKey } from '../../lib/storageKey'
+  import { vizSettings, patchVizSettings } from '../../lib/music'
 
   const FONT_SIZE_KEY = storageKey('fontSize')
   import ProfilesSection from '../settings/ProfilesSection.svelte'
@@ -880,6 +881,51 @@
               <input class="bgrange" type="range" min="0" max="30" step="1" bind:value={bgBlur} oninput={() => applyBgAppearance()} />
             </div>
           {/if}
+          {#if $vizSettings.enabled}
+            <div class="setrow">
+              <div class="seti">
+                <span class="setl">{$t('settings.viz.width')}</span>
+                <span class="setd">{$vizSettings.width}px</span>
+              </div>
+              <input
+                class="bgrange" type="range" min="48" max="160" step="4"
+                value={$vizSettings.width}
+                oninput={(e) => patchVizSettings({ width: Number(e.currentTarget.value) })}
+              />
+            </div>
+            <div class="setrow">
+              <div class="seti">
+                <span class="setl">{$t('settings.viz.opacity')}</span>
+                <span class="setd">{Math.round($vizSettings.opacity * 100)}%</span>
+              </div>
+              <input
+                class="bgrange" type="range" min="0.1" max="1" step="0.05"
+                value={$vizSettings.opacity}
+                oninput={(e) => patchVizSettings({ opacity: Number(e.currentTarget.value) })}
+              />
+            </div>
+            <div class="setrow">
+              <div class="seti">
+                <span class="setl">{$t('settings.viz.color')}</span>
+                <span class="setd">{$t('settings.viz.color_desc')}</span>
+              </div>
+              <select
+                class="sinput"
+                value={$vizSettings.white ? 'white' : 'theme'}
+                onchange={(e) => patchVizSettings({ white: e.currentTarget.value === 'white' })}
+              >
+                <option value="theme">{$t('settings.viz.color_theme')}</option>
+                <option value="white">{$t('settings.viz.color_white')}</option>
+              </select>
+            </div>
+          {/if}
+          <div class="setrow">
+            <div class="seti">
+              <span class="setl">{$t('settings.viz.enabled')}</span>
+              <span class="setd">{$t('settings.viz.enabled_desc')}</span>
+            </div>
+            <Switch checked={$vizSettings.enabled} onchange={(v) => patchVizSettings({ enabled: v })} />
+          </div>
           {#if $nativeShell}
             <div class="setrow">
               <div class="seti">

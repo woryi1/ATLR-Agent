@@ -94,6 +94,7 @@
   import WorkflowsCard from '../components/chat/WorkflowsCard.svelte'
   import BackgroundProcesses from '../components/chat/BackgroundProcesses.svelte'
   import Composer from '../components/chat/Composer.svelte'
+  import MusicVisualizer from '../components/chat/MusicVisualizer.svelte'
   import OctoLogo from '../components/layout/OctoLogo.svelte'
 import QuestionModal from '../components/overlays/QuestionModal.svelte'
   import GenuiBlock from '../components/genui/GenuiBlock.svelte'
@@ -3485,6 +3486,7 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
         {/if}
       </div>
 
+      <MusicVisualizer />
       {#if railTicks.length > 1}
         <div class="msg-rail">
           <div class="msg-rail-inner" style="height:min(100%, {railTicks.length * 28 - 20}px);--rail-scale:{railScale}">
@@ -3759,6 +3761,10 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
   flex: 1;
   overflow-y: auto;
   min-height: 0;
+  /* Stacked above the decorative visualiser that shares this wrapper: the bars
+     are background, the transcript is content. The scroll container has no
+     background of its own, so the bars stay visible in the gutters. */
+  position: relative; z-index: 1;
   /* Scroll anchoring is toggled per state, not here: while the view follows
      the stream we pin the bottom ourselves and anchoring would fight that
      (it nudges scrollTop to keep the visible content still, which reads as

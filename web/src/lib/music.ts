@@ -26,6 +26,135 @@ export const musicLyrics = writable<{ from: number; to: number; text: string }[]
 /** The track actually loaded in the element — playlist or a search result. */
 export const musicNow = writable<Track | null>(null)
 
+// ── Visualiser ───────────────────────────────────────────────────────────────
+// Settings live in one object so the settings pane, the sidebar shortcut and the
+// component itself can never disagree. Defaults: on, 88px wide, 0.8 opacity,
+// theme accent (white is opt-in).
+export interface VizSettings {
+  enabled: boolean
+  width: number
+  opacity: number
+  white: boolean
+}
+
+const VIZ_DEFAULTS: VizSettings = { enabled: true, width: 88, opacity: 0.8, white: false }
+
+function loadVizSettings(): VizSettings {
+  try {
+    const raw = localStorage.getItem('atlr.viz')
+    if (!raw) return { ...VIZ_DEFAULTS }
+    const parsed = JSON.parse(raw) as Partial<VizSettings>
+    return {
+      enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : VIZ_DEFAULTS.enabled,
+      width: Number(parsed.width) >= 32 ? Number(parsed.width) : VIZ_DEFAULTS.width,
+      opacity: Number(parsed.opacity) > 0 ? Math.min(1, Number(parsed.opacity)) : VIZ_DEFAULTS.opacity,
+      white: parsed.white === true,
+    }
+  } catch {
+    return { ...VIZ_DEFAULTS }
+  }
+}
+
+export const vizSettings = writable<VizSettings>(loadVizSettings())
+
+export function patchVizSettings(patch: Partial<VizSettings>): void {
+  vizSettings.update((current) => {
+    const next = { ...current, ...patch }
+    try { localStorage.setItem('atlr.viz', JSON.stringify(next)) } catch { /* ignore */ }
+    return next
+  })
+}
+
+export function setVizColorWhite(on: boolean): void {
+  patchVizSettings({ white: on })
+}
+
+const VIZ_BANDS = 22
+const VIZ_LOW_HZ = 40
+const VIZ_HIGH_HZ = 16000
+let vizCtx: AudioContext | null = null
+let vizAnalyserL: AnalyserNode | null = null
+let vizAnalyserR: AnalyserNode | null = null
+let vizSampleRate = 48000
+let vizBins = 512
+const vizFreqL = new Uint8Array(512)
+const vizFreqR = new Uint8Array(512)
+
+// Built lazily once per audio element: a MediaElementSource may only be created
+// once, and the context cannot leave "suspended" without a user gesture — the
+// play listener resumes it, which is why the graph is created up front.
+function ensureVizGraph(): void {
+  if (vizCtx || !audio) return
+  const Ctor = window.AudioContext ??
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+  if (!Ctor) return
+  try {
+    const ctx = new Ctor()
+    const src = ctx.createMediaElementSource(audio)
+    const split = ctx.createChannelSplitter(2)
+    src.connect(split)
+    const l = ctx.createAnalyser()
+    const r = ctx.createAnalyser()
+    for (const a of [l, r]) {
+      a.fftSize = 1024
+      // Light smoothing on top of the component's own attack/decay: enough to
+      // stop frame-to-frame noise, not enough to flatten the beat.
+      a.smoothingTimeConstant = 0.45
+      // A music stream sits well below a full-scale reference; widening the dB
+      // window is what keeps quiet passages from reading as an empty bar.
+      a.minDecibels = -90
+      a.maxDecibels = -20
+    }
+    split.connect(l, 0)
+    split.connect(r, 1)
+    // Both analysers feed the speakers; without this the source is silent.
+    l.connect(ctx.destination)
+    r.connect(ctx.destination)
+    vizCtx = ctx
+    vizAnalyserL = l
+    vizAnalyserR = r
+    vizSampleRate = ctx.sampleRate
+    vizBins = l.frequencyBinCount
+  } catch {
+    vizCtx = null
+  }
+}
+
+/**
+ * Read both channels as 22 log-spaced bands (0–255). Each band takes the peak
+ * bin rather than the mean, so a kick or a bass line actually kicks; a mono
+ * track leaves the right channel at zero, which is what makes only the left
+ * column move.
+ */
+export function readVizBands(): { left: number[]; right: number[]; live: boolean } {
+  const live = !!(audio && !audio.paused && vizAnalyserL && vizAnalyserR)
+  if (live && vizAnalyserL && vizAnalyserR) {
+    if (vizCtx?.state === 'suspended') void vizCtx.resume()
+    vizAnalyserL.getByteFrequencyData(vizFreqL)
+    vizAnalyserR.getByteFrequencyData(vizFreqR)
+  }
+  const left: number[] = []
+  const right: number[] = []
+  const binHz = vizSampleRate / 1024
+  const ratio = VIZ_HIGH_HZ / VIZ_LOW_HZ
+  for (let i = 0; i < VIZ_BANDS; i++) {
+    const fromHz = VIZ_LOW_HZ * Math.pow(ratio, i / VIZ_BANDS)
+    const toHz = VIZ_LOW_HZ * Math.pow(ratio, (i + 1) / VIZ_BANDS)
+    const from = Math.max(0, Math.min(vizBins - 1, Math.round(fromHz / binHz)))
+    const to = Math.max(from + 1, Math.min(vizBins, Math.round(toHz / binHz)))
+    let peakL = 0
+    let peakR = 0
+    for (let b = from; b < to; b++) {
+      if (vizFreqL[b] > peakL) peakL = vizFreqL[b]
+      if (vizFreqR[b] > peakR) peakR = vizFreqR[b]
+    }
+    // 0.75 curve lifts the low end of the scale without hiding the peak.
+    left.push(live ? Math.round(Math.pow(peakL / 255, 0.75) * 255) : 0)
+    right.push(live ? Math.round(Math.pow(peakR / 255, 0.75) * 255) : 0)
+  }
+  return { left, right, live }
+}
+
 // ── Library panel state ──────────────────────────────────────────────────────
 // Lives here rather than inside the sidebar so closing the panel (or the
 // sidebar remounting) does not throw away the keyword and the results: the
@@ -257,6 +386,10 @@ export async function initMusic(): Promise<void> {
     audio = new Audio()
     attach(audio, Number(st?.position) || 0)
     audio.src = srcFor(idx)
+    ensureVizGraph()
+    audio.addEventListener('play', () => {
+      if (vizCtx?.state === 'suspended') void vizCtx.resume()
+    })
     musicReady.set(true)
 
     // Never start audio here: the sidebar mounts behind the boot splash, and a

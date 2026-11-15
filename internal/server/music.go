@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/open-octo/octo-agent/internal/config"
 	"github.com/open-octo/octo-agent/internal/datahome"
@@ -150,10 +152,78 @@ func (s *Server) handleMusicFavorite(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folder": folder})
 }
 
+// Lyrics are static once published, so the answer is cached on disk and a
+// restart does not pay for the WBI-signed lookup again. A "no lyrics" answer is
+// cached briefly: a track can gain subtitles, and a permanent negative entry
+// would hide them forever.
+const (
+	lyricDiskTTL         = 30 * 24 * time.Hour
+	lyricDiskNegativeTTL = time.Hour
+)
+
+type lyricCacheFile struct {
+	Lines []music.LyricLine `json:"lines"`
+	At    int64             `json:"at"`
+}
+
+func lyricCachePath(bvid string) string {
+	p, err := datahome.SharedPath(datahome.RegionCache, "music", "lyrics", bvid+".json")
+	if err != nil {
+		return ""
+	}
+	return p
+}
+
+func readLyricDiskCache(bvid string) ([]music.LyricLine, bool) {
+	path := lyricCachePath(bvid)
+	if path == "" {
+		return nil, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var f lyricCacheFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return nil, false
+	}
+	ttl := lyricDiskTTL
+	if len(f.Lines) == 0 {
+		ttl = lyricDiskNegativeTTL
+	}
+	if time.Since(time.Unix(f.At, 0)) > ttl {
+		return nil, false
+	}
+	return f.Lines, true
+}
+
+func writeLyricDiskCache(bvid string, lines []music.LyricLine) {
+	path := lyricCachePath(bvid)
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	if lines == nil {
+		lines = []music.LyricLine{}
+	}
+	data, err := json.Marshal(lyricCacheFile{Lines: lines, At: time.Now().Unix()})
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0o644)
+}
+
 func (s *Server) handleMusicLyrics(w http.ResponseWriter, r *http.Request) {
 	bvid := r.URL.Query().Get("bvid")
 	if bvid == "" {
 		writeError(w, http.StatusBadRequest, "missing bvid")
+		return
+	}
+	if lines, ok := readLyricDiskCache(bvid); ok {
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, map[string]any{"bvid": bvid, "lines": lines, "cached": true})
 		return
 	}
 	lines, err := musicService.Lyrics(r.Context(), bvid)
@@ -164,6 +234,7 @@ func (s *Server) handleMusicLyrics(w http.ResponseWriter, r *http.Request) {
 	if lines == nil {
 		lines = []music.LyricLine{}
 	}
+	writeLyricDiskCache(bvid, lines)
 	// Never let the webview serve a stale answer for the same bvid: the host
 	// already memoises, and a cached "no lyrics" must not outlive a fix.
 	w.Header().Set("Cache-Control", "no-store")
