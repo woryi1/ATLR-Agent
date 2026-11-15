@@ -67,3 +67,22 @@
 - **错**：`.github/workflows/pages.yml` 在 push 到 `docs/**` 时部署 GitHub Pages，仓库没开 Pages，任务失败并发失败邮件。
 - **因**：fork 只做 Windows，上游的站点部署没有一起裁掉。
 - **防**：已删除该工作流；发布/CI 只保留与 Windows 产物相关的任务。
+
+## 12. 工具选型：绕远路查文件与开浏览器
+
+- **错**：为了找本机的 Inno Setup，先做了目录枚举，又手写 Everything 的 WM_COPYDATA IPC 去查 `ISCC.exe`；为了看发布页，自己用 `--remote-debugging-port=9222` 起了一个 Edge 实例，代理连不上又改手写 CDP 脚本。
+- **因**：没有先确认环境里已有什么——Everything 自带命令行检索，Agent 环境自带浏览器操作能力。
+- **防**：查本机文件先走 Everything 命令行；看网页先走环境的浏览器能力（browser Agent / CDP 代理），不要自建浏览器实例。自己起 Edge 还会带出「命令结束就被回收」「代理连不上」「临时 profile 留在工作区」三件麻烦。
+- **附**：`ISCC.exe` 本机就有，位置是 `.tools/InnoSetup/ISCC.exe`；找不到时先看这个路径，别默认「没装」。
+
+## 13. 无头渲染的假象：Gitee 把邮箱改写
+
+- **错**：用无头 Edge 抓 Gitee Release 页的渲染 DOM，看到联系邮箱显示成 `13243355121@lastScorpio`，据此判断「Gitee 页面把邮箱搞坏了」。
+- **因**：匿名 + 无头渲染下 Gitee 会把 `163.com` 当链接改写，DOM 里的文本和真实浏览器看到的不一样；接口返回的正文其实一直是正确的。
+- **防**：判断页面是否有问题，以真实浏览器看到的为准；只看 HTML/无头 DOM 时，先对照 API 返回的原文，再决定是不是真坏了。
+
+## 14. 带 BOM 的文本文件被重写
+
+- **错**：`.gitignore` 首行本来带 BOM（`﻿.DS_Store`），整文件重写后变成多个 BOM 字符，diff 里看不出内容变化，只有首行一串隐藏字符。
+- **因**：编辑时不看编码，基于 UTF-8 重新落盘又补了一次 BOM。
+- **防**：改 `.gitignore` 这类文件前先确认首字节；提交前用 `git diff` 看首行，若只有 BOM 变化就 `git checkout -- <file>` 还原。
