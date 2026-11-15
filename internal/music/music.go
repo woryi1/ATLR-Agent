@@ -583,6 +583,21 @@ func (s *Service) Resolve(ctx context.Context, bvid string) (string, error) {
 	}
 
 	s.mu.Lock()
+	// A memo, not a record: with a 3-minute TTL nothing old is ever useful, but
+	// deleting only on lookup let the map grow with every bvid ever played.
+	if len(s.urls) >= 256 {
+		for key, c := range s.urls {
+			if time.Since(c.at) >= urlTTL {
+				delete(s.urls, key)
+			}
+		}
+		for len(s.urls) >= 256 {
+			for key := range s.urls {
+				delete(s.urls, key)
+				break
+			}
+		}
+	}
 	s.urls[bvid] = cachedURL{url: picked, at: time.Now()}
 	s.mu.Unlock()
 	return picked, nil

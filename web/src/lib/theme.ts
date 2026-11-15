@@ -289,7 +289,7 @@ function applyBackgroundLayer(): void {
   const wantImage = !wantVideo && !!imageID && imageID !== 'off'
   const existing = document.getElementById('atlr-bg') as HTMLImageElement | HTMLVideoElement | null
   if (!wantVideo && !wantImage) {
-    existing?.remove()
+    disposeBackgroundLayer(existing)
     return
   }
   // While the boot splash owns the screen, hold the wallpaper until its
@@ -305,7 +305,7 @@ function applyBackgroundLayer(): void {
   const matches = wantVideo ? existing?.tagName === 'VIDEO' : existing?.tagName === 'IMG'
   let el: HTMLImageElement | HTMLVideoElement
   if (!existing || !matches) {
-    existing?.remove()
+    disposeBackgroundLayer(existing)
     el = wantVideo ? createBackgroundVideo() : createBackgroundImage()
     document.body.appendChild(el)
   } else {
@@ -322,15 +322,48 @@ function applyBackgroundLayer(): void {
     // this runs for every appearance-slider move.
     const src = `/api/backgrounds/video/${encodeURIComponent(videoID)}`
     if (el.getAttribute('src') !== src) el.src = src
+    bindBackgroundVisibility()
+    // A hidden window keeps decoding a 1080p loop for pixels nobody sees; that
+    // is decoder and GPU memory spent on nothing. Pause while hidden and resume
+    // on the way back — the first frame stays on screen either way.
+    if (document.hidden) el.pause()
     // Autoplay is best-effort — a webview that blocks it still shows the
     // first frame, which is the same watermark the still wallpapers give.
-    el.play().catch(() => {})
+    else el.play().catch(() => {})
     return
   }
   // Cache-bust only the custom pick, so a freshly uploaded wallpaper shows
   // immediately; the two built-ins stay on stable, cacheable URLs.
   const stable = `/api/backgrounds/${encodeURIComponent(imageID)}`
   el.src = imageID === 'custom' ? `${stable}?v=${Date.now()}` : stable
+}
+
+// Tear the layer down for real. Removing a <video> node is not enough on every
+// engine: the media element keeps its decoder, buffers and the WebView2 media
+// process alive until the source is cleared, which is why switching a video
+// wallpaper back to a still one left a process that had to be killed by hand.
+function disposeBackgroundLayer(el: HTMLElement | null): void {
+  if (!el) return
+  if (el instanceof HTMLVideoElement) {
+    el.pause()
+    el.removeAttribute('src')
+    el.load()
+  }
+  el.remove()
+}
+
+// One listener, whatever the wallpaper: Page Visibility is the only signal the
+// page gets for "the user cannot see this window right now".
+let bgVisibilityBound = false
+function bindBackgroundVisibility(): void {
+  if (bgVisibilityBound) return
+  bgVisibilityBound = true
+  document.addEventListener('visibilitychange', () => {
+    const el = document.getElementById('atlr-bg')
+    if (!(el instanceof HTMLVideoElement)) return
+    if (document.hidden) el.pause()
+    else el.play().catch(() => {})
+  })
 }
 
 function createBackgroundVideo(): HTMLVideoElement {

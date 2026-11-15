@@ -58,7 +58,41 @@ var (
 const (
 	lyricPositiveTTL = 30 * time.Minute
 	lyricNegativeTTL = 60 * time.Second
+	// A lyric answer can be hundreds of kilobytes; an unbounded map kept growing
+	// for as long as the user kept picking new tracks. Capped well above the
+	// playlist size, so the two favourites folders always stay warm.
+	lyricCacheMax = 64
 )
+
+// pruneLyricsLocked drops expired entries first, then the oldest ones, so the
+// memo cannot outgrow the cap no matter how many distinct tracks are played.
+func pruneLyricsLocked(now time.Time) {
+	if len(lyricCache) < lyricCacheMax {
+		return
+	}
+	for bvid, e := range lyricCache {
+		ttl := lyricPositiveTTL
+		if len(e.lines) == 0 {
+			ttl = lyricNegativeTTL
+		}
+		if now.Sub(e.at) > ttl {
+			delete(lyricCache, bvid)
+		}
+	}
+	for len(lyricCache) >= lyricCacheMax {
+		oldest, oldestAt := "", now
+		first := true
+		for bvid, e := range lyricCache {
+			if first || e.at.Before(oldestAt) {
+				oldest, oldestAt, first = bvid, e.at, false
+			}
+		}
+		if oldest == "" {
+			return
+		}
+		delete(lyricCache, oldest)
+	}
+}
 
 // Lyrics returns the timed lines for a video, preferring a Chinese track.
 func (s *Service) Lyrics(ctx context.Context, bvid string) ([]LyricLine, error) {
@@ -85,6 +119,7 @@ func (s *Service) Lyrics(ctx context.Context, bvid string) ([]LyricLine, error) 
 		return nil, err
 	}
 	lyricMu.Lock()
+	pruneLyricsLocked(time.Now())
 	lyricCache[bvid] = lyricEntry{lines: lines, at: time.Now()}
 	lyricMu.Unlock()
 	return lines, nil

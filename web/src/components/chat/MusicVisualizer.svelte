@@ -23,6 +23,13 @@
     let raf = 0
     const tick = () => {
       const bands = readVizBands()
+      // Nothing playing and every bar already at rest: leave the DOM alone and
+      // just wait. Reassigning zero arrays at 60 fps kept Svelte re-rendering
+      // 44 nodes for a silent player.
+      if (!bands.live && held.every((v) => v < 0.004)) {
+        raf = requestAnimationFrame(tick)
+        return
+      }
       const nextLeft: number[] = []
       const nextRight: number[] = []
       for (let i = 0; i < BANDS; i++) {
