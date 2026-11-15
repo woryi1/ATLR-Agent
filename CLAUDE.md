@@ -7,11 +7,11 @@ Guidance for Claude Code working in this repository. The octo-agent equivalent i
 本副本是**主人专用的便携化桌面版**，产品名 **ATLR-Agent**（caoxiang 的重编译版本，基于 Octo），与上游发布形态不同。**任何打包/构建/交付操作都必须遵守本节，违反即任务驳回。**
 
 1. **唯一打包目标 = 桌面版 `ATLR-Agent.exe`**（源码 `cmd/octo-desktop/`，Wails v3 GUI）。
-   - **默认且唯一必需的产物形态 = 单 EXE 便携版**：`dist/portable/ATLR-Agent.exe`（单文件、免安装、`Data/` 与 exe 同级、U 盘可携带）。这个 exe 就是全部交付物：**不再产出 zip、也不再产出安装包**，除非用户明确要求。其它分发格式同样仅在明确要求时才产出。
+   - **默认且唯一必需的产物形态 = 单 EXE 便携版**：`dist/portable/ATLR-Agent.exe`（单文件、免安装、`Data/` 与 exe 同级、U 盘可携带）。**另外每次发版都必须产出安装包** `ATLR-Agent-Setup-<版本>.exe`（`scripts/build-setup-windows.ps1`，ISCC 用项目内 `.tools/InnoSetup/`），Release 固定挂 4 件附件（exe + setup + 两个 sha256），口径见 `docs/releasing.md` 第 0 节；**不产 zip**，其它分发格式仅在明确要求时才产出。
    - **禁止**打包成纯命令行版（`cmd/octo` → `octo.exe`）、移动端或任何其他形态。CLI 构建只允许用于编译验证和冒烟测试，不是交付物。
    - **唯一构建入口**：`pwsh scripts/build-desktop-windows.ps1`（或 `make desktop`，已转发到同一脚本）。脚本会依次 `npm run build` → 确保 rg 嵌入 → `generate-syso` → `CGO_ENABLED=0 go build -tags embedrg -ldflags "-H windowsgui -s -w -X …Version=… -X …brand.*"` → 自检 PE `Subsystem==2` + 品牌标识（`internal/brand`）已嵌入 → 产出 `dist/windows-amd64/ATLR-Agent.exe`（含随附 `octo.exe`，仅编译验证用）与交付物 `dist/portable/ATLR-Agent.exe`（单文件，无 zip），任一失败即 exit 1。
    - **禁止手抄 go build**。历史事故：手抄命令漏 `-H windowsgui` 导致 GUI 启动弹黑控制台；漏 `-tags embedrg` 导致目标机 grep/glob 直接报错；把 `-H` 与 `-X` 拆成两个 `-ldflags` 只有最后一个生效（版本注入了、子系统没改）。
-   - `packaging/windows/octo.iss:60-61` 同时安装 `octo-desktop.exe` 与 `octo.exe`，所以脚本也产出 `octo.exe`（同为 `-tags embedrg`）；它只是**可选安装包**的组成件，本版不交付安装包（`packaging/` 未改动，其中的 `taskkill /IM octo-desktop.exe` 属于不交付路径）。CLI 仍只用于编译验证与冒烟。
+   - `packaging/windows/octo.iss:60-61` 同时安装 `octo-desktop.exe` 与 `octo.exe`，所以脚本也产出 `octo.exe`（同为 `-tags embedrg`）。**实际发版的安装包走 `packaging/windows/atlr.iss`**，由 `scripts/build-setup-windows.ps1` 生成，只装 `ATLR-Agent.exe` + LICENSE/NOTICE；`octo.iss` 里的 `taskkill /IM octo-desktop.exe` 不在交付路径上。CLI 仍只用于编译验证与冒烟。
 2. **便携化布局（已改代码，不是配置）**：所有持久数据在 **EXE 所在目录**下：
    - 数据根：`<EXE 目录>\Data\`；命名 profile 为 `Data-<name>`。
    - 默认工作区：`<EXE 目录>\Workspace\`。

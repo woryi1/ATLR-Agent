@@ -2,12 +2,21 @@
 
 本仓库的双端发布（Gitee / GitHub）踩过的坑，记在这里，下次照做。其他历史错误见 [lessons.md](lessons.md)。
 
+## 0. 发版口径（用户要求，每次发版逐条照做）
+
+- **必须建 Release**：Gitee 和 GitHub 两端都要建，只推代码不算发版。
+- **说明必须中英双语**：同一份正文，英文段在前、`## 中文说明` 在后；两端用同一份，不要一边只写中文、另一边只写英文。
+- **附件固定 4 件**：`ATLR-Agent.exe`、`ATLR-Agent-v<ver>.sha256`、`ATLR-Agent-Setup-<ver>.exe`、`ATLR-Agent-Setup-<ver>.sha256`。每次发版都要有便携 EXE 和安装程序，不再按「只发单 EXE」处理。
+- **打包后替换桌面副本**：把新构建覆盖到 `%USERPROFILE%\Desktop\ATLR-Agent.exe`（桌面那份是日常入口）。覆盖前确认没有 `ATLR-Agent` 进程在跑；覆盖后用 `Get-FileHash` 与 `dist/portable/ATLR-Agent.exe` 的哈希比对确认换对了。
+- **版本号按用户口径**：说 0.71 就写 `"0.71"`，不要自行改成 `0.7.1`；版本号、tag、产物名三处保持一致。
+- **发布后复核**：两端 `main` sha 一致、tag 指向同一 commit、附件名与字节数对得上，再用真实浏览器各看一眼（不要拿无头渲染的结果下结论）。
+
 ## 1. 版本与产物
 
-- 版本号在 `internal/version/version.go`（`var Version = "0.7"`）。
+- 版本号在 `internal/version/version.go`（`var Version = "0.71"`）。
 - 便携版：`scripts/build-desktop-windows.ps1` → `dist/portable/ATLR-Agent.exe`。
 - 安装版：`scripts/build-setup-windows.ps1` → `dist/portable/ATLR-Agent-Setup-<版本>.exe`（同时生成 `.sha256`）。
-- 两个产物都要挂到 Release，`.sha256` 一起上传。安装器需要 Inno Setup 6（`ISCC.exe`）。
+- 两个产物都要挂到 Release，`.sha256` 一起上传。安装器用项目内的 Inno Setup（`.tools/InnoSetup/ISCC.exe`），不需要另外安装；`scripts/build-setup-windows.ps1` 会按这个顺序自己找。
 
 ## 2. 编码坑（乱码的真正原因）
 
