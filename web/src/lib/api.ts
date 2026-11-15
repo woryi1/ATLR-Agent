@@ -263,10 +263,10 @@ export async function putForceTokenSkill(enabled: boolean): Promise<void> {
   })
 }
 
-// 歌曲跳转：true = 系统默认浏览器，false = 应用内新窗口。
+// 歌曲跳转：true = 系统默认浏览器，false = 应用内新窗口（未设置时默认关）。
 export async function getMusicOpenMode(): Promise<boolean> {
   const res = await request<{ system?: boolean }>('/api/config/music_open_in_system')
-  return res?.system !== false
+  return res?.system === true
 }
 
 export async function putMusicOpenMode(system: boolean): Promise<void> {
@@ -448,6 +448,16 @@ export async function nativeWindowState(): Promise<boolean> {
 // peers fall back to window.open.
 export async function openExternal(url: string): Promise<void> {
   await request<{ ok: boolean }>('/api/native/open-external', {
+    method: 'POST',
+    ...json({ url }),
+  })
+}
+
+// Desktop shell only: open an http(s) page in an auxiliary in-app window. The
+// app webview cannot window.open (Wails leaves WebView2's new-window request
+// unhandled), so the shell creates the window instead.
+export async function openWebWindow(url: string): Promise<void> {
+  await request<{ ok: boolean }>('/api/native/open-web-window', {
     method: 'POST',
     ...json({ url }),
   })

@@ -31,6 +31,8 @@ type fakeNative struct {
 	maximised          bool
 	gotOpenURL         string
 	openCalls          int
+	gotOpenWebURL      string
+	openWebCalls       int
 	gotOpenDir         string
 	openDirCalls       int
 	gotSaveName        string
@@ -73,6 +75,11 @@ func (f *fakeNative) WindowState() bool               { return f.maximised }
 func (f *fakeNative) OpenExternal(url string) error {
 	f.openCalls++
 	f.gotOpenURL = url
+	return nil
+}
+func (f *fakeNative) OpenWebWindow(url string) error {
+	f.openWebCalls++
+	f.gotOpenWebURL = url
 	return nil
 }
 func (f *fakeNative) OpenFolder(dir string) error {
@@ -465,6 +472,50 @@ func TestNativeOpenExternalDelegatesToBridge(t *testing.T) {
 	}
 	if fake.openCalls != 1 || fake.gotOpenURL != link {
 		t.Errorf("bridge.OpenExternal calls=%d url=%q, want 1/%s", fake.openCalls, fake.gotOpenURL, link)
+	}
+}
+
+func TestNativeOpenWebWindowDelegatesToBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	const link = "https://www.bilibili.com/video/BV1xx411c7mD"
+	req := httptest.NewRequest(http.MethodPost, "/api/native/open-web-window", strings.NewReader(`{"url":"`+link+`"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.openWebCalls != 1 || fake.gotOpenWebURL != link {
+		t.Errorf("bridge.OpenWebWindow calls=%d url=%q, want 1/%s", fake.openWebCalls, fake.gotOpenWebURL, link)
+	}
+	if fake.openCalls != 0 {
+		t.Errorf("system browser must not be used, got %d OpenExternal calls", fake.openCalls)
+	}
+}
+
+func TestNativeOpenWebWindowRejectsNonHTTP(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	for _, link := range []string{"mailto:someone@example.com", "tel:+15551234567", "file:///C:/Windows"} {
+		fake := &fakeNative{}
+		srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+		req := httptest.NewRequest(http.MethodPost, "/api/native/open-web-window", strings.NewReader(`{"url":"`+link+`"}`))
+		w := httptest.NewRecorder()
+		serveLoopback(srv.mux, w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: got %d, want 400 (%s)", link, w.Code, w.Body.String())
+		}
+		if fake.openWebCalls != 0 {
+			t.Errorf("%s: bridge.OpenWebWindow must not be called", link)
+		}
 	}
 }
 

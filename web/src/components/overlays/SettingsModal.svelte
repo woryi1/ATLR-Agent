@@ -29,6 +29,8 @@
   const LICENSE_URL = 'https://github.com/open-octo/octo-agent/blob/main/LICENSE.txt'
   const RELEASES_URL = 'https://github.com/open-octo/octo-agent/releases'
   const WEBSITE_URL = 'https://octo-agent.dev/'
+  const GITHUB_URL = 'https://github.com/woryi1/ATLR-Agent'
+  const GITEE_URL = 'https://gitee.com/woryi2/ATLR-Agent'
 
   const fontZoomMap: Record<string, string> = { Small: '0.9', Medium: '1', Large: '1.1' }
   const modeToThemeLabel: Record<string, string> = { light: 'Light', dark: 'Dark', system: 'System' }
@@ -1207,6 +1209,18 @@
                 <span class="setd">{$t('settings.about.version_desc')}</span>
               </div>
               <a class="setver mono" href={RELEASES_URL} target="_blank" rel="noopener noreferrer">v{versionStr}</a>
+            </div>
+            <div class="setrow">
+              <div class="seti">
+                <span class="setl">{$t('settings.about.github')}</span>
+              </div>
+              <button class="link-btn" onclick={() => openUrl(GITHUB_URL)}>{$t('settings.about.license_view')}</button>
+            </div>
+            <div class="setrow">
+              <div class="seti">
+                <span class="setl">{$t('settings.about.gitee')}</span>
+              </div>
+              <button class="link-btn" onclick={() => openUrl(GITEE_URL)}>{$t('settings.about.license_view')}</button>
             </div>
             <div class="setrow">
               <div class="seti">

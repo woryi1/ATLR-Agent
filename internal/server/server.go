@@ -902,6 +902,7 @@ func (s *Server) registerRoutes() {
 		s.api("POST /api/native/window/close", s.handleNativeClose)
 		s.api("GET /api/native/window/state", s.handleNativeWindowState)
 		s.api("POST /api/native/open-external", s.handleNativeOpenExternal)
+		s.api("POST /api/native/open-web-window", s.handleNativeOpenWebWindow)
 		s.api("POST /api/native/open-folder", s.handleNativeOpenFolder)
 		s.api("POST /api/native/save-file", s.handleNativeSaveFile)
 		s.api("POST /api/native/print", s.handleNativePrint)

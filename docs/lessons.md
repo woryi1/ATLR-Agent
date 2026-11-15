@@ -86,3 +86,11 @@
 - **错**：`.gitignore` 首行本来带 BOM（`﻿.DS_Store`），整文件重写后变成多个 BOM 字符，diff 里看不出内容变化，只有首行一串隐藏字符。
 - **因**：编辑时不看编码，基于 UTF-8 重新落盘又补了一次 BOM。
 - **防**：改 `.gitignore` 这类文件前先确认首字节；提交前用 `git diff` 看首行，若只有 BOM 变化就 `git checkout -- <file>` 还原。
+
+## 15. WebView2 扩展不能靠命令行加载（BewlyCat 实测）
+
+- **错**：想“内置” B 站增强扩展 BewlyCat，先假设用 `AdditionalBrowserArgs` 的 `--load-extension=<dir>` + `--enable-features=msExtensionService` 就能生效。
+- **因**：官方要求是环境选项 `AreBrowserExtensionsEnabled=true`，再在 profile 上调 `AddBrowserExtension`；命令行开关只是 Chromium 的旁路，WebView2 默认把扩展能力关着。
+- **实测**：扩展 zip 解压到 `Data\Cache\extensions\bewlycat-1.8.3\manifest.json` 正常，WebView2 profile 也在 `Data\Cache\webview` 生成，但 `Default\Preferences` 里 `pinned_extensions: []`、没有该扩展 —— 只有命令行参数时不生效。
+- **额外障碍**：Wails v3 beta.30 实际使用的 `internal/webview2/pkg/edge` 包装层没有 `GetProfile` / `ICoreWebView2Profile7`，要到这个能力必须本地 patch Wails（不是改两行参数）。扩展暂不内置。
+- **顺带确认**：只要 B 站页面在应用内 WebView2 打开，登录 Cookie 就写在 `Data\Cache\webview`（`WebviewUserDataPath` 已固定），与是否加载扩展无关。

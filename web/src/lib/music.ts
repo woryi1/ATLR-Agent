@@ -5,6 +5,8 @@
 // about — which track, playing or paused, and where in the track — is restored
 // on launch from /api/music/state, and saved back while it changes.
 import { get, writable } from 'svelte/store'
+import { nativeShell } from './stores'
+import * as api from './api'
 
 export interface Track {
   bvid: string
@@ -130,7 +132,13 @@ export async function openMusicVideo(bvid: string): Promise<void> {
     })
     if (!res.ok) return
     const body = await res.json().catch(() => null)
-    if (body?.url) window.open(body.url, '_blank', 'width=1100,height=760')
+    // The server answers either {opened:true} (system browser) or {url} (in-app).
+    // In the desktop shell the page cannot window.open, so the URL goes back
+    // through the native bridge and the shell creates the window.
+    if (body?.url) {
+      if (get(nativeShell)) await api.openWebWindow(body.url)
+      else window.open(body.url, '_blank', 'width=1100,height=760')
+    }
   } catch { /* ignore */ }
 }
 

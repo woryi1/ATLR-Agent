@@ -370,7 +370,8 @@ type Config struct {
 	// it off survives a config rewrite.
 	ForceTokenSkill *bool `yaml:"force_token_skill,omitempty"`
 	// MusicOpenInSystem picks where a track's video page opens: the OS default
-	// browser (nil / true) or a new in-app web window (false).
+	// browser (true) or a new in-app web window (nil / false). Unset means the
+	// in-app window — handing every song click to the system browser is opt-in.
 	MusicOpenInSystem *bool `yaml:"music_open_in_system,omitempty"`
 }
 

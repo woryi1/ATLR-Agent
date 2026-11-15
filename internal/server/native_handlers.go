@@ -73,6 +73,13 @@ type NativeBridge interface {
 	// server validates url is http/https before calling.
 	OpenExternal(url string) error
 
+	// OpenWebWindow opens url in an auxiliary in-app window instead of handing
+	// it to the system browser — the "off" side of the music open preference.
+	// The page inside the app webview cannot window.open (Wails leaves WebView2's
+	// NewWindowRequested unhandled), so the server routes it here instead. The
+	// server validates url is http/https before calling.
+	OpenWebWindow(url string) error
+
 	// OpenFolder reveals dir in the OS file manager (Finder, Explorer, the
 	// desktop's file browser) — the sidebar's "Open folder" action on a project
 	// or a session, which a browser tab cannot do at all. The server validates
@@ -417,6 +424,40 @@ func (s *Server) handleNativeOpenExternal(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if err := s.cfg.Native.OpenExternal(req.URL); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+type nativeOpenWebWindowRequest struct {
+	URL string `json:"url"`
+}
+
+// POST /api/native/open-web-window — open an http(s) URL in an auxiliary
+// in-app window (desktop only). Same loopback gate as the other native routes,
+// but a narrower scheme allowlist: this window renders the page, so mailto/tel
+// have nothing to do here.
+func (s *Server) handleNativeOpenWebWindow(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	var req nativeOpenWebWindowRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	u, err := url.Parse(req.URL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		writeError(w, http.StatusBadRequest, "only http(s) URLs may be opened in the app window")
+		return
+	}
+	if err := s.cfg.Native.OpenWebWindow(req.URL); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

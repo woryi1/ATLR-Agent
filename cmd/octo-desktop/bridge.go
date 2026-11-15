@@ -110,6 +110,11 @@ type nativeBridge struct {
 	// and read by the pointer loop, whose hit shapes depend on the pose.
 	petState atomic.Pointer[string]
 
+	// webWin is the auxiliary web page window used for "open in app" targets
+	// (a music track's Bilibili page, for instance). It is independent of the
+	// main window: closing it destroys it, and nothing revives it.
+	webWin atomic.Pointer[application.WebviewWindow]
+
 	settingsMu sync.Mutex
 	settings   desktopSettings
 	// geomTimer debounces persistence of the window geometry to disk: a drag
@@ -925,6 +930,43 @@ func (b *nativeBridge) OpenExternal(url string) error {
 	default:
 		return exec.Command("xdg-open", url).Start()
 	}
+}
+
+// OpenWebWindow opens url in an auxiliary in-app window instead of the system
+// browser. It exists because the octo-served webview has no working
+// `window.open`: Wails does not wire WebView2's NewWindowRequested, so a page
+// that calls it gets nothing. The window is reused when it is still open, so
+// clicking several tracks navigates one window rather than piling them up.
+//
+// The server has already validated the scheme (http/https).
+func (b *nativeBridge) OpenWebWindow(url string) error {
+	if b.app == nil {
+		return fmt.Errorf("web window: app not ready")
+	}
+	if w := b.webWin.Load(); w != nil {
+		w.SetURL(url)
+		w.Show()
+		w.Focus()
+		return nil
+	}
+	w := b.app.Window.NewWithOptions(application.WebviewWindowOptions{
+		Title:  "哔哩哔哩",
+		Width:  1100,
+		Height: 760,
+		URL:    url,
+	})
+	if w == nil {
+		return fmt.Errorf("web window: could not create window")
+	}
+	b.webWin.Store(w)
+	w.RegisterHook(events.Common.WindowClosing, func(*application.WindowEvent) {
+		// Wails destroys the window itself once the hook returns; this only
+		// clears the pointer so the next request creates a fresh one.
+		b.webWin.CompareAndSwap(w, nil)
+	})
+	w.Show()
+	w.Focus()
+	return nil
 }
 
 // OpenFolder reveals a directory in the OS file manager, backing the sidebar's

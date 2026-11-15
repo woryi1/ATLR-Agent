@@ -201,7 +201,8 @@ func (s *Server) handleMusicOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pageURL := "https://www.bilibili.com/video/" + body.BVID
-	useSystem := cfg.MusicOpenInSystem == nil || *cfg.MusicOpenInSystem
+	// Unset means the in-app window: opening the system browser is opt-in.
+	useSystem := cfg.MusicOpenInSystem != nil && *cfg.MusicOpenInSystem
 	if !useSystem {
 		writeJSON(w, http.StatusOK, map[string]any{"url": pageURL})
 		return
@@ -228,7 +229,7 @@ func (s *Server) handleGetMusicOpenMode(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"system": cfg.MusicOpenInSystem == nil || *cfg.MusicOpenInSystem,
+		"system": cfg.MusicOpenInSystem != nil && *cfg.MusicOpenInSystem,
 	})
 }
 
