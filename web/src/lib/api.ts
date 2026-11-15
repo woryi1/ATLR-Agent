@@ -975,6 +975,11 @@ export interface ThemeSelection {
   mode?: string
   pack?: string
   background?: string
+  // Animated wallpaper id ("" = none). Mutually exclusive with `background`:
+  // the server clears the image whenever this is set.
+  backgroundVideo?: string
+  // Unmutes the animated wallpaper. Absent = muted, which is the default.
+  backgroundVideoSound?: boolean
   // Absent = never set → the client defaults the splash on.
   startupAnim?: boolean
   backgroundFit?: string
@@ -1001,6 +1006,7 @@ export async function saveThemeSelection(
   background = '',
   startupAnim?: boolean,
   appearance?: BackgroundAppearance,
+  video?: { id: string; sound: boolean },
 ): Promise<void> {
   await request<ThemeSelection>('/api/theme-selection', {
     method: 'PUT',
@@ -1009,6 +1015,8 @@ export async function saveThemeSelection(
       mode,
       pack,
       background,
+      backgroundVideo: video?.id ?? '',
+      backgroundVideoSound: video?.sound ?? false,
       startupAnim,
       backgroundFit: appearance?.fit,
       backgroundOpacity: appearance?.opacity,

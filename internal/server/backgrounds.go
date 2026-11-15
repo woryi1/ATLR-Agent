@@ -1,13 +1,16 @@
 package server
 
 import (
+	"bytes"
 	"embed"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/open-octo/octo-agent/internal/datahome"
 )
@@ -23,12 +26,27 @@ import (
 //go:embed backgrounds/bloom.jpeg backgrounds/mystery.jpeg backgrounds/meadow.jpeg
 var backgroundFS embed.FS
 
+// Animated wallpapers live in their own embed so the (large) video is only in
+// the binary that actually serves it.
+//
+//go:embed backgrounds/sakura-1080p.mp4
+var backgroundVideoFS embed.FS
+
 // backgroundIDs maps the selection ids a client may send to the embedded
 // asset. "off" is not here — it means "no background image".
 var backgroundAssets = map[string]string{
 	"bloom":   "backgrounds/bloom.jpeg",
 	"mystery": "backgrounds/mystery.jpeg",
 	"meadow":  "backgrounds/meadow.jpeg",
+}
+
+// backgroundVideoAssets maps the animated-wallpaper ids to the embedded file.
+// The asset is H.264 High profile, 1080p30, yuv420p — the codec every browser
+// and WebView2 decodes, with or without hardware support. HEVC was deliberately
+// not used: it is exactly what renders as a black rectangle on machines whose
+// GPU cannot decode it.
+var backgroundVideoAssets = map[string]string{
+	"sakura": "backgrounds/sakura-1080p.mp4",
 }
 
 // maxCustomBackgroundBytes caps an uploaded wallpaper at 15 MB — plenty for a
@@ -81,6 +99,30 @@ func (s *Server) handleGetBackground(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=86400")
 		_, _ = w.Write(data)
 	}
+}
+
+// handleGetBackgroundVideo serves one built-in animated wallpaper.
+//
+// The body goes through http.ServeContent so Range requests work: without them
+// a <video> element has to buffer the whole file before the first frame, and
+// some engines refuse to loop a source they cannot seek.
+func (s *Server) handleGetBackgroundVideo(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	asset, ok := backgroundVideoAssets[id]
+	if !ok {
+		writeError(w, http.StatusNotFound, "unknown background video")
+		return
+	}
+	data, err := backgroundVideoFS.ReadFile(asset)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "video/mp4")
+	// Embedded assets are immutable per build, so the webview may keep them;
+	// the header is also what makes ServeContent answer a conditional request.
+	w.Header().Set("Cache-Control", "max-age=86400")
+	http.ServeContent(w, r, path.Base(asset), time.Time{}, bytes.NewReader(data))
 }
 
 // handlePutBackgroundCustom accepts a multipart upload (field "file") and
@@ -145,6 +187,18 @@ func isImageHead(head []byte) bool {
 		return true
 	}
 	return false
+}
+
+// validBackgroundVideoID reports whether id is an animated wallpaper the
+// selection may name. "" means no video wallpaper.
+func validBackgroundVideoID(id string) error {
+	if id == "" {
+		return nil
+	}
+	if _, ok := backgroundVideoAssets[id]; ok {
+		return nil
+	}
+	return fmt.Errorf("unknown background video %q", strings.TrimSpace(id))
 }
 
 // validBackgroundID reports whether id is a background the selection may name.

@@ -14,7 +14,7 @@
   import { showToast, nativeShell, settingsModalOpen, settingsTarget, onboardPhase, sessions, sessionGroups, collapsedSessions, activeSessionId, view, clearPendingSessionOpts } from '../../lib/stores'
   import type { Session, SessionGroup } from '../../lib/types'
   import { setLocale, t, tr } from '../../lib/i18n'
-  import { getMode, setMode, getBackground, setBackground, getBackgroundAppearance, setBackgroundAppearance, getStartupAnim, setStartupAnim, type BackgroundFit, type BackgroundID, type ThemeMode } from '../../lib/theme'
+  import { getMode, setMode, getBackground, setBackground, getBackgroundAppearance, setBackgroundAppearance, getStartupAnim, setStartupAnim, getBackgroundVideo, setBackgroundVideo, getBackgroundVideoSound, setBackgroundVideoSound, type BackgroundFit, type BackgroundID, type BackgroundVideoID, type ThemeMode } from '../../lib/theme'
   import { notificationsEnabled, setNotificationsEnabled } from '../../lib/notifications'
   import { openUrl } from '../../lib/externalLinks'
   import { confirmDialog } from '../../lib/confirm'
@@ -49,6 +49,12 @@
   let fontSize      = $state(storedFontSize())
   let theme         = $state(modeToThemeLabel[getMode()] ?? 'Light')
   let bg            = $state<BackgroundID>(getBackground())
+  let bgVideo       = $state<BackgroundVideoID>(getBackgroundVideo())
+  let bgVideoSound  = $state(getBackgroundVideoSound())
+  // One control for the two wallpaper sources: the server refuses to keep a
+  // still image and a video at the same time, so a single three-way choice
+  // states that rule instead of leaving it to two controls to agree.
+  let bgKind        = $state<'off' | 'static' | 'video'>(getBackgroundVideo() ? 'video' : getBackground() && getBackground() !== 'off' ? 'static' : 'off')
   let bgFileInput   = $state<HTMLInputElement | null>(null)
   let bgFit         = $state<BackgroundFit>(getBackgroundAppearance().fit)
   let bgOpacity     = $state(getBackgroundAppearance().opacity)
@@ -438,6 +444,13 @@
       if (get(nativeShell)) api.getAutostart().then(v => (autostart = v)).catch(() => {})
       theme = modeToThemeLabel[getMode()] ?? 'Light'
       fontSize = storedFontSize()
+      // Theme and wallpapers are reconciled with the server after boot, so the
+      // boot seed can be behind by the time this opens — re-read the live
+      // values instead of showing whatever the seed captured.
+      bg = getBackground()
+      bgVideo = getBackgroundVideo()
+      bgVideoSound = getBackgroundVideoSound()
+      bgKind = bgVideo ? 'video' : bg && bg !== 'off' ? 'static' : 'off'
       modalEl?.focus()
     }
   })
@@ -604,6 +617,34 @@
     setBackgroundAppearance(bgFit, bgOpacity, bgBlur)
   }
 
+  // The three-way control: off / still image / animated. Both setters already
+  // clear the other source, which is exactly the server's rule, so this only
+  // routes to the right one.
+  function onBgKindChange(v: string) {
+    if (v === 'off') {
+      bg = 'off'
+      bgVideo = ''
+      setBackground('off')
+      return
+    }
+    if (v === 'video') {
+      bgVideo = 'sakura'
+      setBackgroundVideo('sakura')
+      return
+    }
+    // Restore the remembered still pick, falling back to the first built-in so
+    // switching to "still" always lands on something visible.
+    const next: BackgroundID = bg && bg !== 'off' ? bg : 'bloom'
+    if (next === 'custom') {
+      // The uploaded file is still served; re-picking would force a fresh
+      // upload for no reason.
+      bg = 'custom'
+      setBackground('custom')
+      return
+    }
+    onBackgroundChange(next)
+  }
+
   async function onBgFilePicked(e: Event) {
     const input = e.currentTarget as HTMLInputElement
     const file = input.files?.[0]
@@ -699,30 +740,70 @@
             </div>
             <Segment options={['Light', 'Dark', 'System']} labels={{ Light: $t('settings.theme_light'), Dark: $t('settings.theme_dark'), System: $t('settings.theme_system') }} bind:value={theme} />
           </div>
-          <!-- Wallpaper: off / one of the two built-ins / the user's own
-               upload. Choosing "custom" opens a picker first; the wallpaper
-               applies only after a successful upload, so the select never
-               shows a choice the server can't serve. -->
+          <!-- Wallpaper: three exclusive states — off, a still image, or the
+               built-in animated one. The server refuses to keep an image and a
+               video at once, so one control states that rule outright. -->
           <div class="setrow">
             <div class="seti">
               <span class="setl">{$t('settings.background')}</span>
               <span class="setd">{$t('settings.background_desc')}</span>
             </div>
-            <select class="sinput" bind:value={bg} onchange={() => onBackgroundChange(bg)}>
-              <option value="off">{$t('settings.background.off')}</option>
-              <option value="bloom">{$t('settings.background.bloom')}</option>
-              <option value="mystery">{$t('settings.background.mystery')}</option>
-              <option value="meadow">{$t('settings.background.meadow')}</option>
-              <option value="custom">{$t('settings.background.custom')}</option>
-            </select>
+            <Segment
+              options={['off', 'static', 'video']}
+              labels={{
+                off: $t('settings.background.kind_off'),
+                static: $t('settings.background.kind_static'),
+                video: $t('settings.background.kind_video'),
+              }}
+              value={bgKind}
+              onchange={(v) => onBgKindChange(v)}
+            />
           </div>
-          {#if bg === 'custom'}
+          {#if bgKind === 'static'}
+            <!-- "custom" opens a picker first; the wallpaper applies only after
+                 a successful upload, so the select never shows a choice the
+                 server can't serve. -->
             <div class="setrow">
               <div class="seti">
-                <span class="setl"></span>
-                <span class="setd">{$t('settings.background.upload')}</span>
+                <span class="setl">{$t('settings.background.kind_static')}</span>
               </div>
-              <button class="link-btn" onclick={() => bgFileInput?.click()}>{$t('settings.background.upload')}</button>
+              <select class="sinput" bind:value={bg} onchange={() => onBackgroundChange(bg)}>
+                <option value="bloom">{$t('settings.background.bloom')}</option>
+                <option value="mystery">{$t('settings.background.mystery')}</option>
+                <option value="meadow">{$t('settings.background.meadow')}</option>
+                <option value="custom">{$t('settings.background.custom')}</option>
+              </select>
+            </div>
+            {#if bg === 'custom'}
+              <div class="setrow">
+                <div class="seti">
+                  <span class="setl"></span>
+                  <span class="setd">{$t('settings.background.upload')}</span>
+                </div>
+                <button class="link-btn" onclick={() => bgFileInput?.click()}>{$t('settings.background.upload')}</button>
+              </div>
+            {/if}
+          {/if}
+          {#if bgKind === 'video'}
+            <div class="setrow">
+              <div class="seti">
+                <span class="setl">{$t('settings.background.video_name')}</span>
+                <span class="setd">{$t('settings.background.video_meta')}</span>
+              </div>
+              <video
+                class="bg-video-thumb"
+                muted
+                playsinline
+                preload="metadata"
+                src="/api/backgrounds/video/sakura"
+              ></video>
+            </div>
+            <div class="setrow">
+              <div class="seti">
+                <span class="setl">{$t('settings.background.video_sound')}</span>
+                <span class="setd">{$t('settings.background.video_sound_desc')}</span>
+              </div>
+              <Switch checked={bgVideoSound} onchange={(v) => { bgVideoSound = v; setBackgroundVideoSound(v) }} />
             </div>
           {/if}
           <input
@@ -770,7 +851,7 @@
               }}
             />
           </div>
-          {#if bg && bg !== 'off'}
+          {#if (bg && bg !== 'off') || bgVideo}
             <div class="setrow">
               <div class="seti">
                 <span class="setl">{$t('settings.background.fit')}</span>
@@ -1272,6 +1353,12 @@
 select.sinput { cursor: pointer; }
 .sinput:focus { border-color: var(--blue-6); box-shadow: 0 0 0 2px var(--focus-ring); }
 
+/* ── animated wallpaper preview ───────────────────────────────────────────── */
+.bg-video-thumb {
+  width: 160px; aspect-ratio: 16 / 9; flex: 0 0 auto; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--bg-layout); object-fit: cover;
+}
+
 /* ── buttons ───────────────────────────────────────────────────────────────── */
 .btns {
   height: 30px; padding: 0 12px; border: 1px solid var(--border); background: var(--bg-container);
@@ -1303,6 +1390,7 @@ select.sinput { cursor: pointer; }
   .pane { padding: 16px 14px; }
   .setrow { gap: 12px; }
   .sinput { width: 150px; }
+  .bg-video-thumb { width: 120px; }
   .archive-project-select { width: 120px; }
 }
 

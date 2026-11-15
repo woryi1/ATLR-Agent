@@ -25,6 +25,14 @@ type themeSelection struct {
 	// Background is the wallpaper id: "" | "off" (no image), "bloom"/"mystery"
 	// (built-in), or "custom" (uploaded). "" and "off" render the plain app.
 	Background string `json:"background,omitempty"`
+	// BackgroundVideo is the animated wallpaper id ("sakura") or "" for none.
+	// It is mutually exclusive with Background — image and video never share
+	// the layer, and a PUT naming one clears the other (see the PUT handler).
+	BackgroundVideo string `json:"backgroundVideo,omitempty"`
+	// BackgroundVideoSound unmutes the animated wallpaper. Absent/false is the
+	// product default and also what browser autoplay policies require: a
+	// video that starts unmuted without a gesture never starts at all.
+	BackgroundVideoSound bool `json:"backgroundVideoSound,omitempty"`
 	// StartupAnim gates the boot splash (dsh-startup-screen). A pointer keeps
 	// "never set" (nil → the client defaults it on) distinct from an explicit
 	// false, so a fresh install plays the animation until the user turns it
@@ -122,6 +130,16 @@ func (s *Server) handlePutThemeSelection(w http.ResponseWriter, r *http.Request)
 	if err := validBackgroundID(sel.Background); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if err := validBackgroundVideoID(sel.BackgroundVideo); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// The two wallpaper kinds are mutually exclusive by construction: a video
+	// wins over an image named in the same request, so no client can leave the
+	// file describing a state the renderer cannot express.
+	if sel.BackgroundVideo != "" {
+		sel.Background = ""
 	}
 	switch sel.BackgroundFit {
 	case "", "cover", "contain", "fill":

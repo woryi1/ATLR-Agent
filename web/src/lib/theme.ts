@@ -17,11 +17,17 @@ export type ThemeMode = 'light' | 'dark' | 'system'
 // 'meadow' are the wallpapers baked into the binary; 'custom' is the user's own
 // upload (served from Data/backgrounds/).
 export type BackgroundID = '' | 'off' | 'bloom' | 'mystery' | 'meadow' | 'custom'
+// Animated wallpapers baked into the binary. Only one ships today; the id is
+// sent to the server as-is and must be in internal/server's
+// backgroundVideoAssets map.
+export type BackgroundVideoID = '' | 'sakura'
 export type BackgroundFit = 'cover' | 'contain' | 'fill'
 
 const MODE_KEY = storageKey('themeMode')
 const PACK_KEY = storageKey('themePack')
 const BG_KEY = storageKey('background')
+const BG_VIDEO_KEY = storageKey('bgVideo')
+const BG_VIDEO_SOUND_KEY = storageKey('bgVideoSound')
 const BG_FIT_KEY = storageKey('bgFit')
 const BG_OPACITY_KEY = storageKey('bgOpacity')
 const BG_BLUR_KEY = storageKey('bgBlur')
@@ -113,6 +119,8 @@ export const packs = writable<PackChoice[]>(builtinChoices())
 let currentMode: ThemeMode = 'light'
 let currentPack = DEFAULT_PACK
 let currentBackground: BackgroundID = ''
+let currentBgVideo: BackgroundVideoID = ''
+let currentBgVideoSound = false
 let currentBgFit: BackgroundFit = 'cover'
 let currentBgOpacity = 0.2
 let currentBgBlur = 0
@@ -185,6 +193,14 @@ export function getBackground(): BackgroundID {
   return currentBackground
 }
 
+export function getBackgroundVideo(): BackgroundVideoID {
+  return currentBgVideo
+}
+
+export function getBackgroundVideoSound(): boolean {
+  return currentBgVideoSound
+}
+
 export function getBackgroundAppearance(): { fit: BackgroundFit; opacity: number; blur: number } {
   return { fit: currentBgFit, opacity: currentBgOpacity, blur: currentBgBlur }
 }
@@ -217,12 +233,46 @@ export function setStartupAnim(v: boolean): void {
 }
 
 // setBackground switches the wallpaper and mirrors the choice to the server.
-// 'off' (or '') removes the layer entirely — the plain octo look.
+// 'off' (or '') removes the layer entirely — the plain octo look. Picking a
+// still image also retires the animated one: the server enforces the same
+// exclusivity, and leaving the local video id set would disagree with it.
 export function setBackground(bg: BackgroundID): void {
   currentBackground = bg
+  currentBgVideo = ''
+  localStorage.removeItem(BG_VIDEO_KEY)
   if (bg && bg !== 'off') localStorage.setItem(BG_KEY, bg)
   else localStorage.removeItem(BG_KEY)
   applyBackgroundLayer()
+  void persistSelection()
+}
+
+// setBackgroundVideo plays one of the built-in animated wallpapers. Same
+// exclusivity as setBackground, from the other side: the still wallpaper is
+// cleared, so exactly one layer is ever mounted.
+export function setBackgroundVideo(id: BackgroundVideoID): void {
+  currentBgVideo = id
+  if (id) {
+    currentBackground = ''
+    localStorage.removeItem(BG_KEY)
+    localStorage.setItem(BG_VIDEO_KEY, id)
+  } else {
+    localStorage.removeItem(BG_VIDEO_KEY)
+  }
+  applyBackgroundLayer()
+  void persistSelection()
+}
+
+// setBackgroundVideoSound only toggles the audio track of the layer already
+// on screen — the video keeps its position, so this does not go through
+// applyBackgroundLayer (which would reassign src and restart playback).
+export function setBackgroundVideoSound(on: boolean): void {
+  currentBgVideoSound = on
+  localStorage.setItem(BG_VIDEO_SOUND_KEY, on ? '1' : '0')
+  const el = document.getElementById('atlr-bg')
+  if (el instanceof HTMLVideoElement) {
+    el.muted = !on
+    if (on) el.play().catch(() => {})
+  }
   void persistSelection()
 }
 
@@ -231,10 +281,15 @@ export function setBackground(bg: BackgroundID): void {
 // readable, whatever the theme). Managed here rather than in a Svelte
 // component so it exists from boot and survives route changes for free.
 function applyBackgroundLayer(): void {
-  const id = currentBackground
-  let el = document.getElementById('atlr-bg') as HTMLImageElement | null
-  if (!id || id === 'off') {
-    el?.remove()
+  const imageID = currentBackground
+  const videoID = currentBgVideo
+  const wantVideo = !!videoID
+  // A still wallpaper only counts while it is something other than "off";
+  // '' and 'off' both mean the plain app.
+  const wantImage = !wantVideo && !!imageID && imageID !== 'off'
+  const existing = document.getElementById('atlr-bg') as HTMLImageElement | HTMLVideoElement | null
+  if (!wantVideo && !wantImage) {
+    existing?.remove()
     return
   }
   // While the boot splash owns the screen, hold the wallpaper until its
@@ -244,20 +299,64 @@ function applyBackgroundLayer(): void {
     window.addEventListener('dsh-startup:done', () => applyBackgroundLayer(), { once: true })
     return
   }
-  if (!el) {
-    el = document.createElement('img')
-    el.id = 'atlr-bg'
-    el.alt = ''
-    el.draggable = false
+  // The two sources need different elements, so a switch retires the old node
+  // rather than mutating it: an <img> cannot play the mp4, and a <video>
+  // cannot be pointed at a jpeg.
+  const matches = wantVideo ? existing?.tagName === 'VIDEO' : existing?.tagName === 'IMG'
+  let el: HTMLImageElement | HTMLVideoElement
+  if (!existing || !matches) {
+    existing?.remove()
+    el = wantVideo ? createBackgroundVideo() : createBackgroundImage()
     document.body.appendChild(el)
+  } else {
+    el = existing
   }
+  // Fit / opacity / blur are shared by both sources — one set of controls, one
+  // rendering, whatever the layer is showing.
   el.style.objectFit = currentBgFit
   el.style.opacity = String(currentBgOpacity)
   el.style.filter = currentBgBlur > 0 ? `blur(${currentBgBlur}px)` : ''
+  if (el instanceof HTMLVideoElement) {
+    el.muted = !currentBgVideoSound
+    // Only touch src on a real change: reassigning it restarts playback, and
+    // this runs for every appearance-slider move.
+    const src = `/api/backgrounds/video/${encodeURIComponent(videoID)}`
+    if (el.getAttribute('src') !== src) el.src = src
+    // Autoplay is best-effort — a webview that blocks it still shows the
+    // first frame, which is the same watermark the still wallpapers give.
+    el.play().catch(() => {})
+    return
+  }
   // Cache-bust only the custom pick, so a freshly uploaded wallpaper shows
   // immediately; the two built-ins stay on stable, cacheable URLs.
-  const stable = `/api/backgrounds/${encodeURIComponent(id)}`
-  el.src = id === 'custom' ? `${stable}?v=${Date.now()}` : stable
+  const stable = `/api/backgrounds/${encodeURIComponent(imageID)}`
+  el.src = imageID === 'custom' ? `${stable}?v=${Date.now()}` : stable
+}
+
+function createBackgroundVideo(): HTMLVideoElement {
+  const v = document.createElement('video')
+  v.id = 'atlr-bg'
+  v.autoplay = true
+  v.loop = true
+  v.muted = !currentBgVideoSound
+  // The muted *attribute* is what lets an autoplaying video start without a
+  // user gesture; the property alone is not enough on every engine.
+  if (!currentBgVideoSound) v.setAttribute('muted', '')
+  v.playsInline = true
+  v.preload = 'auto'
+  v.setAttribute('playsinline', '')
+  v.setAttribute('aria-hidden', 'true')
+  v.setAttribute('disablepictureinpicture', '')
+  v.tabIndex = -1
+  return v
+}
+
+function createBackgroundImage(): HTMLImageElement {
+  const img = document.createElement('img')
+  img.id = 'atlr-bg'
+  img.alt = ''
+  img.draggable = false
+  return img
 }
 
 // Normalizes the same way getPack does, so the two can never disagree: an id
@@ -277,11 +376,14 @@ export function setPack(pack: string): void {
 // the next successful write.
 async function persistSelection(): Promise<void> {
   try {
-    await saveThemeSelection(currentMode, currentPack, currentBackground, currentStartupAnim, {
-      fit: currentBgFit,
-      opacity: currentBgOpacity,
-      blur: currentBgBlur,
-    })
+    await saveThemeSelection(
+      currentMode,
+      currentPack,
+      currentBackground,
+      currentStartupAnim,
+      { fit: currentBgFit, opacity: currentBgOpacity, blur: currentBgBlur },
+      { id: currentBgVideo, sound: currentBgVideoSound },
+    )
   } catch {
     // Kept locally only; retried on the next setMode/setPack/setBackground.
   }
@@ -292,6 +394,11 @@ export function initTheme(): void {
   currentMode = (localStorage.getItem(MODE_KEY) as ThemeMode) || 'light'
   currentPack = normalizePack(localStorage.getItem(PACK_KEY))
   currentBackground = (localStorage.getItem(BG_KEY) as BackgroundID) || ''
+  currentBgVideo = localStorage.getItem(BG_VIDEO_KEY) === 'sakura' ? 'sakura' : ''
+  currentBgVideoSound = localStorage.getItem(BG_VIDEO_SOUND_KEY) === '1'
+  // The server treats the two as exclusive; mirror that locally so a stale
+  // image key left next to a video key cannot mount both layers.
+  if (currentBgVideo) currentBackground = ''
   const fit = localStorage.getItem(BG_FIT_KEY) as BackgroundFit | null
   currentBgFit = fit === 'contain' || fit === 'fill' ? fit : 'cover'
   // Number(null) is 0, not NaN — guard on the raw string so "never stored"
@@ -327,6 +434,11 @@ export async function loadThemeSelection(): Promise<void> {
     currentPack = normalizePack(sel.pack || DEFAULT_PACK)
     const bg = (sel.background ?? '') as BackgroundID
     currentBackground = bg === 'off' || bg === 'bloom' || bg === 'mystery' || bg === 'meadow' || bg === 'custom' ? bg : ''
+    currentBgVideo = sel.backgroundVideo === 'sakura' ? 'sakura' : ''
+    currentBgVideoSound = sel.backgroundVideoSound === true
+    // Server-enforced exclusivity, applied here too so the boot state matches
+    // what is about to be persisted back.
+    if (currentBgVideo) currentBackground = ''
     currentStartupAnim = sel.startupAnim !== false
     const fit = (sel.backgroundFit ?? 'cover') as BackgroundFit
     currentBgFit = fit === 'contain' || fit === 'fill' ? fit : 'cover'
@@ -338,6 +450,8 @@ export async function loadThemeSelection(): Promise<void> {
     currentMode = FIRST_RUN_MODE
     currentPack = normalizePack(FIRST_RUN_PACK) || DEFAULT_PACK
     currentBackground = FIRST_RUN_BACKGROUND
+    currentBgVideo = ''
+    currentBgVideoSound = false
     currentStartupAnim = true
     currentBgFit = 'cover'
     currentBgOpacity = 0.2
@@ -348,6 +462,9 @@ export async function loadThemeSelection(): Promise<void> {
   localStorage.setItem(ANIM_KEY, currentStartupAnim ? '1' : '0')
   if (currentBackground && currentBackground !== 'off') localStorage.setItem(BG_KEY, currentBackground)
   else localStorage.removeItem(BG_KEY)
+  if (currentBgVideo) localStorage.setItem(BG_VIDEO_KEY, currentBgVideo)
+  else localStorage.removeItem(BG_VIDEO_KEY)
+  localStorage.setItem(BG_VIDEO_SOUND_KEY, currentBgVideoSound ? '1' : '0')
   apply(currentMode, currentPack)
   applyBackgroundLayer()
   void persistSelection()

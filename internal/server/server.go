@@ -971,6 +971,7 @@ func (s *Server) registerRoutes() {
 	s.api("GET /api/bili/me", s.handleBiliMe)
 	s.api("POST /api/bili/logout", s.handleBiliLogout)
 	s.api("GET /api/backgrounds/{id}", s.handleGetBackground)
+	s.api("GET /api/backgrounds/video/{id}", s.handleGetBackgroundVideo)
 	s.api("POST /api/backgrounds/custom", s.handlePutBackgroundCustom)
 	s.api("GET /api/light-apps", s.handleListLightApps)
 	s.api("GET /api/light-apps/{slug}", s.handleGetLightApp)

@@ -394,6 +394,9 @@ input, textarea, select {
 #atlr-bg {
   position: fixed;
   inset: 0;
+  /* Explicit block: the layer is an <img> or a <video> depending on the pick,
+     and an inline-level box would keep a baseline gap under it. */
+  display: block;
   width: 100vw;
   height: 100vh;
   object-fit: cover;
