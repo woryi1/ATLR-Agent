@@ -190,6 +190,8 @@ export const musicLibSearchOpen = writable(false)
 export const musicLibQuery = writable('')
 export const musicLibRemote = writable<Track[]>([])
 export const musicLibSearching = writable(false)
+/** True while the host is still paging the favourites in the background. */
+export const musicLibLoading = writable(false)
 /** Videos favourited during this session (bvid), for the filled star. */
 export const musicFaved = writable<Set<string>>(new Set())
 
@@ -304,13 +306,11 @@ export async function forceRefreshPlaylist(): Promise<void> {
 
 /** Fetch in the background and hold the result for the next panel open. */
 export async function stagePlaylistRefresh(): Promise<void> {
-  try {
-    const res = await fetch('/api/music/playlist')
-    if (!res.ok) return
-    const body = await res.json().catch(() => null)
-    const tracks: Track[] = body?.tracks ?? []
-    if (tracks.length) pendingTracks = tracks
-  } catch { /* keep the current list */ }
+  const reply = await fetchPlaylistReply(false)
+  if (!reply) return
+  musicLibLoading.set(reply.loading)
+  if (reply.tracks.length) pendingTracks = reply.tracks
+  if (reply.loading) startPlaylistPolling()
 }
 
 /** Swap in the staged list (next open). Keeps the playing track by bvid. */
@@ -318,22 +318,16 @@ export function applyPendingPlaylist(): void {
   const fresh = pendingTracks
   pendingTracks = null
   if (!fresh || !fresh.length) return
-  const prev = get(musicTracks)
-  if (prev.length > 0 && fresh.length < prev.length) return
-  const playing = prev[get(musicIndex)]?.bvid ?? ''
-  const prevIdx = get(musicIndex)
-  musicTracks.set(fresh)
-  const idx = playing ? Math.max(0, fresh.findIndex(t => t.bvid === playing)) : Math.min(prevIdx, fresh.length - 1)
-  musicIndex.set(idx)
-  if (!get(musicNow) || fresh.some(t => t.bvid === get(musicNow)!.bvid)) {
-    musicNow.set(fresh[idx])
-  }
-  if (audio && (idx !== prevIdx || !playing)) audio.src = srcFor(idx)
+  if (!adoptPlaylist(fresh)) return
+  if (audio && !audio.src) audio.src = srcFor(get(musicIndex))
 }
 
 /** True when the last session was playing; try to pick it back up after boot. */
 export function resumeMusicIfWanted(): void {
   if (!wantResume || !audio || !audio.paused) return
+  // Nothing loaded yet (cold library still paging): keep the flag, a later
+  // tick can still pick it up.
+  if (!audio.src) return
   wantResume = false
   void audio.play().catch(() => { /* still no gesture: stays paused */ })
 }
@@ -342,9 +336,12 @@ let audio: HTMLAudioElement | null = null
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 let initialized = false
 let wantResume = false
+/** Position restored from the last session, applied once on the next metadata. */
+let restorePosition = 0
 // A refreshed library waits here until the NEXT panel open, so the visible
 // list never jumps under the user's finger.
 let pendingTracks: Track[] | null = null
+let pollTimer: ReturnType<typeof setInterval> | null = null
 
 function trackAt(i: number): Track | null {
   return get(musicTracks)[i] ?? null
@@ -388,7 +385,7 @@ function save(immediate = false): void {
   else saveTimer = setTimeout(fire, 2000)
 }
 
-function attach(a: HTMLAudioElement, restore: number): void {
+function attach(a: HTMLAudioElement): void {
   a.preload = 'auto'
   a.addEventListener('timeupdate', () => { musicPosition.set(a.currentTime); save() })
   a.addEventListener('durationchange', () => { musicDuration.set(Number.isFinite(a.duration) ? a.duration : 0) })
@@ -396,84 +393,177 @@ function attach(a: HTMLAudioElement, restore: number): void {
   a.addEventListener('pause', () => { musicPlaying.set(false); save(true) })
   a.addEventListener('ended', () => nextMusic())
   a.addEventListener('loadedmetadata', () => {
-    if (restore > 0) {
-      try { a.currentTime = restore } catch { /* seek before data is fine to skip */ }
+    if (restorePosition > 0) {
+      try { a.currentTime = restorePosition } catch { /* seek before data is fine to skip */ }
+      restorePosition = 0
     }
-  }, { once: true })
+  })
+}
+
+/**
+ * Create the one <audio> element on demand. It must not depend on the library:
+ * a cold or failed playlist used to leave `audio` null, and every search result
+ * then showed its cover and lyrics but refused to play or seek.
+ */
+function ensureAudio(): HTMLAudioElement | null {
+  if (typeof window === 'undefined') return null
+  if (audio) return audio
+  const a = new Audio()
+  // Assign before wiring the visualiser: ensureVizGraph() bails out while the
+  // module-level `audio` is still null, which silently left the spectrum with
+  // no analyser nodes (the columns rendered, but every band stayed at zero).
+  audio = a
+  attach(a)
+  ensureVizGraph()
+  a.addEventListener('play', () => {
+    if (vizCtx?.state === 'suspended') void vizCtx.resume()
+  })
+  musicReady.set(true)
+  return a
+}
+
+/**
+ * Swap in a fetched list. A shorter answer never replaces a longer one (a
+ * partial page sequence must not erase the library), and the playing track
+ * keeps its bvid so playback is not interrupted.
+ */
+function adoptPlaylist(tracks: Track[], hint?: number, allowShrink = false): boolean {
+  if (!tracks.length) return false
+  const prev = get(musicTracks)
+  if (!allowShrink && prev.length > 0 && tracks.length < prev.length) return false
+  const playing = prev[get(musicIndex)]?.bvid ?? ''
+  const prevIdx = get(musicIndex)
+  musicTracks.set(tracks)
+  let idx = playing ? tracks.findIndex(t => t.bvid === playing) : -1
+  if (idx < 0) {
+    idx = typeof hint === 'number'
+      ? Math.min(Math.max(0, hint), tracks.length - 1)
+      : Math.min(prevIdx, tracks.length - 1)
+  }
+  musicIndex.set(idx)
+  const now = get(musicNow)
+  if (!now || tracks.some(t => t.bvid === now.bvid)) musicNow.set(tracks[idx])
+  return true
+}
+
+interface PlaylistReply {
+  tracks: Track[]
+  loading: boolean
+}
+
+async function fetchPlaylistReply(force: boolean): Promise<PlaylistReply | null> {
+  try {
+    const res = await fetch(force ? '/api/music/playlist?refresh=1' : '/api/music/playlist')
+    if (!res.ok) return null
+    const body = await res.json().catch(() => null)
+    return { tracks: body?.tracks ?? [], loading: body?.loading === true }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Poll the host while it pages the favourites in the background. A cold walk of
+ * ~1,200 songs takes about a minute; polling is what turns that into a list
+ * that fills in instead of a spinner that never ends.
+ */
+export function startPlaylistPolling(intervalMs = 1500): void {
+  if (pollTimer || typeof window === 'undefined') return
+  const deadline = Date.now() + 5 * 60 * 1000
+  pollTimer = setInterval(() => {
+    void (async () => {
+      if (Date.now() > deadline) {
+        stopPlaylistPolling()
+        return
+      }
+      await pullPlaylist(false)
+      if (!get(musicLibLoading)) stopPlaylistPolling()
+    })()
+  }, intervalMs)
+}
+
+export function stopPlaylistPolling(): void {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+/** One poll tick: adopt what the host has published and refresh the flags. */
+async function pullPlaylist(force: boolean): Promise<void> {
+  const reply = await fetchPlaylistReply(force)
+  if (!reply) return
+  // An empty answer with no walk running means the last attempt failed and is
+  // still throttled: ask for a forced rebuild once instead of sitting empty.
+  if (!force && !reply.tracks.length && !reply.loading) {
+    await pullPlaylist(true)
+    return
+  }
+  musicLibLoading.set(reply.loading)
+  if (reply.tracks.length) {
+    // A finished walk is the authoritative answer: it may legitimately be
+    // shorter (songs unfavourited), unlike a half-published list.
+    adoptPlaylist(reply.tracks, undefined, !reply.loading)
+    ensureAudio()
+    if (audio && !audio.src) audio.src = srcFor(get(musicIndex))
+  }
+  if (reply.loading) startPlaylistPolling()
+  else stopPlaylistPolling()
 }
 
 /** Load the playlist + saved state and prepare the audio element. Idempotent. */
 export async function initMusic(): Promise<void> {
   if (initialized || typeof window === 'undefined') return
   initialized = true
+  // Element first: a library that never loads must not leave search results
+  // unplayable, which is exactly what the old early return did.
+  ensureAudio()
   try {
     const [plRes, stateRes] = await Promise.all([
       fetch('/api/music/playlist').catch(() => null),
       fetch('/api/music/state').catch(() => null),
     ])
-    if (!plRes || !plRes.ok) return
-    const body = await plRes.json().catch(() => null)
-    const tracks: Track[] = body?.tracks ?? []
-    if (!tracks.length) return
     const st = stateRes && stateRes.ok ? await stateRes.json().catch(() => null) : null
+    restorePosition = Number(st?.position) || 0
+    if (st?.paused === false) wantResume = true
 
-    musicTracks.set(tracks)
-    const idx = Math.min(Math.max(0, Number(st?.index) || 0), tracks.length - 1)
-    musicIndex.set(idx)
-    musicNow.set(tracks[idx])
-
-    audio = new Audio()
-    attach(audio, Number(st?.position) || 0)
-    audio.src = srcFor(idx)
-    ensureVizGraph()
-    audio.addEventListener('play', () => {
-      if (vizCtx?.state === 'suspended') void vizCtx.resume()
-    })
-    musicReady.set(true)
+    const body = plRes && plRes.ok ? await plRes.json().catch(() => null) : null
+    const tracks: Track[] = body?.tracks ?? []
+    const loading = body?.loading === true
+    musicLibLoading.set(loading)
+    if (!tracks.length) {
+      // A throttled empty answer (a previous walk failed) is worth one forced
+      // rebuild; otherwise just poll the walk that is already running.
+      if (loading) startPlaylistPolling()
+      else void pullPlaylist(false)
+      return
+    }
+    adoptPlaylist(tracks, Number(st?.index) || 0)
+    if (audio && !audio.src) audio.src = srcFor(get(musicIndex))
+    if (loading) startPlaylistPolling()
 
     // Never start audio here: the sidebar mounts behind the boot splash, and a
     // song under the opening animation is exactly the bug this flag avoids.
     // resumeMusicIfWanted() runs once the splash hands over.
-    if (st?.paused === false) wantResume = true
   } catch { /* no playlist (offline): the button stays "休息" */ }
 }
 
 /** Fill an empty playlist (panel open). `force` bypasses the host snapshot. */
 export async function retryMusicPlaylist(force = false): Promise<void> {
-  if (!force && get(musicTracks).length > 0) return
-  try {
-    const res = await fetch(force ? '/api/music/playlist?refresh=1' : '/api/music/playlist')
-    if (!res.ok) return
-    const body = await res.json().catch(() => null)
-    const tracks: Track[] = body?.tracks ?? []
-    if (!tracks.length) return
-    const prev = get(musicTracks)
-    // A partial answer must never shrink the library nor restart the song.
-    if (prev.length > 0 && tracks.length < prev.length) return
-    const playing = prev[get(musicIndex)]?.bvid ?? ''
-    const prevIdx = get(musicIndex)
-    musicTracks.set(tracks)
-    const idx = playing
-      ? Math.max(0, tracks.findIndex(t => t.bvid === playing))
-      : Math.min(prevIdx, tracks.length - 1)
-    musicIndex.set(idx)
-    if (!get(musicNow) || tracks.some(t => t.bvid === get(musicNow)!.bvid)) {
-      musicNow.set(tracks[idx])
-    }
-    if (!audio) {
-      await initMusic()
-    } else if (idx !== prevIdx || !playing) {
-      // Only re-point the element when the current track actually changed.
-      audio.src = srcFor(idx)
-    }
-    musicReady.set(true)
-  } catch { /* still blocked: the button keeps saying 休息 */ }
+  if (!force && get(musicTracks).length > 0 && !get(musicLibLoading)) return
+  await pullPlaylist(force)
 }
 
 export function toggleMusic(): void {
-  if (!audio) return
-  if (audio.paused) void audio.play().catch(() => {})
-  else audio.pause()
+  const a = ensureAudio()
+  if (!a) return
+  if (!a.src) {
+    const t = get(musicNow) ?? trackAt(get(musicIndex))
+    if (!t) return
+    a.src = `/api/music/stream/${encodeURIComponent(t.bvid)}`
+  }
+  if (a.paused) void a.play().catch(() => {})
+  else a.pause()
 }
 
 /** Pause without toggling — used while the in-capsule video owns the sound. */
@@ -493,9 +583,10 @@ export function selectTrack(i: number, play: boolean): void {
   musicIndex.set(idx)
   musicNow.set(tracks[idx])
   musicPosition.set(0)
-  if (!audio) return
-  audio.src = srcFor(idx)
-  if (play) void audio.play().catch(() => {})
+  const a = ensureAudio()
+  if (!a) return
+  a.src = srcFor(idx)
+  if (play) void a.play().catch(() => {})
   save(true)
   reportNearby()
 }
@@ -506,9 +597,11 @@ export function playTrack(t: Track): void {
   musicPosition.set(0)
   const idx = get(musicTracks).findIndex(x => x.bvid === t.bvid)
   if (idx >= 0) musicIndex.set(idx)
-  if (!audio) return
-  audio.src = `/api/music/stream/${encodeURIComponent(t.bvid)}`
-  void audio.play().catch(() => {})
+  // A search result must play even when the library never loaded.
+  const a = ensureAudio()
+  if (!a) return
+  a.src = `/api/music/stream/${encodeURIComponent(t.bvid)}`
+  void a.play().catch(() => {})
   save(true)
   reportNearby()
 }
@@ -536,8 +629,9 @@ export function prevMusic(): void {
 }
 
 export function seekMusic(seconds: number): void {
-  if (!audio) return
-  try { audio.currentTime = seconds } catch { /* ignore */ }
+  const a = ensureAudio()
+  if (!a) return
+  try { a.currentTime = seconds } catch { /* ignore */ }
   musicPosition.set(seconds)
   save()
 }

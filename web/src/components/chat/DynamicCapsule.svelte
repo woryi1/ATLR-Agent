@@ -29,9 +29,6 @@
   let showVideo = $state(false)
   let videoEl = $state<HTMLVideoElement | null>(null)
   let videoError = $state('')
-  // True while the video has taken the sound away from the music player, so
-  // closing it can hand the audio back exactly once.
-  let musicOwnedByVideo = false
 
   const clock = setInterval(() => { now = new Date() }, 30_000)
 
@@ -146,22 +143,30 @@
   }
 
   // Release the media element for real: dropping the node alone can leave the
-  // decoder and its buffers alive until GC.
+  // decoder and its buffers alive until GC. The music player owns the sound in
+  // this mode, so there is nothing to hand back.
   function closeVideo(): void {
-    // Hand the sound back to the music player if the video borrowed it.
-    if (musicOwnedByVideo) {
-      musicOwnedByVideo = false
-      resumeMusic()
-      videoLog('video.music.restored', {})
-    }
     const v = videoEl
     if (!v) return
     videoLog('video.close', { bvid: $musicNow?.bvid ?? '', ...videoState() })
-    try { v.pause() } catch { /* already gone */ }
-    try {
-      v.removeAttribute('src')
-      v.load()
-    } catch { /* ignore */ }
+    quietly(() => {
+      try { v.pause() } catch { /* already gone */ }
+      try {
+        v.removeAttribute('src')
+        v.load()
+      } catch { /* ignore */ }
+    })
+  }
+
+  // Media events are dispatched asynchronously, so a pause we trigger ourselves
+  // (track switch, closing the player) would otherwise look like the user
+  // pressing pause and stop the music. The window covers the queued events.
+  let programmatic = 0
+  function quietly(fn: () => void): void {
+    programmatic++
+    try { fn() } finally {
+      setTimeout(() => { programmatic = Math.max(0, programmatic - 1) }, 400)
+    }
   }
 
   function toggleVideo(): void {
@@ -176,27 +181,22 @@
       open,
     })
     if (showVideo) {
-      // Entering video mode pins the panel open, and the video owns the sound
-      // while it plays: pause the music instead of stacking two audio sources.
+      // Entering video mode pins the panel open. The music keeps playing: the
+      // DASH rendition is video-only, so it is the sound for this mode.
       clearTimer()
-      if (get(musicPlaying)) {
-        musicOwnedByVideo = true
-        pauseMusic()
-        videoLog('video.music.paused_for_video', { musicPos: get(musicPosition) })
-      }
     } else {
       closeVideo()
       scheduleAutoClose()
     }
   }
 
-  // Seek to the music position on metadata, then start playback with sound.
-  // If the autoplay policy refuses an audible start (rare: the click that
-  // opened the video normally counts as a gesture), fall back to muted playback
-  // and hand the audio back to the music instead of leaving a silent video.
+  // The stream is video-only: the music player (same track) owns the sound, so
+  // the picture is slaved to the audio clock. On metadata, align to the music
+  // position and start only if the music is playing.
   function onVideoMeta(): void {
     const v = videoEl
     if (!v) return
+    v.muted = true
     const pos = get(musicPosition)
     videoLog('video.metadata', { ...videoState(), seekTo: Number(pos.toFixed(2)) })
     try {
@@ -204,26 +204,66 @@
     } catch (e) {
       videoLog('video.seek.failed', { error: String(e) })
     }
-    const p = v.play()
-    if (p && typeof p.then === 'function') {
-      p.then(() => videoLog('video.play.ok', videoState()))
-        .catch((e) => {
-          const err = e as Error
-          videoLog('video.play.rejected', {
-            name: err?.name ?? '',
-            message: String(err?.message ?? e),
-            ...videoState(),
-          })
-          if (err?.name === 'NotAllowedError') {
-            v.muted = true
-            videoLog('video.play.muted_fallback', videoState())
-            if (musicOwnedByVideo) {
-              musicOwnedByVideo = false
-              resumeMusic()
-            }
-            void v.play().catch(() => { /* controls stay available */ })
-          }
-        })
+    if (!get(musicPlaying)) return
+    v.play()
+      .then(() => videoLog('video.play.ok', videoState()))
+      .catch((e) => videoLog('video.play.rejected', {
+        name: (e as Error)?.name ?? '',
+        message: String((e as Error)?.message ?? e),
+        ...videoState(),
+      }))
+  }
+
+  /** Video and music are the same timeline; correct drift, never fight it. */
+  function syncVideoToMusic(): void {
+    const v = videoEl
+    if (!v || v.seeking || v.ended) return
+    const pos = get(musicPosition)
+    if (Math.abs(v.currentTime - pos) > 0.5) {
+      const from = v.currentTime
+      try { v.currentTime = pos } catch { /* ignore */ }
+      videoLog('video.sync.seek', { from: Number(from.toFixed(2)), to: Number(pos.toFixed(2)) })
+    }
+  }
+
+  /** The capsule's seek bar drives both clocks, so they never split. */
+  function seekBoth(seconds: number): void {
+    seekMusic(seconds)
+    const v = videoEl
+    if (v && showVideo) {
+      try { v.currentTime = seconds } catch { /* ignore */ }
+    }
+  }
+
+  // Native controls must drive the music too, otherwise the picture pauses and
+  // the sound keeps going.
+  function onVideoPlay(): void {
+    logVideoEvent('play')
+    if (programmatic > 0) return
+    if (!get(musicPlaying)) resumeMusic()
+  }
+
+  function onVideoPause(): void {
+    logVideoEvent('pause')
+    if (programmatic > 0) return
+    if (get(musicPlaying)) pauseMusic()
+  }
+
+  function onVideoSeeked(): void {
+    logVideoEvent('seeked')
+    if (programmatic > 0) return
+    const v = videoEl
+    if (!v) return
+    if (Math.abs(get(musicPosition) - v.currentTime) > 0.5) seekMusic(v.currentTime)
+  }
+
+  // The video carries no audio track; unmuting it would only stack a silent
+  // control on top of the music. Keep it muted and say so in the log.
+  function onVideoVolumeChange(): void {
+    const v = videoEl
+    if (v && !v.muted) {
+      v.muted = true
+      videoLog('video.muted.forced', videoState())
     }
   }
 
@@ -249,16 +289,71 @@
     videoLog(`video.event.${name}`, videoState())
   }
 
+  // Swap the source of the live element in place when the song changes. Svelte
+  // has already pointed the src attribute at the new bvid; load() aborts the
+  // previous request, frees its decoder buffers, and restarts the resource
+  // selection, so the panel cannot keep showing the old frozen frame.
+  function switchVideo(bvid: string): void {
+    const v = videoEl
+    if (!v) return
+    videoError = ''
+    videoLog('video.switch', { bvid, ...videoState() })
+    quietly(() => {
+      try { v.pause() } catch { /* already gone */ }
+      try { v.currentTime = 0 } catch { /* ignore */ }
+      try { v.load() } catch { /* ignore */ }
+    })
+  }
+
   // Closing the panel or changing track must stop the stream. untrack keeps
   // closeVideo's reads (videoEl, musicNow) OUT of these effects' dependencies:
   // without it, binding the media element itself re-ran an effect and cleared
-  // the src the moment it was set.
-  $effect(() => {
-    if (!open) untrack(() => closeVideo())
+  // the src the moment it was set. `pre` so the release happens while the
+  // element is still bound — after the panel unmounts there is nothing left to
+  // pause and the browser keeps the download alive until GC.
+  $effect.pre(() => {
+    if (!open) untrack(() => {
+      closeVideo()
+      // Leaving the panel exits video mode too. Keeping showVideo true remounted
+      // the player on the next open and started a second audio source over the
+      // music closeVideo had just resumed.
+      showVideo = false
+    })
   })
+
+  // A track change follows into the open video. This used to call closeVideo()
+  // unconditionally, which removed the src Svelte had just pointed at the new
+  // bvid — the picture froze until the button was toggled off and on again.
+  let lastVideoBvid = ''
   $effect(() => {
-    void $musicNow?.bvid
-    untrack(() => closeVideo())
+    const bvid = $musicNow?.bvid ?? ''
+    if (bvid === lastVideoBvid) return
+    lastVideoBvid = bvid
+    untrack(() => {
+      if (!showVideo || !bvid) {
+        closeVideo()
+        return
+      }
+      switchVideo(bvid)
+    })
+  })
+
+  // The capsule's play/pause is the music transport; mirror it onto the picture.
+  $effect(() => {
+    const playing = $musicPlaying
+    const v = videoEl
+    if (!v || !showVideo) return
+    if (playing && v.paused) void v.play().catch(() => {})
+    else if (!playing && !v.paused) v.pause()
+  })
+
+  // Two independent decoders drift; nudge the picture back to the audio clock.
+  $effect(() => {
+    if (!showVideo) return
+    const id = setInterval(() => {
+      if (get(musicPlaying)) syncVideoToMusic()
+    }, 2000)
+    return () => clearInterval(id)
   })
 
   // A short two-note chime, deliberately different from the voice-input cue.
@@ -466,7 +561,7 @@
               max={$musicDuration || 0}
               step="0.5"
               value={$musicPosition}
-              oninput={(e) => seekMusic(Number(e.currentTarget.value))}
+              oninput={(e) => seekBoth(Number(e.currentTarget.value))}
             />
             <span>{fmtTime($musicDuration)}</span>
           </div>
@@ -480,23 +575,24 @@
               src={`/api/music/video/${encodeURIComponent($musicNow.bvid)}`}
               poster={$musicNow.cover ? proxyImg($musicNow.cover) : undefined}
               playsinline
-              loop
+              muted
               preload="metadata"
               controls
               onloadstart={() => logVideoEvent('loadstart')}
               onloadedmetadata={onVideoMeta}
               onloadeddata={() => logVideoEvent('loadeddata')}
               oncanplay={() => logVideoEvent('canplay')}
-              onplay={() => logVideoEvent('play')}
+              onplay={onVideoPlay}
               onplaying={() => logVideoEvent('playing')}
-              onpause={() => logVideoEvent('pause')}
+              onpause={onVideoPause}
               onwaiting={() => logVideoEvent('waiting')}
               onstalled={() => logVideoEvent('stalled')}
               onseeking={() => logVideoEvent('seeking')}
-              onseeked={() => logVideoEvent('seeked')}
+              onseeked={onVideoSeeked}
               onended={() => logVideoEvent('ended')}
               onemptied={() => logVideoEvent('emptied')}
               onabort={() => logVideoEvent('abort')}
+              onvolumechange={onVideoVolumeChange}
               onprogress={onVideoProgress}
               onerror={onVideoError}
             ></video>

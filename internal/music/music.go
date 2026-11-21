@@ -92,14 +92,27 @@ type cachedURL struct {
 	at  time.Time
 }
 
+// cachedVideo is a resolved video stream plus the rendition Bilibili granted.
+// The quality belongs in the cache file name: a 720p copy must never shadow a
+// later 1080p grant for the same bvid.
+type cachedVideo struct {
+	url     string
+	at      time.Time
+	quality int
+	width   int
+	height  int
+	codecid int
+}
+
 // Service owns the playlist cache, the resolved-URL cache and the audio cache.
 type Service struct {
 	mu      sync.Mutex
 	tracks  []Track
 	fetched time.Time
 	urls    map[string]cachedURL
-	// videoURLs memoises resolved DASH video URLs separately from audio.
-	videoURLs map[string]cachedURL
+	// videoURLs memoises resolved video streams (DASH and progressive) with the
+	// granted rendition, separately from audio.
+	videoURLs map[string]cachedVideo
 	warming   map[string]bool
 	client    *http.Client
 	cacheDir  string
@@ -124,7 +137,7 @@ func NewService() *Service {
 	videoCacheDir, _ := datahome.RegionPath(datahome.RegionCache, "music-video-cache")
 	s := &Service{
 		urls:          make(map[string]cachedURL),
-		videoURLs:     make(map[string]cachedURL),
+		videoURLs:     make(map[string]cachedVideo),
 		cookies:       make(map[string]string),
 		client:        &http.Client{Timeout: 20 * time.Second},
 		cacheDir:      cacheDir,
@@ -183,6 +196,14 @@ func LogDebug(side, event string, detail any) {
 		}
 	}
 	_, _ = f.WriteString(time.Now().Format("2006-01-02T15:04:05.000-07:00") + " [" + side + "] " + event + payload + "\n")
+}
+
+// loggedIn reports whether an account session is present, for the video debug
+// log (the granted quality depends on it). Never logs the cookie value.
+func (s *Service) loggedIn() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cookies["SESSDATA"] != ""
 }
 
 // cookieHeader renders the stored cookies as a Cookie header.
@@ -280,6 +301,12 @@ func (s *Service) getJSON(ctx context.Context, rawURL string, dst any) error {
 }
 
 // Playlist returns both favourites in order, de-duplicated, cached for a while.
+//
+// A cold library never blocks the caller. Walking ~1,200 favourites takes about
+// a minute at the client-shaped pace, and making the HTTP call wait for it was
+// what left the panel on "loading" while the player refused to respond. The
+// rebuild now runs in the background and publishes each page as it arrives, so
+// the list fills in and every visible track is playable immediately.
 func (s *Service) Playlist(ctx context.Context) ([]Track, error) {
 	s.mu.Lock()
 	if len(s.tracks) > 0 && time.Since(s.fetched) < playlistTTL {
@@ -309,47 +336,29 @@ func (s *Service) Playlist(ctx context.Context) ([]Track, error) {
 		return append([]Track(nil), snap.Tracks...), nil
 	}
 
-	s.ensureCookie(ctx)
-	tracks, complete, err := s.fetchRemote(ctx)
-	if err != nil || len(tracks) == 0 {
-		// The WAF answered 412 (IP-level rate limit) — an older snapshot is far
-		// better than an empty player, so reuse one regardless of age.
-		if stale, _, ok := s.loadPlaylistFileAny(); ok {
-			s.mu.Lock()
-			s.tracks, s.fetched = stale, time.Now()
-			s.mu.Unlock()
-			return stale, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("music: no playable items in the favourites")
-	}
-
+	// Cold: nothing local to serve. Start the walk in the background and answer
+	// with whatever has been published so far (usually nothing on the first
+	// call); the page polls until the pages arrive.
+	s.refreshNow()
 	s.mu.Lock()
-	s.tracks = tracks
-	// An incomplete run keeps the old timestamp, so the next attempt refetches
-	// instead of serving the partial list for the in-memory TTL.
-	if complete {
-		s.fetched = time.Now()
-	}
+	out := append([]Track(nil), s.tracks...)
 	s.mu.Unlock()
-	// A partial list (one favourite refused) must not poison the snapshot: it
-	// would otherwise stick for six hours and hide the rest of the library.
-	if complete {
-		s.savePlaylistFile(tracks)
-	} else if stale, _, ok := s.loadPlaylistFileAny(); ok && len(stale) > len(tracks) {
-		s.mu.Lock()
-		s.tracks = stale
-		s.mu.Unlock()
-		return stale, nil
-	}
-	return append([]Track(nil), tracks...), nil
+	return out, nil
+}
+
+// Loading reports whether a background rebuild is still walking the favourites.
+// The page polls while this is true so the list keeps growing.
+func (s *Service) Loading() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refreshing
 }
 
 // fetchRemote pages through both favourites. It reports complete=false when a
 // page was refused mid-way, so callers can avoid persisting a partial list.
-func (s *Service) fetchRemote(ctx context.Context) ([]Track, bool, error) {
+// onProgress, when non-nil, receives a snapshot after every page so a cold
+// library can be shown — and played — while the walk is still running.
+func (s *Service) fetchRemote(ctx context.Context, onProgress func([]Track)) ([]Track, bool, error) {
 	var tracks []Track
 	seen := map[string]bool{}
 	seenTitle := map[string]bool{}
@@ -375,6 +384,12 @@ func (s *Service) fetchRemote(ctx context.Context) ([]Track, bool, error) {
 			Cover:    m.Cover,
 			Duration: m.Duration,
 		})
+	}
+	emit := func() {
+		if onProgress == nil || len(tracks) == 0 {
+			return
+		}
+		onProgress(append([]Track(nil), tracks...))
 	}
 
 	// One page with the WAF retry already in it. The full parameter set matters:
@@ -411,6 +426,7 @@ func (s *Service) fetchRemote(ctx context.Context) ([]Track, bool, error) {
 						addMedia(m)
 					}
 					fetched[anchor] = true
+					emit()
 					time.Sleep(pageGap)
 				}
 			}
@@ -429,6 +445,7 @@ func (s *Service) fetchRemote(ctx context.Context) ([]Track, bool, error) {
 					for _, m := range medias {
 						addMedia(m)
 					}
+					emit()
 					break
 				}
 				if len(tracks) > 0 {
@@ -440,6 +457,7 @@ func (s *Service) fetchRemote(ctx context.Context) ([]Track, bool, error) {
 				addMedia(m)
 			}
 			fetched[pn] = true
+			emit()
 			// Client-shaped pacing: a small gap between pages, then a longer
 			// pause after each 100-track batch. Dozens of requests back to back
 			// are what trips the WAF on anonymous clients.
@@ -586,8 +604,29 @@ func (s *Service) runRefresh() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 		s.ensureCookie(ctx)
-		tracks, complete, err := s.fetchRemote(ctx)
+		// Publish page by page only when there is nothing to lose. A warm list
+		// must stay intact until the new one is complete, otherwise a refresh
+		// would briefly shrink the library and move the playing index.
+		s.mu.Lock()
+		cold := len(s.tracks) == 0
+		s.mu.Unlock()
+		var progress func([]Track)
+		if cold {
+			progress = func(partial []Track) {
+				s.mu.Lock()
+				s.tracks = partial
+				s.mu.Unlock()
+			}
+		}
+		tracks, complete, err := s.fetchRemote(ctx, progress)
 		if err != nil || !complete || len(tracks) == 0 {
+			// An older snapshot is far better than an empty player, whatever the
+			// reason the walk stopped (WAF 412, offline, timeout).
+			if stale, _, ok := s.loadPlaylistFileAny(); ok && len(stale) > 0 {
+				s.mu.Lock()
+				s.tracks = stale
+				s.mu.Unlock()
+			}
 			return
 		}
 		s.mu.Lock()
@@ -870,12 +909,15 @@ type dashVideoStream struct {
 	BackupURL []string `json:"backupUrl"`
 	Bandwidth int      `json:"bandwidth"`
 	Codecid   int      `json:"codecid"`
+	Width     int      `json:"width"`
+	Height    int      `json:"height"`
 }
 
 // pickVideoStream prefers AVC, then AV1, then anything except HEVC. WebView2
 // has no HEVC soft decoder on most machines, so an HEVC-only pick would show
-// audio with a black picture. Within the chosen codec the highest bandwidth
-// wins — that is the highest resolution the account is allowed to play.
+// audio with a black picture. Within the chosen codec the highest rendition id
+// (80 = 1080p, 116 = 1080p+) wins, then the highest bandwidth — that is the
+// best picture the account is allowed to play.
 func pickVideoStream(list []dashVideoStream) dashVideoStream {
 	rank := func(codecid int) int {
 		switch codecid {
@@ -893,21 +935,23 @@ func pickVideoStream(list []dashVideoStream) dashVideoStream {
 	bestRank := rank(best.Codecid)
 	for _, v := range list[1:] {
 		r := rank(v.Codecid)
-		if r < bestRank || (r == bestRank && v.Bandwidth > best.Bandwidth) {
+		if r < bestRank ||
+			(r == bestRank && (v.ID > best.ID || (v.ID == best.ID && v.Bandwidth > best.Bandwidth))) {
 			best, bestRank = v, r
 		}
 	}
 	return best
 }
 
-// ResolveVideo maps a bvid to the best playable DASH video URL, using the same
-// playurl call PiliPlus makes (fnval=4048 = every DASH format, try_look=1 lets
-// a logged-out client reach 1080p). URLs are memoised separately from audio.
-func (s *Service) ResolveVideo(ctx context.Context, bvid string) (string, error) {
+// ResolveVideo maps a bvid to the best playable DASH video stream, using the
+// same playurl call PiliPlus makes (fnval=4048 = every DASH format, try_look=1
+// lets a logged-out client reach 1080p). The returned rendition is what the
+// cache file name is built from, so a 720p copy cannot shadow a 1080p grant.
+func (s *Service) ResolveVideo(ctx context.Context, bvid string) (cachedVideo, error) {
 	s.mu.Lock()
 	if c, ok := s.videoURLs[bvid]; ok && time.Since(c.at) < urlTTL {
 		s.mu.Unlock()
-		return c.url, nil
+		return c, nil
 	}
 	s.mu.Unlock()
 
@@ -918,26 +962,28 @@ func (s *Service) ResolveVideo(ctx context.Context, bvid string) (string, error)
 		} `json:"data"`
 	}
 	if err := s.getJSON(ctx, apiBase+"/x/web-interface/view?bvid="+url.QueryEscape(bvid), &view); err != nil {
-		return "", err
+		return cachedVideo{}, err
 	}
 	if view.Code != 0 || view.Data.CID == 0 {
-		return "", fmt.Errorf("music: cannot resolve %s", bvid)
+		return cachedVideo{}, fmt.Errorf("music: cannot resolve %s", bvid)
 	}
 
 	var play struct {
 		Code int `json:"code"`
 		Data struct {
-			Dash struct {
+			Quality       int   `json:"quality"`
+			AcceptQuality []int `json:"accept_quality"`
+			Dash          struct {
 				Video []dashVideoStream `json:"video"`
 			} `json:"dash"`
 		} `json:"data"`
 	}
 	u := fmt.Sprintf("%s/x/player/playurl?bvid=%s&cid=%d&fnval=4048&qn=127&fourk=1&try_look=1", apiBase, url.QueryEscape(bvid), view.Data.CID)
 	if err := s.getJSON(ctx, u, &play); err != nil {
-		return "", err
+		return cachedVideo{}, err
 	}
 	if play.Code != 0 || len(play.Data.Dash.Video) == 0 {
-		return "", fmt.Errorf("music: no video stream for %s", bvid)
+		return cachedVideo{}, fmt.Errorf("music: no video stream for %s", bvid)
 	}
 	best := pickVideoStream(play.Data.Dash.Video)
 	picked := best.BaseURL
@@ -945,8 +991,17 @@ func (s *Service) ResolveVideo(ctx context.Context, bvid string) (string, error)
 		picked = best.BackupURL[0]
 	}
 	if picked == "" {
-		return "", fmt.Errorf("music: empty video stream URL for %s", bvid)
+		return cachedVideo{}, fmt.Errorf("music: empty video stream URL for %s", bvid)
 	}
+	out := cachedVideo{
+		url: picked, at: time.Now(), quality: best.ID,
+		width: best.Width, height: best.Height, codecid: best.Codecid,
+	}
+	LogDebug("be", "video.resolve.dash.ok", map[string]any{
+		"bvid": bvid, "cid": view.Data.CID, "quality": best.ID, "accept": play.Data.AcceptQuality,
+		"width": best.Width, "height": best.Height, "codecid": best.Codecid,
+		"bandwidth": best.Bandwidth, "login": s.loggedIn(), "renditions": len(play.Data.Dash.Video),
+	})
 
 	s.mu.Lock()
 	if len(s.videoURLs) >= 64 {
@@ -962,29 +1017,29 @@ func (s *Service) ResolveVideo(ctx context.Context, bvid string) (string, error)
 			}
 		}
 	}
-	s.videoURLs[bvid] = cachedURL{url: picked, at: time.Now()}
+	s.videoURLs[bvid] = out
 	s.mu.Unlock()
-	return picked, nil
+	return out, nil
 }
 
-func (s *Service) videoCachePath(bvid string) string {
+func (s *Service) videoCachePath(bvid string, quality, height int) string {
 	sum := sha1.Sum([]byte(bvid))
-	return filepath.Join(s.videoCacheDir, hex.EncodeToString(sum[:])+".m4s")
+	return filepath.Join(s.videoCacheDir, fmt.Sprintf("%s-q%d-%d.m4s", hex.EncodeToString(sum[:]), quality, height))
 }
 
-// resolveProgressive resolves Bilibili's plain MP4 (durl). A WebView's <video>
-// can play this directly; DASH renditions are fragmented MP4 and need MSE,
-// which is why a DASH source only ever showed the poster frame here.
-func (s *Service) resolveProgressive(ctx context.Context, bvid string) (string, error) {
+// resolveProgressive resolves Bilibili's plain MP4 (durl). This is the fallback
+// for videos whose DASH renditions are all undecodable; Bilibili caps durl at
+// 720p, so the granted quality is returned and used in the cache file name.
+func (s *Service) resolveProgressive(ctx context.Context, bvid string) (string, int, error) {
 	key := "p:" + bvid
 	s.mu.Lock()
 	if c, ok := s.videoURLs[key]; ok && time.Since(c.at) < urlTTL {
 		s.mu.Unlock()
-		LogDebug("be", "video.resolve.progressive.cached", map[string]any{"bvid": bvid})
-		return c.url, nil
+		LogDebug("be", "video.resolve.progressive.cached", map[string]any{"bvid": bvid, "quality": c.quality})
+		return c.url, c.quality, nil
 	}
 	s.mu.Unlock()
-	LogDebug("be", "video.resolve.progressive.start", map[string]any{"bvid": bvid})
+	LogDebug("be", "video.resolve.progressive.start", map[string]any{"bvid": bvid, "login": s.loggedIn()})
 	start := time.Now()
 
 	var view struct {
@@ -995,18 +1050,19 @@ func (s *Service) resolveProgressive(ctx context.Context, bvid string) (string, 
 	}
 	if err := s.getJSON(ctx, apiBase+"/x/web-interface/view?bvid="+url.QueryEscape(bvid), &view); err != nil {
 		LogDebug("be", "video.resolve.progressive.view_error", map[string]any{"bvid": bvid, "error": err.Error()})
-		return "", err
+		return "", 0, err
 	}
 	if view.Code != 0 || view.Data.CID == 0 {
 		LogDebug("be", "video.resolve.progressive.no_cid", map[string]any{"bvid": bvid, "code": view.Code, "cid": view.Data.CID})
-		return "", fmt.Errorf("music: cannot resolve %s", bvid)
+		return "", 0, fmt.Errorf("music: cannot resolve %s", bvid)
 	}
 
 	var play struct {
 		Code int `json:"code"`
 		Data struct {
-			Quality int `json:"quality"`
-			Durl    []struct {
+			Quality       int   `json:"quality"`
+			AcceptQuality []int `json:"accept_quality"`
+			Durl          []struct {
 				URL       string   `json:"url"`
 				BackupURL []string `json:"backup_url"`
 				Size      int64    `json:"size"`
@@ -1018,13 +1074,13 @@ func (s *Service) resolveProgressive(ctx context.Context, bvid string) (string, 
 	u := fmt.Sprintf("%s/x/player/playurl?bvid=%s&cid=%d&fnval=1&qn=80&fourk=1&try_look=1", apiBase, url.QueryEscape(bvid), view.Data.CID)
 	if err := s.getJSON(ctx, u, &play); err != nil {
 		LogDebug("be", "video.resolve.progressive.playurl_error", map[string]any{"bvid": bvid, "error": err.Error()})
-		return "", err
+		return "", 0, err
 	}
 	if play.Code != 0 || len(play.Data.Durl) == 0 {
 		LogDebug("be", "video.resolve.progressive.empty", map[string]any{
 			"bvid": bvid, "code": play.Code, "quality": play.Data.Quality, "segments": len(play.Data.Durl),
 		})
-		return "", fmt.Errorf("music: no progressive stream for %s", bvid)
+		return "", 0, fmt.Errorf("music: no progressive stream for %s", bvid)
 	}
 	picked := play.Data.Durl[0].URL
 	if picked == "" && len(play.Data.Durl[0].BackupURL) > 0 {
@@ -1032,10 +1088,11 @@ func (s *Service) resolveProgressive(ctx context.Context, bvid string) (string, 
 	}
 	if picked == "" {
 		LogDebug("be", "video.resolve.progressive.no_url", map[string]any{"bvid": bvid, "segments": len(play.Data.Durl)})
-		return "", fmt.Errorf("music: empty progressive URL for %s", bvid)
+		return "", 0, fmt.Errorf("music: empty progressive URL for %s", bvid)
 	}
 	LogDebug("be", "video.resolve.progressive.ok", map[string]any{
 		"bvid": bvid, "cid": view.Data.CID, "quality": play.Data.Quality,
+		"accept": play.Data.AcceptQuality, "login": s.loggedIn(),
 		"segments": len(play.Data.Durl), "size": play.Data.Durl[0].Size,
 		"host": urlHost(picked), "ms": time.Since(start).Milliseconds(),
 	})
@@ -1053,19 +1110,23 @@ func (s *Service) resolveProgressive(ctx context.Context, bvid string) (string, 
 			}
 		}
 	}
-	s.videoURLs[key] = cachedURL{url: picked, at: time.Now()}
+	s.videoURLs[key] = cachedVideo{url: picked, at: time.Now(), quality: play.Data.Quality}
 	s.mu.Unlock()
-	return picked, nil
+	return picked, play.Data.Quality, nil
 }
 
-func (s *Service) progressiveCachePath(bvid string) string {
+func (s *Service) progressiveCachePath(bvid string, quality int) string {
 	sum := sha1.Sum([]byte(bvid))
-	return filepath.Join(s.videoCacheDir, hex.EncodeToString(sum[:])+".mp4")
+	return filepath.Join(s.videoCacheDir, fmt.Sprintf("%s-q%d.mp4", hex.EncodeToString(sum[:]), quality))
 }
 
-// ServeVideo proxies one video. Progressive MP4 is tried first so the WebView
-// can play it as a plain <video src>; DASH stays as a fallback for videos that
-// have no progressive rendition.
+// ServeVideo proxies one video.
+//
+// DASH is the primary source: it is the only place Bilibili still offers 1080p
+// and above (durl/MP4 is capped at 720p), and Chromium's <video> plays a DASH
+// video-only rendition directly when it is served as a plain file. Progressive
+// MP4 stays as the fallback for videos whose DASH renditions are HEVC-only —
+// WebView2 cannot decode those, whereas its MP4 includes an AVC track.
 func (s *Service) ServeVideo(w http.ResponseWriter, r *http.Request, bvid string) {
 	rid := NextDebugRequestID()
 	LogDebug("be", "video.request", map[string]any{
@@ -1075,31 +1136,38 @@ func (s *Service) ServeVideo(w http.ResponseWriter, r *http.Request, bvid string
 		"range":  r.Header.Get("Range"),
 		"accept": r.Header.Get("Accept"),
 		"ua":     r.Header.Get("User-Agent"),
+		"mode":   r.URL.Query().Get("mode"),
 	})
 	if !ValidBVID(bvid) {
 		LogDebug("be", "video.reject", map[string]any{"rid": rid, "bvid": bvid, "reason": "invalid bvid"})
 		http.Error(w, "unknown track", http.StatusNotFound)
 		return
 	}
-	if videoURL, err := s.resolveProgressive(r.Context(), bvid); err == nil {
-		LogDebug("be", "video.source", map[string]any{
-			"rid": rid, "mode": "progressive", "host": urlHost(videoURL),
-		})
-		s.serveVideoStream(w, r, bvid, videoURL, s.progressiveCachePath(bvid), rid)
-		return
-	} else {
-		LogDebug("be", "video.progressive.failed", map[string]any{
-			"rid": rid, "bvid": bvid, "error": err.Error(),
-		})
+	mode := r.URL.Query().Get("mode")
+	if mode != "progressive" {
+		if v, err := s.ResolveVideo(r.Context(), bvid); err == nil && v.codecid != 12 {
+			LogDebug("be", "video.source", map[string]any{
+				"rid": rid, "mode": "dash", "quality": v.quality, "height": v.height,
+				"codecid": v.codecid, "host": urlHost(v.url),
+			})
+			s.serveVideoStream(w, r, bvid, v.url, s.videoCachePath(bvid, v.quality, v.height), rid)
+			return
+		} else if err != nil {
+			LogDebug("be", "video.dash.failed", map[string]any{"rid": rid, "bvid": bvid, "error": err.Error()})
+		} else {
+			LogDebug("be", "video.dash.skipped", map[string]any{"rid": rid, "bvid": bvid, "reason": "hevc only"})
+		}
 	}
-	videoURL, err := s.ResolveVideo(r.Context(), bvid)
+	videoURL, quality, err := s.resolveProgressive(r.Context(), bvid)
 	if err != nil {
-		LogDebug("be", "video.dash.failed", map[string]any{"rid": rid, "bvid": bvid, "error": err.Error()})
+		LogDebug("be", "video.progressive.failed", map[string]any{"rid": rid, "bvid": bvid, "error": err.Error()})
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	LogDebug("be", "video.source", map[string]any{"rid": rid, "mode": "dash", "host": urlHost(videoURL)})
-	s.serveVideoStream(w, r, bvid, videoURL, s.videoCachePath(bvid), rid)
+	LogDebug("be", "video.source", map[string]any{
+		"rid": rid, "mode": "progressive", "quality": quality, "host": urlHost(videoURL),
+	})
+	s.serveVideoStream(w, r, bvid, videoURL, s.progressiveCachePath(bvid, quality), rid)
 }
 
 // urlHost is the log-safe part of a signed CDN URL (the query is a token).
@@ -1174,7 +1242,9 @@ func (s *Service) serveVideoStream(w http.ResponseWriter, r *http.Request, bvid,
 		})
 		if rangeReq {
 			LogDebug("be", "video.warm.trigger", map[string]any{"rid": rid, "bvid": bvid})
-			s.warmVideo(videoURL, path)
+			// Never hold this handler open for a download the next track may
+			// make pointless; warmVideo bounds its own concurrency.
+			go s.warmVideo(videoURL, path)
 		}
 		return
 	}
@@ -1214,6 +1284,11 @@ func errString(err error) string {
 	return err.Error()
 }
 
+// warmSlots bounds background video downloads. Skipping through tracks would
+// otherwise start one full download per song; when both slots are busy the warm
+// is dropped rather than queued, and a later visit simply downloads it again.
+var warmSlots = make(chan struct{}, 2)
+
 // warmVideo downloads a clip in the background after a Range response so the
 // next play comes from disk. Keyed by cache path, which separates the
 // progressive and DASH variants of the same bvid.
@@ -1237,6 +1312,14 @@ func (s *Service) warmVideo(videoURL, path string) {
 		delete(s.warming, key)
 		s.mu.Unlock()
 	}()
+
+	select {
+	case warmSlots <- struct{}{}:
+		defer func() { <-warmSlots }()
+	default:
+		LogDebug("be", "video.warm.skip", map[string]any{"file": filepath.Base(path), "reason": "slots busy"})
+		return
+	}
 
 	if _, err := os.Stat(path); err == nil {
 		LogDebug("be", "video.warm.skip", map[string]any{"file": filepath.Base(path), "reason": "already cached"})

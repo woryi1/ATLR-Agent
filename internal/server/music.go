@@ -51,7 +51,12 @@ func (s *Server) handleMusicPlaylist(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"tracks": tracks})
+	// An empty list with loading=true means the background walk is still
+	// running; the page polls and fills in instead of blocking on this call.
+	if tracks == nil {
+		tracks = []music.Track{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tracks": tracks, "loading": musicService.Loading()})
 }
 
 // POST /api/music/nearby — record the playing index. The service keeps that

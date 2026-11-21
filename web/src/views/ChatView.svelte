@@ -4198,6 +4198,20 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
 :global(.rich-answer .mermaid-block[data-mermaid-rendered] pre), :global(.think-body .mermaid-block[data-mermaid-rendered] pre) { display: none; }
 :global(.rich-answer .mermaid-diagram), :global(.think-body .mermaid-diagram) { padding: 12px 14px; overflow-x: auto; }
 :global(.rich-answer .mermaid-diagram svg), :global(.think-body .mermaid-diagram svg) { max-width: 100%; height: auto; }
+/* A diagram is not a code listing: the generic code-block fill (82% + a 10px
+   backdrop blur) let the wallpaper through but smeared the background lyrics
+   behind it into an unreadable blob. Drop the fill and the blur so only the
+   SVG's own shapes sit on top, exactly like normal text does. */
+:global(.rich-answer .code-block.mermaid-block), :global(.think-body .code-block.mermaid-block) {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+:global(.rich-answer .mermaid-block .code-header), :global(.think-body .mermaid-block .code-header) {
+  background: transparent;
+}
+:global(.rich-answer .mermaid-diagram), :global(.think-body .mermaid-diagram) { background: transparent; }
+:global(.rich-answer .mermaid-diagram svg), :global(.think-body .mermaid-diagram svg) { background: transparent; }
 :global(.rich-answer .md-bq), :global(.think-body .md-bq) {
   margin: 0; padding: 8px 14px; border-left: 3px solid var(--blue-2);
   background: color-mix(in srgb, var(--surface-info) 74%, transparent); border-radius: 0 6px 6px 0;

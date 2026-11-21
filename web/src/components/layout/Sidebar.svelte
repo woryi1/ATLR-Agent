@@ -9,6 +9,7 @@
     openMusicVideo, resumeMusicIfWanted, stagePlaylistRefresh, applyPendingPlaylist,
     musicNow, playTrack,
     musicLibOpen, musicLibSearchOpen, musicLibQuery, musicLibRemote, musicLibSearching,
+    musicLibLoading, startPlaylistPolling,
     setMusicLibQuery, favoriteTrack, musicFaved,
   } from '../../lib/music'
   import type { Track } from '../../lib/music'
@@ -1314,7 +1315,14 @@
                 aria-label={$t('music.search_placeholder')}
               />
             {:else}
-              <span>{$musicTracks.length === 0 ? $t('music.lib_loading') : $t('music.lib_count').replace('{n}', String($musicTracks.length))}</span>
+              <span>
+                {#if $musicTracks.length === 0 && $musicLibLoading}
+                  {$t('music.lib_loading')}
+                {:else}
+                  {$t('music.lib_count').replace('{n}', String($musicTracks.length))}
+                  {#if $musicLibLoading}<span class="mp-lib-sep-hint">{$t('music.refreshing')}</span>{/if}
+                {/if}
+              </span>
             {/if}
             <button
               class="mp-lib-search-btn"
@@ -1505,6 +1513,9 @@
               applyPendingPlaylist()
               if (!$musicTracks.length) void retryMusicPlaylist()
               else void stagePlaylistRefresh()
+              // A cold library is paged in the background; poll so the list
+              // fills in instead of sitting on "loading".
+              if (!$musicTracks.length || $musicLibLoading) startPlaylistPolling()
             }
           }}
         >
