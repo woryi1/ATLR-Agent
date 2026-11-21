@@ -6,6 +6,7 @@
   import { ws, wsState } from '../../lib/ws'
   import { nativeMinimise, nativeClose } from '../../lib/api'
   import { isMaximised, flipMaximise, refreshMaximised, titlebarDblClick } from '../../lib/nativeWindow'
+  import DynamicCapsule from '../chat/DynamicCapsule.svelte'
 
   // The main column's own top row. There is no window-spanning title bar: each
   // of the three columns (Sidebar, this, ArtifactsPanel) starts at the very top
@@ -129,6 +130,10 @@
       <button class="window-btn close" aria-label="Close" title="Close" onclick={() => nativeClose()}>×</button>
     </div>
   {/if}
+
+  <!-- Top-centre capsule, on the same axis as the window controls. It is
+       fixed-positioned, so it does not take part in this row's layout. -->
+  <DynamicCapsule />
 </header>
 
 <style>

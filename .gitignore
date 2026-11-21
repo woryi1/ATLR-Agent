@@ -38,6 +38,10 @@ coverage.html
 __pycache__/
 *.pyc
 
+# Node dependencies. The real install lives in web/node_modules; a stray one at
+# the repository root must never be staged.
+node_modules/
+
 # Vite build output. go:embed requires the directory to exist with at least
 # one file, so only .gitkeep is committed — the real assets are built from
 # source (`make web-build` locally, CI for releases), never committed.

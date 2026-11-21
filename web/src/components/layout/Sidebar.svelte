@@ -17,7 +17,7 @@
   import * as api from '../../lib/api'
   import { storageKey } from '../../lib/storageKey'
   import { titlebarDblClick } from '../../lib/nativeWindow'
-  import { t, tr } from '../../lib/i18n'
+  import { t, tr, locale } from '../../lib/i18n'
   import { confirmDialog } from '../../lib/confirm'
   import { splitSections, swapWithinSection, parseSectionFold, type SectionFold } from '../../lib/sidebarSections'
   import { SIDEBAR_MIN, SIDEBAR_MAX, CENTER_MIN, readSidebarWidth, saveSidebarWidth } from '../../lib/sidebarWidth'
@@ -88,8 +88,9 @@
       extra.push({ kind: 'remote', t })
     }
     const rows: LibRow[] = [...local]
+    void $locale // recompute the section label on a language switch
     if (extra.length || $musicLibSearching) {
-      rows.push({ kind: 'sep', label: 'B 站搜索' })
+      rows.push({ kind: 'sep', label: tr('music.bili_search') })
       rows.push(...extra)
     }
     return rows
@@ -122,8 +123,8 @@
     favBusy = t.bvid
     const res = await favoriteTrack(t)
     favBusy = ''
-    if (res.ok) showToast(res.folder ? `已收藏到「${res.folder}」` : '已收藏')
-    else showToast(res.message || '收藏失败', 'error')
+    if (res.ok) showToast(res.folder ? tr('music.fav_added_to').replace('{folder}', res.folder) : tr('music.fav_added'))
+    else showToast(res.message || tr('music.fav_failed'), 'error')
   }
 
   async function openBiliQr(): Promise<void> {
@@ -153,7 +154,7 @@
         // Login raises the quality ceiling and unblocks the favourites call:
         // refetch now instead of making the user restart the app. A cold
         // rebuild pages ~1,200 videos, so tell them it is happening.
-        showToast('正在刷新曲库…')
+        showToast(tr('music.refreshing'))
         await forceRefreshPlaylist()
       } else if (status === 'expired') {
         clearInterval(id)
@@ -1302,23 +1303,23 @@
     <div class="footer">
       {#if $musicLibOpen}
         <div class="mp-lib-backdrop" onclick={() => { musicLibOpen.set(false) }}></div>
-        <div class="mp-library" role="dialog" aria-label="曲库" onclick={(e) => e.stopPropagation()}>
+        <div class="mp-library" role="dialog" aria-label={$t('music.lib')} onclick={(e) => e.stopPropagation()}>
           <div class="mp-lib-head">
             {#if $musicLibSearchOpen}
               <input
                 class="mp-lib-search"
-                placeholder="搜索歌曲…"
+                placeholder={$t('music.search_placeholder')}
                 value={$musicLibQuery}
                 oninput={(e) => setMusicLibQuery((e.currentTarget as HTMLInputElement).value)}
-                aria-label="搜索歌曲"
+                aria-label={$t('music.search_placeholder')}
               />
             {:else}
-              <span>{$musicTracks.length === 0 ? '曲库加载中…' : `曲库 · ${$musicTracks.length} 首`}</span>
+              <span>{$musicTracks.length === 0 ? $t('music.lib_loading') : $t('music.lib_count').replace('{n}', String($musicTracks.length))}</span>
             {/if}
             <button
               class="mp-lib-search-btn"
-              title="搜索"
-              aria-label="搜索"
+              title={$t('music.search')}
+              aria-label={$t('music.search')}
               onclick={() => {
                 // 关闭搜索才清关键词：只是收起面板时搜索页要原样保留。
                 if ($musicLibSearchOpen) { musicLibSearchOpen.set(false); setMusicLibQuery('') }
@@ -1341,7 +1342,7 @@
                     style={`position:absolute;left:0;right:0;top:${(libStart + k) * LIB_ROW}px;height:${LIB_ROW}px`}
                   >
                     <span>{row.label}</span>
-                    {#if $musicLibSearching}<span class="mp-lib-sep-hint">搜索中…</span>{/if}
+                    {#if $musicLibSearching}<span class="mp-lib-sep-hint">{$t('music.searching')}</span>{/if}
                   </div>
                 {:else}
                   <div
@@ -1352,17 +1353,17 @@
                     <button
                       class="mp-lib-cover"
                       onclick={() => row.kind === 'track' ? selectTrack(row.i, true) : playTrack(row.t)}
-                      aria-label="播放"
+                      aria-label={$t('music.play')}
                     >
                       <img src={proxyImg(row.t.cover)} alt="" loading="lazy" />
                     </button>
                     <div class="mp-lib-meta">
                       <button class="mp-lib-title" title={row.t.title} onclick={() => void openMusicVideo(row.t.bvid)}>{row.t.title}</button>
-                      <span class="mp-lib-sub">{row.t.artist || (row.kind === 'remote' ? 'B 站' : '')}</span>
+                      <span class="mp-lib-sub">{row.t.artist || (row.kind === 'remote' ? $t('music.bili') : '')}</span>
                     </div>
                     <div class="mp-lib-actions">
                       {#if row.t.bvid === currentTrack?.bvid}
-                        <span class="mp-lib-eq" class:paused={!$musicPlaying} title={$musicPlaying ? '正在播放' : '已暂停'} aria-label={$musicPlaying ? '正在播放' : '已暂停'}>
+                        <span class="mp-lib-eq" class:paused={!$musicPlaying} title={$musicPlaying ? $t('music.playing') : $t('music.paused')} aria-label={$musicPlaying ? $t('music.playing') : $t('music.paused')}>
                           <i></i><i></i><i></i><i></i>
                         </span>
                       {/if}
@@ -1370,8 +1371,8 @@
                         <button
                           class="mp-lib-fav"
                           class:done={$musicFaved.has(row.t.bvid)}
-                          title={$musicFaved.has(row.t.bvid) ? '已收藏' : '收藏到哔哩哔哩'}
-                          aria-label="收藏"
+                          title={$musicFaved.has(row.t.bvid) ? $t('music.faved') : $t('music.fav')}
+                          aria-label={$t('music.favorite')}
                           onclick={(e) => { e.stopPropagation(); void onFavorite(row.t) }}
                         >
                           <iconify-icon icon={$musicFaved.has(row.t.bvid) ? 'lucide:bookmark-check' : 'lucide:bookmark-plus'} width="13"></iconify-icon>
@@ -1391,14 +1392,14 @@
           {#if biliQrOpen}
             <div class="mp-qr">
               {#if biliQrUrl}
-                <img src={`/api/bili/qr.png?text=${encodeURIComponent(biliQrUrl)}`} alt="登录二维码" />
+                <img src={`/api/bili/qr.png?text=${encodeURIComponent(biliQrUrl)}`} alt={$t('music.qr_alt')} />
               {/if}
               <div class="mp-qr-hint">
                 {biliQrStatus === 'scanned'
-                  ? '已扫码，请在手机上确认'
+                  ? $t('music.qr_scanned')
                   : biliQrStatus === 'expired'
-                    ? '二维码过期，正在刷新…'
-                    : '用哔哩哔哩 App 扫码登录'}
+                    ? $t('music.qr_expired')
+                    : $t('music.qr_hint')}
               </div>
             </div>
           {/if}
@@ -1414,7 +1415,7 @@
             </div>
           {/if}
           <div class="mp-head">
-            <button class="mp-cover" aria-hidden="true" title="曲库" onclick={() => { musicLibOpen.set(true) }}>
+            <button class="mp-cover" aria-hidden="true" title={$t('music.lib')} onclick={() => { musicLibOpen.set(true) }}>
               {#if currentTrack?.cover}
                 <img src={proxyImg(currentTrack.cover)} alt="" loading="lazy" onerror={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none' }} />
               {:else}
@@ -1429,8 +1430,8 @@
               <button
                 class="mp-lyric-btn"
                 class:on={lyricsOpen}
-                title="歌词"
-                aria-label="lyrics"
+                title={$t('music.lyrics')}
+                aria-label={$t('music.lyrics')}
                 onclick={() => { lyricsOpen = !lyricsOpen }}
               >
                 <iconify-icon icon="lucide:captions" width="14"></iconify-icon>
@@ -1447,7 +1448,7 @@
             </div>
             <button
               class="mp-account"
-              title={$biliMe.loggedIn ? $biliMe.name : '扫码登录'}
+              title={$biliMe.loggedIn ? $biliMe.name : $t('music.login')}
               onclick={() => {
                 if ($biliMe.loggedIn) biliAccountOpen = !biliAccountOpen
                 else void openBiliQr()
@@ -1468,7 +1469,7 @@
                     biliAccountOpen = false
                     void openBiliQr()
                   }}
-                >退出登录</button>
+                >{$t('music.logout')}</button>
               </div>
             {/if}
           </div>

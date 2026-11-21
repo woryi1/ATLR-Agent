@@ -2,7 +2,7 @@ import './app.css'
 import App from './App.svelte'
 import { mount } from 'svelte'
 import { initIcons } from './lib/icons'
-import { initTheme, loadUserPacks, loadThemeSelection } from './lib/theme'
+import { initTheme, loadUserPacks, loadThemeSelection, whenBackgroundReady } from './lib/theme'
 import { initFramelessDrag } from './lib/framelessDrag'
 import { installArtifactThemeRefresh } from './lib/artifacts'
 import { applyTitlebarLift } from './lib/nativeWindow'
@@ -24,14 +24,40 @@ initTheme()
 ;(function bootSplash() {
   const root = document.getElementById('dsh-startup-root')
   const done = () => window.dispatchEvent(new CustomEvent('dsh-startup:done'))
+  let handedOver = false
+  // The start-up animation is the first of the three screen owners (animation,
+  // still wallpaper, animated wallpaper). It leaves only after the wallpaper
+  // picked for this launch has painted its first frame — normally already true
+  // because the layer loads underneath the splash — so the handover never shows
+  // a bare page. The 3s cap keeps a slow or absent wallpaper from pinning the
+  // splash, and the flag makes repeated unlocks harmless.
   const unlock = () => {
+    if (handedOver) return
+    handedOver = true
+    const cap = new Promise<void>((resolve) => window.setTimeout(resolve, 3000))
+    void Promise.race([whenBackgroundReady(), cap]).then(() => handOver())
+  }
+  const handOver = () => {
     document.documentElement.classList.remove('dsu-lock')
     if (document.body) document.body.style.overflow = ''
+    // Release the animation's audio/video before its DOM goes away: removing
+    // the node alone can keep the decoder and its buffers alive until GC.
+    const releaseMedia = () => {
+      root?.querySelectorAll('audio, video').forEach((el) => {
+        try {
+          const media = el as HTMLMediaElement
+          media.pause()
+          media.removeAttribute('src')
+          media.load()
+        } catch { /* ignore */ }
+      })
+    }
     // Crossfade instead of a hard cut: the splash used to vanish in one
     // frame, which read as the app "appearing" rather than the boot screen
     // handing over. Pin it over the page while it fades so nothing shifts.
     const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
     if (!root || reduce) {
+      releaseMedia()
       root?.remove()
       done()
       return
@@ -46,7 +72,11 @@ initTheme()
     requestAnimationFrame(() => {
       requestAnimationFrame(() => { root.style.opacity = '0' })
     })
-    window.setTimeout(() => { root.remove(); done() }, 300)
+    window.setTimeout(() => {
+      releaseMedia()
+      root.remove()
+      done()
+    }, 300)
   }
   if ((window as unknown as { __DSH_STARTUP_SKIP__?: boolean }).__DSH_STARTUP_SKIP__) return
   if (sessionStorage.getItem('dsh-startup-screen:shown') === '1') {

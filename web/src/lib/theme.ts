@@ -268,7 +268,7 @@ export function setBackgroundVideo(id: BackgroundVideoID): void {
 export function setBackgroundVideoSound(on: boolean): void {
   currentBgVideoSound = on
   localStorage.setItem(BG_VIDEO_SOUND_KEY, on ? '1' : '0')
-  const el = document.getElementById('atlr-bg')
+  const el = activeEl ?? document.getElementById('atlr-bg')
   if (el instanceof HTMLVideoElement) {
     el.muted = !on
     if (on) el.play().catch(() => {})
@@ -276,72 +276,213 @@ export function setBackgroundVideoSound(on: boolean): void {
   void persistSelection()
 }
 
+// Wallpaper layer lifecycle.
+//
+// Exactly one layer — a still image or an animated video — may be mounted, and
+// the boot animation is the third owner of the screen. A switch is progressive:
+// the incoming layer is built and starts loading while the outgoing one is
+// still visible; only once the new layer has painted (first decoded image /
+// video frame, or a bounded timeout) is the old one torn down. That ordering is
+// what keeps a switch from flashing the bare app.
+//
+// A guard re-checks the mounted layer every 10 seconds: a video that dropped
+// out is restarted, a node that vanished is rebuilt, and a layer that should no
+// longer exist is removed. Rebuilds are rate-limited so a broken source cannot
+// spin the page.
+let activeEl: HTMLImageElement | HTMLVideoElement | null = null
+let layerGen = 0
+let layerReady: Promise<void> = Promise.resolve()
+let resolveLayerReady: (() => void) | null = null
+let layerGuardStarted = false
+let lastRebuildAt = 0
+
+const LAYER_READY_TIMEOUT_MS = 8000
+const LAYER_GUARD_MS = 10_000
+const LAYER_REBUILD_COOLDOWN_MS = 10_000
+
+// whenBackgroundReady resolves once the boot-time wallpaper has painted its
+// first frame (or given up). main.ts waits on it before dismissing the start-up
+// animation, so the handover never shows a bare page.
+export function whenBackgroundReady(): Promise<void> {
+  return layerReady
+}
+
+function beginLayerReady(): Promise<void> {
+  layerReady = new Promise<void>((resolve) => { resolveLayerReady = resolve })
+  return layerReady
+}
+
+function finishLayerReady(): void {
+  const resolve = resolveLayerReady
+  resolveLayerReady = null
+  resolve?.()
+}
+
+function wantedLayerKind(): 'image' | 'video' | null {
+  if (currentBgVideo) return 'video'
+  if (currentBackground && currentBackground !== 'off') return 'image'
+  return null
+}
+
+function matchesKind(el: HTMLElement, kind: 'image' | 'video'): boolean {
+  return kind === 'video' ? el.tagName === 'VIDEO' : el.tagName === 'IMG'
+}
+
 // applyBackgroundLayer renders the wallpaper as a fixed, non-interactive
-// overlay above the app (a low-opacity watermark keeps every surface
-// readable, whatever the theme). Managed here rather than in a Svelte
-// component so it exists from boot and survives route changes for free.
+// overlay above the app (a low-opacity watermark keeps every surface readable,
+// whatever the theme). Managed here rather than in a Svelte component so it
+// exists from boot and survives route changes for free.
 function applyBackgroundLayer(): void {
+  const kind = wantedLayerKind()
   const imageID = currentBackground
   const videoID = currentBgVideo
-  const wantVideo = !!videoID
-  // A still wallpaper only counts while it is something other than "off";
-  // '' and 'off' both mean the plain app.
-  const wantImage = !wantVideo && !!imageID && imageID !== 'off'
-  const existing = document.getElementById('atlr-bg') as HTMLImageElement | HTMLVideoElement | null
-  if (!wantVideo && !wantImage) {
-    disposeBackgroundLayer(existing)
+  if (!kind) {
+    if (activeEl) {
+      disposeBackgroundLayer(activeEl)
+      activeEl = null
+    }
+    finishLayerReady()
     return
   }
-  // While the boot splash owns the screen, hold the wallpaper until its
-  // reveal (dsh-startup:done, fired by the splash itself or by a skipped
-  // splash) — otherwise the watermark would tint the splash frames.
-  if (document.getElementById('dsh-startup-root')) {
-    window.addEventListener('dsh-startup:done', () => applyBackgroundLayer(), { once: true })
+  // The right kind is already mounted: refresh its appearance (fit / opacity /
+  // blur, and video sound) without reloading, which would restart playback.
+  if (activeEl && activeEl.isConnected && matchesKind(activeEl, kind)) {
+    styleLayer(activeEl, kind, videoID, imageID, currentBgOpacity)
+    finishLayerReady()
+    startLayerGuard()
     return
   }
-  // The two sources need different elements, so a switch retires the old node
-  // rather than mutating it: an <img> cannot play the mp4, and a <video>
-  // cannot be pointed at a jpeg.
-  const matches = wantVideo ? existing?.tagName === 'VIDEO' : existing?.tagName === 'IMG'
-  let el: HTMLImageElement | HTMLVideoElement
-  if (!existing || !matches) {
-    disposeBackgroundLayer(existing)
-    el = wantVideo ? createBackgroundVideo() : createBackgroundImage()
-    document.body.appendChild(el)
-  } else {
-    el = existing
-  }
-  // Fit / opacity / blur are shared by both sources — one set of controls, one
-  // rendering, whatever the layer is showing.
+  // Build the incoming layer first; retire the outgoing one only after the new
+  // one is ready to paint.
+  const gen = ++layerGen
+  beginLayerReady()
+  const incoming = kind === 'video' ? createBackgroundVideo() : createBackgroundImage()
+  document.body.appendChild(incoming)
+  styleLayer(incoming, kind, videoID, imageID, 0)
+  void waitForLayerPaint(incoming, kind).then(() => {
+    // A newer switch overtook this one: drop the half-loaded node.
+    if (gen !== layerGen) {
+      disposeBackgroundLayer(incoming)
+      return
+    }
+    const outgoing = activeEl
+    incoming.id = 'atlr-bg'
+    incoming.style.transition = 'opacity 240ms ease'
+    incoming.style.opacity = String(currentBgOpacity)
+    activeEl = incoming
+    if (outgoing && outgoing !== incoming) disposeBackgroundLayer(outgoing)
+    if (kind === 'video') bindBackgroundVisibility()
+    finishLayerReady()
+    startLayerGuard()
+  })
+}
+
+// styleLayer applies the shared appearance controls and points the element at
+// its source. Only a real source change is written, so moving a slider does not
+// restart the video.
+function styleLayer(
+  el: HTMLImageElement | HTMLVideoElement,
+  kind: 'image' | 'video',
+  videoID: BackgroundVideoID,
+  imageID: BackgroundID,
+  opacity: number,
+): void {
   el.style.objectFit = currentBgFit
-  el.style.opacity = String(currentBgOpacity)
+  el.style.opacity = String(opacity)
   el.style.filter = currentBgBlur > 0 ? `blur(${currentBgBlur}px)` : ''
-  if (el instanceof HTMLVideoElement) {
-    el.muted = !currentBgVideoSound
-    // Only touch src on a real change: reassigning it restarts playback, and
-    // this runs for every appearance-slider move.
+  if (kind === 'video') {
+    const v = el as HTMLVideoElement
+    // Never let the wallpaper's audio compete with the boot animation: the
+    // layer is already loading underneath the splash, but it stays silent
+    // until the splash hands the screen over (see the done listener below).
+    const splashUp = !!document.getElementById('dsh-startup-root')
+    v.muted = !currentBgVideoSound || splashUp
+    if (v.muted) v.setAttribute('muted', '')
+    else v.removeAttribute('muted')
     const src = `/api/backgrounds/video/${encodeURIComponent(videoID)}`
-    if (el.getAttribute('src') !== src) el.src = src
-    bindBackgroundVisibility()
-    // A hidden window keeps decoding a 1080p loop for pixels nobody sees; that
-    // is decoder and GPU memory spent on nothing. Pause while hidden and resume
-    // on the way back — the first frame stays on screen either way.
-    if (document.hidden) el.pause()
-    // Autoplay is best-effort — a webview that blocks it still shows the
-    // first frame, which is the same watermark the still wallpapers give.
-    else el.play().catch(() => {})
+    if (v.getAttribute('src') !== src) v.src = src
+    // A hidden window keeps decoding a 1080p loop for pixels nobody sees.
+    // Pause while hidden and resume on the way back.
+    if (document.hidden) v.pause()
+    else v.play().catch(() => {})
     return
   }
+  const img = el as HTMLImageElement
   // Cache-bust only the custom pick, so a freshly uploaded wallpaper shows
   // immediately; the two built-ins stay on stable, cacheable URLs.
   const stable = `/api/backgrounds/${encodeURIComponent(imageID)}`
-  el.src = imageID === 'custom' ? `${stable}?v=${Date.now()}` : stable
+  const src = imageID === 'custom' ? `${stable}?v=${Date.now()}` : stable
+  if (img.getAttribute('src') !== src) img.src = src
 }
 
-// Tear the layer down for real. Removing a <video> node is not enough on every
-// engine: the media element keeps its decoder, buffers and the WebView2 media
-// process alive until the source is cleared, which is why switching a video
-// wallpaper back to a still one left a process that had to be killed by hand.
+// waitForLayerPaint resolves on the first decoded frame (or image), on error,
+// or after the timeout — the last case keeps a slow source from blocking the
+// handover forever.
+function waitForLayerPaint(
+  el: HTMLImageElement | HTMLVideoElement,
+  kind: 'image' | 'video',
+): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      el.removeEventListener('load', finish)
+      el.removeEventListener('loadeddata', finish)
+      el.removeEventListener('error', finish)
+      resolve()
+    }
+    const timer = setTimeout(finish, LAYER_READY_TIMEOUT_MS)
+    if (kind === 'video') {
+      el.addEventListener('loadeddata', finish, { once: true })
+      if ((el as HTMLVideoElement).readyState >= 2) finish()
+    } else {
+      el.addEventListener('load', finish, { once: true })
+      if ((el as HTMLImageElement).complete) finish()
+    }
+    el.addEventListener('error', finish, { once: true })
+  })
+}
+
+// startLayerGuard installs the 10-second self-check once. It restarts a video
+// that stopped, rebuilds a layer whose node disappeared, and removes a layer
+// the user has since turned off.
+function startLayerGuard(): void {
+  if (layerGuardStarted || typeof window === 'undefined') return
+  layerGuardStarted = true
+  window.setInterval(() => {
+    if (document.hidden) return
+    const kind = wantedLayerKind()
+    if (!kind) {
+      if (activeEl) {
+        disposeBackgroundLayer(activeEl)
+        activeEl = null
+      }
+      return
+    }
+    if (!activeEl || !activeEl.isConnected || !matchesKind(activeEl, kind)) {
+      rebuildLayer()
+      return
+    }
+    if (kind === 'video') {
+      const v = activeEl as HTMLVideoElement
+      if (v.paused) v.play().catch(() => {})
+    }
+  }, LAYER_GUARD_MS)
+}
+
+// rebuildLayer is the "it dropped out, bring it back" path. Rate-limited so a
+// source that keeps failing cannot rebuild in a loop; the guard retries after
+// the cooldown.
+function rebuildLayer(): void {
+  const now = Date.now()
+  if (now - lastRebuildAt < LAYER_REBUILD_COOLDOWN_MS) return
+  lastRebuildAt = now
+  applyBackgroundLayer()
+}
+
+// The two sources need different elements, so a switch retires the old node.
 function disposeBackgroundLayer(el: HTMLElement | null): void {
   if (!el) return
   if (el instanceof HTMLVideoElement) {
@@ -359,7 +500,7 @@ function bindBackgroundVisibility(): void {
   if (bgVisibilityBound) return
   bgVisibilityBound = true
   document.addEventListener('visibilitychange', () => {
-    const el = document.getElementById('atlr-bg')
+    const el = activeEl
     if (!(el instanceof HTMLVideoElement)) return
     if (document.hidden) el.pause()
     else el.play().catch(() => {})
@@ -368,7 +509,10 @@ function bindBackgroundVisibility(): void {
 
 function createBackgroundVideo(): HTMLVideoElement {
   const v = document.createElement('video')
-  v.id = 'atlr-bg'
+  // The CSS selector accepts the class so a layer being loaded has its fixed
+  // overlay geometry before it earns the #atlr-bg id (only the live layer may
+  // hold that id, and the outgoing one is still on screen).
+  v.classList.add('atlr-bg')
   v.autoplay = true
   v.loop = true
   v.muted = !currentBgVideoSound
@@ -381,12 +525,17 @@ function createBackgroundVideo(): HTMLVideoElement {
   v.setAttribute('aria-hidden', 'true')
   v.setAttribute('disablepictureinpicture', '')
   v.tabIndex = -1
+  // A decoder that dies takes the layer with it: rebuild the node, guarded by
+  // the same cooldown the periodic check uses.
+  v.addEventListener('error', () => {
+    if (v === activeEl) rebuildLayer()
+  })
   return v
 }
 
 function createBackgroundImage(): HTMLImageElement {
   const img = document.createElement('img')
-  img.id = 'atlr-bg'
+  img.classList.add('atlr-bg')
   img.alt = ''
   img.draggable = false
   return img
@@ -445,6 +594,13 @@ export function initTheme(): void {
   currentStartupAnim = localStorage.getItem(ANIM_KEY) !== '0'
   apply(currentMode, currentPack)
   applyBackgroundLayer()
+  startLayerGuard()
+  // The splash owns the screen until it says it is done; only then may the
+  // wallpaper unmute. Re-applying is cheap — the layer of the right kind is
+  // reused and only its sound flag changes.
+  if (typeof window !== 'undefined') {
+    window.addEventListener('dsh-startup:done', () => { applyBackgroundLayer() }, { once: true })
+  }
 }
 
 // loadThemeSelection reconciles the boot choice with the server copy under

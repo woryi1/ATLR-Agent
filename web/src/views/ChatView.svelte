@@ -26,6 +26,8 @@
     chatTodos,
     chatContextUsage,
     chatContextTokens,
+    chatCachePct,
+    autoScrollOn,
     chatWorkingDir,
     chatPermMode,
     chatReasoningEffort,
@@ -95,6 +97,7 @@
   import BackgroundProcesses from '../components/chat/BackgroundProcesses.svelte'
   import Composer from '../components/chat/Composer.svelte'
   import MusicVisualizer from '../components/chat/MusicVisualizer.svelte'
+  import LyricsBackdrop from '../components/chat/LyricsBackdrop.svelte'
   import OctoLogo from '../components/layout/OctoLogo.svelte'
 import QuestionModal from '../components/overlays/QuestionModal.svelte'
   import GenuiBlock from '../components/genui/GenuiBlock.svelte'
@@ -1287,6 +1290,12 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
       const durationMs = (ev as any).duration_ms
       const tokens = (ev as any).tokens
       const cachePct = (ev as any).cache_pct
+      // The composer's status bar shows the hit rate of the latest turn; the
+      // backend omits the field when the provider reported no cache activity,
+      // in which case the chip stays hidden rather than reading "0%".
+      if (typeof cachePct === 'number') {
+        chatCachePct.update(u => ({ ...u, [sid]: cachePct }))
+      }
       if (typeof durationMs === 'number' && typeof tokens === 'number') {
         // A silent panel-update turn draws nothing in the transcript, so a
         // summary notice would float anchored to nothing. Hand the stats to
@@ -1704,6 +1713,46 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
   $effect(() => {
     void $activeSessionId
     stick = true
+  })
+
+  // ── auto-scroll (composer chip) ───────────────────────────────────────────
+  // Off by default. The stick logic above still follows a live stream; this
+  // adds the explicit "idle returns to the newest message" mode: once on, five
+  // seconds without any user scroll input pulls the pane back to the bottom.
+  // The toggle lives in the composer status bar; state is shared via the store
+  // so the chip and this effect can never disagree.
+  let lastUserScrollAt = 0
+  $effect(() => {
+    if (!$autoScrollOn) return
+    lastUserScrollAt = Date.now()
+    const timer = setInterval(() => {
+      const el = messagesEl
+      if (!el || document.hidden) return
+      if (Date.now() - lastUserScrollAt < 5000) return
+      if (el.scrollHeight - el.scrollTop - el.clientHeight <= 4) return
+      stick = true
+      el.scrollTop = el.scrollHeight
+    }, 1000)
+    // Every deliberate scroll input restarts the idle countdown. Pointer/wheel
+    // are the user's own gestures; 'scroll' covers scrollbar drags and keyboard
+    // paging that produce no wheel delta.
+    const mark = () => { lastUserScrollAt = Date.now() }
+    const el = messagesEl
+    const keys = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '])
+    const onKey = (e: KeyboardEvent) => { if (keys.has(e.key)) mark() }
+    el?.addEventListener('wheel', mark, { passive: true })
+    el?.addEventListener('touchstart', mark, { passive: true })
+    el?.addEventListener('pointerdown', mark)
+    el?.addEventListener('scroll', mark, { passive: true })
+    window.addEventListener('keydown', onKey)
+    return () => {
+      clearInterval(timer)
+      el?.removeEventListener('wheel', mark)
+      el?.removeEventListener('touchstart', mark)
+      el?.removeEventListener('pointerdown', mark)
+      el?.removeEventListener('scroll', mark)
+      window.removeEventListener('keydown', onKey)
+    }
   })
 
   // ── user-message rail ───────────────────────────────────────────────────────
@@ -3487,6 +3536,7 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
       </div>
 
       <MusicVisualizer />
+      <LyricsBackdrop />
       {#if railTicks.length > 1}
         <div class="msg-rail">
           <div class="msg-rail-inner" style="height:min(100%, {railTicks.length * 28 - 20}px);--rail-scale:{railScale}">
@@ -3511,6 +3561,8 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
           </div>
         </div>
       {/if}
+
+      <!-- Auto-scroll toggle moved to the composer status bar. -->
       </div>
 
       <!-- Background workflows panel (persists across turns, pinned above composer) -->
@@ -4117,15 +4169,20 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
 :global(.rich-answer p) { margin: 0; }
 :global(.rich-answer :not(pre) > code), :global(.think-body :not(pre) > code) {
   font-family: var(--font-mono); font-size: 13px; font-style: normal;
-  background: var(--bg-table-header); border: 1px solid var(--border-table); border-radius: 4px; padding: 1px 5px;
+  background: color-mix(in srgb, var(--bg-table-header) 78%, transparent); border: 1px solid var(--border-table); border-radius: 4px; padding: 1px 5px;
 }
 :global(.rich-answer .code-block), :global(.think-body .code-block) {
   border: 1px solid var(--border-table); border-radius: 8px; overflow: hidden;
-  background: var(--bg-sidebar); font-style: normal;
+  /* Semi-transparent + blurred so the wallpaper, spectrum columns and lyrics
+     behind the transcript stay faintly visible through code blocks instead of
+     being painted over. Text contrast is kept by the 82% fill. */
+  background: color-mix(in srgb, var(--bg-sidebar) 82%, transparent);
+  backdrop-filter: blur(10px) saturate(1.05);
+  font-style: normal;
 }
 :global(.rich-answer .code-header), :global(.think-body .code-header) {
   display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 12px;
-  background: var(--bg-table-header); border-bottom: 1px solid var(--border-table);
+  background: color-mix(in srgb, var(--bg-table-header) 80%, transparent); border-bottom: 1px solid var(--border-table);
 }
 :global(.rich-answer .code-lang), :global(.think-body .code-lang) { font-size: 11px; color: var(--text-tertiary); font-family: var(--font-mono); }
 :global(.rich-answer .copy-btn), :global(.think-body .copy-btn) {
@@ -4143,7 +4200,7 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
 :global(.rich-answer .mermaid-diagram svg), :global(.think-body .mermaid-diagram svg) { max-width: 100%; height: auto; }
 :global(.rich-answer .md-bq), :global(.think-body .md-bq) {
   margin: 0; padding: 8px 14px; border-left: 3px solid var(--blue-2);
-  background: var(--surface-info); border-radius: 0 6px 6px 0;
+  background: color-mix(in srgb, var(--surface-info) 74%, transparent); border-radius: 0 6px 6px 0;
   font-size: 13px; line-height: 1.6; color: var(--text-secondary);
 }
 /* Markdown tables: marked emits plain <table>/<th>/<td> (no classes), so style
@@ -4161,15 +4218,17 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
   border: 1px solid var(--border-table);
 }
 :global(.rich-answer th), :global(.think-body th) {
-  background: var(--bg-table-header); font-weight: 600; color: var(--text-heading); white-space: nowrap;
+  background: color-mix(in srgb, var(--bg-table-header) 80%, transparent); font-weight: 600; color: var(--text-heading); white-space: nowrap;
 }
 :global(.rich-answer tbody tr:nth-child(even) td), :global(.think-body tbody tr:nth-child(even) td) {
-  background: var(--bg-zebra);
+  background: color-mix(in srgb, var(--bg-zebra) 60%, transparent);
 }
 /* Reasoning card — a bordered fold matching the design's tool-card look. */
 :global(.think-block) {
   border: 1px solid var(--border); border-radius: 10px;
-  background: var(--bg-container); box-shadow: var(--card-shadow);
+  background: color-mix(in srgb, var(--bg-container) 84%, transparent);
+  backdrop-filter: blur(10px) saturate(1.05);
+  box-shadow: var(--card-shadow);
 }
 :global(.think-summary) {
   list-style: none; display: flex; align-items: center; gap: 8px;
@@ -4252,7 +4311,7 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
 .notice-line :global(p) { margin: 0; }
 .notice-line :global(code) {
   font-family: var(--font-mono);
-  font-size: 12px; background: var(--bg-table-header); border: 1px solid var(--border-table);
+  font-size: 12px; background: color-mix(in srgb, var(--bg-table-header) 78%, transparent); border: 1px solid var(--border-table);
   border-radius: 4px; padding: 1px 4px;
 }
 

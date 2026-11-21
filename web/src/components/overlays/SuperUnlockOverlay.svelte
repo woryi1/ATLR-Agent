@@ -24,6 +24,7 @@
   import { cubicOut } from 'svelte/easing'
   import { prefersReducedMotion } from 'svelte/motion'
   import { superUnlock } from '../../lib/stores'
+  import { t } from '../../lib/i18n'
 
   const VIDEO = '/super/unlock.mp4'
   const POSTER = '/super/unlock-poster.webp'
@@ -110,12 +111,16 @@
   }
 
   function finish(): void {
-    // Stop and release the media before the overlay unmounts — a paused
-    // <video> torn out of the DOM in the middle of playback can keep its
-    // buffer (and audio) alive until GC otherwise.
+    // Stop and release the media before the overlay unmounts. Dropping the node
+    // alone leaves the decoder, buffer and audio graph alive until GC; clearing
+    // the source is what actually frees them, same as the wallpaper layer.
     const v = videoEl
     if (v) {
       try { v.pause() } catch { /* already gone */ }
+      try {
+        v.removeAttribute('src')
+        v.load()
+      } catch { /* ignore */ }
     }
     playing = false
     active = false
@@ -189,7 +194,7 @@
       <img class="super-unlock-poster" src={POSTER} alt="" draggable="false" />
       <div class="super-unlock-hint" aria-hidden="true">
         <span class="super-unlock-dot"></span>
-        <span class="super-unlock-hint-text">{mode === 'intro' ? '点击开始' : '点击开启极速极致模式'}</span>
+        <span class="super-unlock-hint-text">{mode === 'intro' ? $t('super.start') : $t('super.enable')}</span>
       </div>
     {/if}
   </div>

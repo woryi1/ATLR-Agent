@@ -7,6 +7,7 @@
 import { get, writable } from 'svelte/store'
 import { nativeShell } from './stores'
 import * as api from './api'
+import { tr } from './i18n'
 
 export interface Track {
   bvid: string
@@ -35,9 +36,29 @@ export interface VizSettings {
   width: number
   opacity: number
   white: boolean
+  /** Background lyrics layer (same layer as the spectrum columns). */
+  lyrics: boolean
+  /** Gap between lyric lines, in px. */
+  lyricsGap: number
+  /** Font size of the current lyric line, in px (neighbours scale down). */
+  lyricsSize: number
+  /** '' follows the visualiser colour; otherwise a CSS colour. */
+  lyricsColor: string
+  /** Dynamic capsule at the top of the screen (lyrics + calendar). */
+  capsule: boolean
 }
 
-const VIZ_DEFAULTS: VizSettings = { enabled: true, width: 88, opacity: 0.8, white: false }
+const VIZ_DEFAULTS: VizSettings = {
+  enabled: true,
+  width: 88,
+  opacity: 0.8,
+  white: false,
+  lyrics: true,
+  lyricsGap: 22,
+  lyricsSize: 44,
+  lyricsColor: '',
+  capsule: true,
+}
 
 function loadVizSettings(): VizSettings {
   try {
@@ -49,6 +70,11 @@ function loadVizSettings(): VizSettings {
       width: Number(parsed.width) >= 32 ? Number(parsed.width) : VIZ_DEFAULTS.width,
       opacity: Number(parsed.opacity) > 0 ? Math.min(1, Number(parsed.opacity)) : VIZ_DEFAULTS.opacity,
       white: parsed.white === true,
+      lyrics: typeof parsed.lyrics === 'boolean' ? parsed.lyrics : VIZ_DEFAULTS.lyrics,
+      lyricsGap: Number(parsed.lyricsGap) > 0 ? Math.min(64, Math.max(2, Number(parsed.lyricsGap))) : VIZ_DEFAULTS.lyricsGap,
+      lyricsSize: Number(parsed.lyricsSize) > 0 ? Math.min(80, Math.max(20, Number(parsed.lyricsSize))) : VIZ_DEFAULTS.lyricsSize,
+      lyricsColor: typeof parsed.lyricsColor === 'string' ? parsed.lyricsColor : VIZ_DEFAULTS.lyricsColor,
+      capsule: typeof parsed.capsule === 'boolean' ? parsed.capsule : VIZ_DEFAULTS.capsule,
     }
   } catch {
     return { ...VIZ_DEFAULTS }
@@ -203,12 +229,12 @@ export async function favoriteTrack(t: Track): Promise<{ ok: boolean; folder: st
     })
     const body = await res.json().catch(() => null)
     if (!res.ok || !body?.ok) {
-      return { ok: false, folder: '', message: body?.error || '收藏失败' }
+      return { ok: false, folder: '', message: body?.error || tr('music.fav_failed') }
     }
     musicFaved.update(s => new Set(s).add(t.bvid))
     return { ok: true, folder: body.folder ?? '' }
   } catch {
-    return { ok: false, folder: '', message: '网络异常' }
+    return { ok: false, folder: '', message: tr('music.net_error') }
   }
 }
 
@@ -329,6 +355,19 @@ function srcFor(i: number): string {
   return t ? `/api/music/stream/${encodeURIComponent(t.bvid)}` : ''
 }
 
+// reportNearby tells the host where playback is. It keeps that track and its
+// neighbours in the personal data folder, so the next launch starts from the
+// current neighbourhood instead of paging through the whole favourites list.
+// Only track changes call this — the position save above runs every couple of
+// seconds and must not rewrite the file that often.
+function reportNearby(): void {
+  void fetch('/api/music/nearby', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ index: get(musicIndex) }),
+  }).catch(() => {})
+}
+
 function save(immediate = false): void {
   if (saveTimer) {
     clearTimeout(saveTimer)
@@ -437,6 +476,16 @@ export function toggleMusic(): void {
   else audio.pause()
 }
 
+/** Pause without toggling — used while the in-capsule video owns the sound. */
+export function pauseMusic(): void {
+  if (audio && !audio.paused) audio.pause()
+}
+
+/** Resume only if paused; a no-op while already playing or before init. */
+export function resumeMusic(): void {
+  if (audio && audio.paused) void audio.play().catch(() => {})
+}
+
 export function selectTrack(i: number, play: boolean): void {
   const tracks = get(musicTracks)
   if (!tracks.length) return
@@ -448,6 +497,7 @@ export function selectTrack(i: number, play: boolean): void {
   audio.src = srcFor(idx)
   if (play) void audio.play().catch(() => {})
   save(true)
+  reportNearby()
 }
 
 /** Play an arbitrary track (a Bilibili search result, not in the two folders). */
@@ -460,6 +510,7 @@ export function playTrack(t: Track): void {
   audio.src = `/api/music/stream/${encodeURIComponent(t.bvid)}`
   void audio.play().catch(() => {})
   save(true)
+  reportNearby()
 }
 
 /** Bilibili-wide search results, appended after the local folder matches. */

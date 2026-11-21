@@ -391,7 +391,11 @@ input, textarea, select {
    readable in both appearances without touching each component's own
    background. Managed by lib/theme.ts (created/removed with the setting). */
 
-#atlr-bg {
+/* Both selectors match the live layer and the one still loading beside it
+   during a wallpaper switch: the class gives a new layer its geometry before it
+   takes over the #atlr-bg id from the outgoing one. z-index sits just below the
+   boot splash (2147483000) so the start-up animation always paints on top. */
+#atlr-bg, .atlr-bg {
   position: fixed;
   inset: 0;
   /* Explicit block: the layer is an <img> or a <video> depending on the pick,
@@ -400,14 +404,14 @@ input, textarea, select {
   width: 100vw;
   height: 100vh;
   object-fit: cover;
-  z-index: 2147483000;
+  z-index: 2147482000;
   pointer-events: none;
   user-select: none;
   opacity: 0.2;
   animation: atlr-bg-in 1.1s ease both;
   transition: opacity 0.6s ease;
 }
-:root[data-theme="dark"] #atlr-bg { opacity: 0.26; }
+:root[data-theme="dark"] #atlr-bg, :root[data-theme="dark"] .atlr-bg { opacity: 0.26; }
 
 @keyframes atlr-bg-in {
   from { opacity: 0; }

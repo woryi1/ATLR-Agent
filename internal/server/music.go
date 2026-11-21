@@ -40,8 +40,10 @@ func (s *Server) handleMusicPlaylist(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("refresh") == "1" {
 		musicService.Invalidate()
 	} else {
-		// Every read refreshes in the background; the current list keeps playing
-		// and the swap lands on the next open.
+		// Background refresh is throttled inside the service: a fresh list is
+		// served as-is, and a rebuild runs at most once per refreshMinInterval,
+		// so opening the player repeatedly cannot walk both favourites every
+		// time (Bilibili answers that with 412).
 		musicService.RefreshAsync()
 	}
 	tracks, err := musicService.Playlist(r.Context())
@@ -52,6 +54,21 @@ func (s *Server) handleMusicPlaylist(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"tracks": tracks})
 }
 
+// POST /api/music/nearby — record the playing index. The service keeps that
+// track and its neighbours in Data/User/music-nearby.json, which is what the
+// next launch starts from instead of re-paging ~1,200 favourites.
+func (s *Server) handleMusicNearby(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Index int `json:"index"`
+	}
+	if err := readBodyJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	musicService.RecordPlayback(body.Index)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func (s *Server) handleMusicStream(w http.ResponseWriter, r *http.Request) {
 	bvid := r.PathValue("bvid")
 	if bvid == "" {
@@ -59,6 +76,17 @@ func (s *Server) handleMusicStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	musicService.ServeStream(w, r, bvid)
+}
+
+// GET /api/music/video/{bvid} — proxy the DASH video stream (best decodable
+// rendition). Nothing is fetched until the page asks for it.
+func (s *Server) handleMusicVideo(w http.ResponseWriter, r *http.Request) {
+	bvid := r.PathValue("bvid")
+	if bvid == "" {
+		writeError(w, http.StatusBadRequest, "missing track id")
+		return
+	}
+	musicService.ServeVideo(w, r, bvid)
 }
 
 func (s *Server) handleBiliQR(w http.ResponseWriter, r *http.Request) {

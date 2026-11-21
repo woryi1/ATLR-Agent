@@ -67,8 +67,14 @@ type nativeBridge struct {
 	lastBeat       atomic.Int64
 	lastFrame      atomic.Int64
 	lastHiddenBeat atomic.Int64
-	probeInFlight  atomic.Bool
-	lastRevive     atomic.Int64
+	// lastFocusBeat is when the page last beat while visible AND holding the
+	// foreground slot. The black-window watchdog only acts on windows in that
+	// state; a backgrounded or locked session is entitled to stop painting.
+	lastFocusBeat atomic.Int64
+	probeInFlight atomic.Bool
+	lastRevive    atomic.Int64
+	// watchOnce makes the black-window watchdog a single goroutine per app.
+	watchOnce sync.Once
 
 	// creating guards window CREATION (not the pointer, which windowMu covers):
 	// two shows racing on a nil window would each build one, leaving an orphan
@@ -117,13 +123,9 @@ type nativeBridge struct {
 
 	settingsMu sync.Mutex
 	settings   desktopSettings
-	// geomTimer debounces persistence of the window geometry to disk: a drag
-	// fires WindowDidResize once per pixel, so we coalesce to a single write
-	// ~400ms after the gesture settles. Guarded by settingsMu.
+	// geomTimer debounces the optional window-size write. Guarded by settingsMu.
 	geomTimer *time.Timer
-	// petGeomTimer debounces persistence of the pet's position the same way —
-	// a drag shows up in the position loop as one bounds change per poll, so
-	// coalesce to a single write once the gesture settles. Guarded by settingsMu.
+	// petGeomTimer debounces persistence of the pet's position — a drag shows up
 	petGeomTimer *time.Timer
 }
 
@@ -145,6 +147,66 @@ const (
 	minWindowWidth  = 704
 	minWindowHeight = 480
 )
+
+// defaultWindowSizeFor sizes a first launch against the primary screen's work
+// area instead of a fixed 1280×860. On a small school laptop that fixed size is
+// taller than the screen, which pushes the frameless titlebar buttons above the
+// visible area and leaves them unreachable.
+func defaultWindowSizeFor(app *application.App) (int, int) {
+	const golden = 1.618
+	const maxHeight = 980
+	if app != nil && app.Screen != nil {
+		if s := app.Screen.GetPrimary(); s != nil {
+			if s.WorkArea.Width > 0 && s.WorkArea.Height > 0 {
+				// Height drives the size, width follows the golden ratio, and both
+				// are clamped inside the work area. That keeps the same proportions
+				// on every panel instead of the wide "stretched" shape a percentage
+				// of both axes produces on a widescreen display.
+				h := int(float64(s.WorkArea.Height) * 0.88)
+				if h > maxHeight {
+					h = maxHeight
+				}
+				if h < minWindowHeight {
+					h = minWindowHeight
+				}
+				w := int(float64(h) * golden)
+				maxW := int(float64(s.WorkArea.Width) * 0.92)
+				if w > maxW {
+					w = maxW
+					h = int(float64(w) / golden)
+				}
+				return clampToWorkArea(s, w, h)
+			}
+		}
+	}
+	return defaultWindowWidth, defaultWindowHeight
+}
+
+// clampToWorkArea keeps a remembered geometry inside the current screen. A
+// window restored at 1920×1080 on a 1366×768 panel would otherwise open with
+// its top edge (and the frameless controls) off screen.
+func clampToWorkArea(s *application.Screen, width, height int) (int, int) {
+	if s == nil || s.WorkArea.Width <= 0 || s.WorkArea.Height <= 0 {
+		return width, height
+	}
+	maxW := int(float64(s.WorkArea.Width) * 0.95)
+	maxH := int(float64(s.WorkArea.Height) * 0.95)
+	if width > maxW {
+		width = maxW
+	}
+	if height > maxH {
+		height = maxH
+	}
+	// The floor must not win over a screen smaller than it: an oversized window
+	// is exactly the off-screen case this function exists to prevent.
+	if width < minWindowWidth && maxW >= minWindowWidth {
+		width = minWindowWidth
+	}
+	if height < minWindowHeight && maxH >= minWindowHeight {
+		height = minWindowHeight
+	}
+	return width, height
+}
 
 // desktopShellQuery marks the window's URL so the frontend can tell it is
 // running inside the desktop-shell webview rather than an external browser
@@ -195,20 +257,17 @@ func shellURL(base, hash string) string {
 	return u
 }
 
-// rememberWindowGeometry captures the window's size and maximised state into
-// settings and debounces the disk write. The window is read HERE, from the
-// WindowDidResize handler where it is guaranteed alive — never from the debounce
-// timer or the close path. Those paths run on their own goroutines and would
-// race the window's destruction: Wails' built-in WindowClosing listener marks
-// the window destroyed, after which IsMaximised()/Size() short-circuit to
-// false/0×0 and would clobber the freshly-saved state. The window methods are
-// read before taking the lock (they marshal to the UI thread; holding
-// settingsMu across that could deadlock the main thread). Size is recorded only
-// while neither maximised, fullscreen, nor minimised — maximised/fullscreen
-// report a size that isn't the windowed size, and on Windows a minimised window
-// reports its taskbar-button size (≈160×28); persisting any of these would
-// corrupt the restore size a relaunch un-maximises back to.
+// rememberWindowGeometry stores the window's normal-state size when the user
+// opted into remembering it. The window is read here, in the resize handler
+// where it is guaranteed alive; maximised/fullscreen/minimised sizes are never
+// recorded because they are not the restore size.
 func (b *nativeBridge) rememberWindowGeometry(w *application.WebviewWindow) {
+	b.settingsMu.Lock()
+	enabled := b.settings.RememberWindowSize
+	b.settingsMu.Unlock()
+	if !enabled {
+		return
+	}
 	maximised := w.IsMaximised()
 	fullscreen := w.IsFullscreen()
 	minimised := w.IsMinimised()
@@ -216,7 +275,6 @@ func (b *nativeBridge) rememberWindowGeometry(w *application.WebviewWindow) {
 
 	b.settingsMu.Lock()
 	defer b.settingsMu.Unlock()
-	b.settings.WindowMaximised = maximised
 	if !maximised && !fullscreen && !minimised && width > 0 && height > 0 {
 		b.settings.WindowWidth = width
 		b.settings.WindowHeight = height
@@ -225,6 +283,39 @@ func (b *nativeBridge) rememberWindowGeometry(w *application.WebviewWindow) {
 		b.geomTimer.Stop()
 	}
 	b.geomTimer = time.AfterFunc(400*time.Millisecond, b.persistSettings)
+}
+
+// WindowSizeRemembered reports the opt-in window-size setting.
+func (b *nativeBridge) WindowSizeRemembered() (bool, error) {
+	b.settingsMu.Lock()
+	defer b.settingsMu.Unlock()
+	return b.settings.RememberWindowSize, nil
+}
+
+// SetWindowSizeRemembered enables or disables the remembered window size. When
+// disabling, the stored geometry is dropped so re-enabling later cannot restore
+// a stale size from a different monitor.
+func (b *nativeBridge) SetWindowSizeRemembered(enable bool) error {
+	// Window methods marshal to the UI thread, so read them BEFORE taking the
+	// settings lock (never hold settingsMu across a window call).
+	var seedW, seedH int
+	if enable {
+		if win := b.currentWindow(); win != nil && !win.IsMaximised() && !win.IsFullscreen() && !win.IsMinimised() {
+			seedW, seedH = win.Size()
+		}
+	}
+	b.settingsMu.Lock()
+	b.settings.RememberWindowSize = enable
+	if !enable {
+		b.settings.WindowWidth = 0
+		b.settings.WindowHeight = 0
+	} else if seedW > 0 && seedH > 0 {
+		// Seed the first restore point from the window that is on screen now.
+		b.settings.WindowWidth, b.settings.WindowHeight = seedW, seedH
+	}
+	b.settingsMu.Unlock()
+	b.persistSettings()
+	return nil
 }
 
 // persistSettings writes the current settings to disk. It touches no window
@@ -514,16 +605,18 @@ func (b *nativeBridge) showWindowAt(hash string) {
 		}
 	}
 	if created {
-		// Restore the size and maximised state saved from the last session.
+		// Size to the current screen by default. If the user opted into
+		// remembering the window size, restore the last windowed geometry —
+		// clamped to this screen so a size from a bigger monitor cannot open
+		// partly off screen.
 		b.settingsMu.Lock()
-		width, height, maximised := b.settings.WindowWidth, b.settings.WindowHeight, b.settings.WindowMaximised
+		remember := b.settings.RememberWindowSize
+		width, height := b.settings.WindowWidth, b.settings.WindowHeight
 		b.settingsMu.Unlock()
-		if width <= 0 || height <= 0 {
-			width, height = defaultWindowWidth, defaultWindowHeight
-		}
-		startState := application.WindowStateNormal
-		if maximised {
-			startState = application.WindowStateMaximised
+		if !remember || width <= 0 || height <= 0 {
+			width, height = defaultWindowSizeFor(b.app)
+		} else if s := b.app.Screen.GetPrimary(); s != nil {
+			width, height = clampToWorkArea(s, width, height)
 		}
 		w := b.app.Window.NewWithOptions(application.WebviewWindowOptions{
 			Title:      brand.Name,
@@ -531,7 +624,7 @@ func (b *nativeBridge) showWindowAt(hash string) {
 			Height:     height,
 			MinWidth:   minWindowWidth,
 			MinHeight:  minWindowHeight,
-			StartState: startState,
+			StartState: application.WindowStateNormal,
 			URL:        target,
 			// Mac keeps its native title bar (hidden, inset traffic lights)
 			// instead of Frameless, so the real NSWindow buttons — and their
@@ -580,15 +673,9 @@ func (b *nativeBridge) showWindowAt(hash string) {
 		})
 		// Forget the window when it really closes so a later Show re-creates one;
 		// the app itself stays alive via ApplicationShouldTerminateAfterLastWindowClosed.
-		// Cancel any pending debounce and flush the last captured geometry — this
-		// only persists already-captured settings, so unlike reading the window
-		// here it can't race the window's destruction.
+		// Flush settings (the pet position and background-running flag); the window
+		// size is not part of them.
 		w.OnWindowEvent(events.Common.WindowClosing, func(*application.WindowEvent) {
-			b.settingsMu.Lock()
-			if b.geomTimer != nil {
-				b.geomTimer.Stop()
-			}
-			b.settingsMu.Unlock()
 			b.persistSettings()
 			// Guarded: when a revive replaced this window, b.window already
 			// points at the successor and must survive the old one's close.
@@ -607,7 +694,7 @@ func (b *nativeBridge) showWindowAt(hash string) {
 				b.app.Quit()
 			}
 		})
-		// Capture size/maximised changes as the user drags or zooms the window.
+		// Capture the windowed size when the user opted into remembering it.
 		w.OnWindowEvent(events.Common.WindowDidResize, func(*application.WindowEvent) {
 			b.rememberWindowGeometry(w)
 		})
@@ -632,6 +719,9 @@ func (b *nativeBridge) showWindowAt(hash string) {
 		b.windowMu.Lock()
 		b.window = w
 		b.windowMu.Unlock()
+		// A window can go black while it is simply sitting there, with no show
+		// to probe after; the watchdog is what repairs that case.
+		b.watchBlackWindow()
 	} else {
 		// Re-validate the snapshot before touching the window: a liveness
 		// probe may have detached and closed it meanwhile (its revive path
@@ -854,14 +944,78 @@ func (b *nativeBridge) probeDelay() time.Duration {
 	return frameProbeDelay
 }
 
+// Black-window watchdog.
+//
+// probeAfterShow only judges a window the user just asked for. A WebView2 can
+// also lose its compositor while it sits open and untouched: the window still
+// drags, JS keeps beating, but every frame is stale (the reported symptom is a
+// window that is there but entirely black). This loop looks for exactly that
+// state and replaces the window.
+//
+// Every condition must hold, so the common legitimate silences never rebuild:
+// visible (not hidden), recently focused (a background app or locked session
+// may stop painting), JS still beating, and no frame for three minutes. A
+// hidden report newer than the last frame also means no frames were owed.
+const (
+	blackWatchInterval = 30 * time.Second
+	blackFrameStall    = 3 * time.Minute
+	blackFocusWindow   = 10 * time.Minute
+)
+
+func (b *nativeBridge) watchBlackWindow() {
+	b.watchOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(blackWatchInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				b.checkBlackWindow(time.Now())
+			}
+		}()
+	})
+}
+
+func (b *nativeBridge) checkBlackWindow(now time.Time) {
+	win := b.currentWindow()
+	if win == nil || b.hidden.Load() || b.allowQuit.Load() {
+		return
+	}
+	focus := b.lastFocusBeat.Load()
+	if focus == 0 || now.Sub(time.Unix(0, focus)) > blackFocusWindow {
+		return
+	}
+	frame := b.lastFrame.Load()
+	if frame == 0 || now.Sub(time.Unix(0, frame)) < blackFrameStall {
+		return
+	}
+	if hidden := b.lastHiddenBeat.Load(); hidden > frame {
+		return
+	}
+	if !b.reviveAllowed(now) {
+		return
+	}
+	old := b.detachStalled(win, now)
+	if old == nil {
+		return
+	}
+	b.revive(old)
+}
+
 // Heartbeat implements server.NativeBridge: the page beats every
 // heartbeatInterval (and on focus/visibilitychange) with the age of the last
 // requestAnimationFrame it observed, or -1 while it is hidden and owes no
 // frames. The beat proves JS alive; the frame timestamp proves the render
 // pipeline alive; the hidden flag says frames aren't expected.
-func (b *nativeBridge) Heartbeat(frameAgeMS int64, hidden bool) {
+func (b *nativeBridge) Heartbeat(frameAgeMS int64, hidden bool, focused ...bool) {
 	now := time.Now()
 	b.lastBeat.Store(now.UnixNano())
+	if len(focused) > 0 && focused[0] && !hidden {
+		// The page is visible and holds the foreground slot. Only beats from
+		// this state may drive the black-window watchdog: a window behind
+		// another app, a locked session, or a sleeping display is allowed to
+		// stop painting without being torn down and rebuilt behind the user's
+		// back.
+		b.lastFocusBeat.Store(now.UnixNano())
+	}
 	if hidden {
 		// Not visible, so no frames are owed: record that explicitly, or the
 		// probe would read the missing frame as a black window.

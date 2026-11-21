@@ -21,15 +21,18 @@
     // made it read like a volume meter).
     const held = Array(BANDS * 2).fill(0)
     let raf = 0
+    // Half-rate sampling: the bars are 90ms-transitioned, so 30 updates/s looks
+    // identical to 60 and halves both the per-frame allocations and the Svelte
+    // node updates while a track is playing all day.
+    let frame = 0
     const tick = () => {
+      raf = requestAnimationFrame(tick)
+      if (frame++ % 2 === 1) return
       const bands = readVizBands()
       // Nothing playing and every bar already at rest: leave the DOM alone and
-      // just wait. Reassigning zero arrays at 60 fps kept Svelte re-rendering
-      // 44 nodes for a silent player.
-      if (!bands.live && held.every((v) => v < 0.004)) {
-        raf = requestAnimationFrame(tick)
-        return
-      }
+      // just wait. Reassigning zero arrays kept Svelte re-rendering 44 nodes for
+      // a silent player.
+      if (!bands.live && held.every((v) => v < 0.004)) return
       const nextLeft: number[] = []
       const nextRight: number[] = []
       for (let i = 0; i < BANDS; i++) {
@@ -43,7 +46,6 @@
       left = nextLeft
       right = nextRight
       live = bands.live
-      raf = requestAnimationFrame(tick)
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)

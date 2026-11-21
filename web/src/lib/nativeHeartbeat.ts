@@ -48,7 +48,14 @@ export function startNativeHeartbeat(): () => void {
     void request<{ ok: boolean }>('/api/native/heartbeat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ frame_age_ms: frameAge, hidden: document.hidden }),
+      // focused tells the shell this window is the foreground app. The
+      // black-window watchdog only rebuilds windows in that state, so a
+      // backgrounded or locked session is never torn down for going quiet.
+      body: JSON.stringify({
+        frame_age_ms: frameAge,
+        hidden: document.hidden,
+        focused: document.hasFocus(),
+      }),
     }).catch(() => {
       // Best-effort: a failed beat reads as silence, and silence after a show
       // is what the shell already treats as "needs a new window".

@@ -15,7 +15,7 @@
   import * as api from './lib/api'
   import { installExternalLinkInterceptor } from './lib/externalLinks'
   import { installLaStorageBridge } from './lib/laStorage'
-  import { loadLanding, loadLightApps, onStartScreen } from './lib/stores'
+  import { loadLanding, loadLightApps, onStartScreen, postCapsuleNotice, clearCapsuleNotice } from './lib/stores'
   import { startNativeHeartbeat } from './lib/nativeHeartbeat'
   import { normalizeHash, hashPicksChatTarget } from './lib/hashRouting'
   import { pruneSessions } from './lib/genui/panel-state'
@@ -507,6 +507,12 @@
       }
       if (ev.kind === 'question_pending' || ev.kind === 'confirm_pending' || ev.kind === 'turn_complete') {
         notifyForSessionActivity(sid, ev.kind)
+        // Foreground reminder for the dynamic capsule: the desktop toast covers
+        // the unfocused case, this covers the user sitting in the app.
+        postCapsuleNotice(ev.kind === 'turn_complete' ? 'done' : 'confirm', sid)
+      }
+      if (ev.kind === 'question_resolved' || ev.kind === 'confirm_resolved') {
+        clearCapsuleNotice(sid)
       }
     })
 

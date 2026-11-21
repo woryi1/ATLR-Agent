@@ -492,6 +492,18 @@ export async function setAutostart(enabled: boolean): Promise<void> {
   })
 }
 
+// Desktop shell only: opt-in "restore the last window size on launch".
+export async function getRememberWindowSize(): Promise<boolean> {
+  const r = await request<{ enabled: boolean }>('/api/native/remember-window-size')
+  return r.enabled
+}
+export async function setRememberWindowSize(enabled: boolean): Promise<void> {
+  await request<{ enabled: boolean }>('/api/native/remember-window-size', {
+    method: 'PUT',
+    ...json({ enabled }),
+  })
+}
+
 export interface FsEntry {
   name: string
   is_dir: boolean

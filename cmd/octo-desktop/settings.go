@@ -20,15 +20,14 @@ type desktopSettings struct {
 	// installer). It scopes the refresh-on-upgrade: an octo on ~/.local/bin
 	// with no matching record here is the user's own and is never overwritten.
 	SeededOctoVersion string `json:"seeded_octo_version,omitempty"`
-	// WindowWidth/WindowHeight remember the window's non-maximised size across
-	// relaunches. Zero (a fresh install) means "use the built-in default size".
-	// They hold the *restore* size — while maximised the size isn't overwritten,
-	// so un-maximising after a relaunch returns to the size the user last chose.
+	// RememberWindowSize opts into restoring the last windowed size on the next
+	// launch. Off by default: a remembered size is what opened the app at an old
+	// aspect ratio after moving to a different display.
+	RememberWindowSize bool `json:"remember_window_size,omitempty"`
+	// WindowWidth/WindowHeight hold that remembered size, and are only written
+	// while RememberWindowSize is on and the window is in its normal state.
 	WindowWidth  int `json:"window_width,omitempty"`
 	WindowHeight int `json:"window_height,omitempty"`
-	// WindowMaximised remembers whether the window was maximised at exit, so a
-	// relaunch reopens maximised instead of at the restore size.
-	WindowMaximised bool `json:"window_maximised,omitempty"`
 	// PetX/PetY remember the pet window's position across relaunches, in
 	// absolute screen points. PetPositionSet is the "user has placed the pet"
 	// flag: (0,0) is a legitimate on-screen position, so the coordinates alone

@@ -25,6 +25,7 @@ type fakeNative struct {
 	dismissCalls       int
 	gotDismissID       string
 	autostart          bool
+	rememberSize       bool
 	toggleMaxCalls     int
 	minimiseCalls      int
 	closeCalls         int
@@ -66,12 +67,17 @@ func (f *fakeNative) DismissSessionNotification(sessionID string) {
 	f.dismissCalls++
 	f.gotDismissID = sessionID
 }
-func (f *fakeNative) AutostartEnabled() (bool, error) { return f.autostart, nil }
-func (f *fakeNative) SetAutostart(enable bool) error  { f.autostart = enable; return nil }
-func (f *fakeNative) ToggleMaximise()                 { f.toggleMaxCalls++ }
-func (f *fakeNative) Minimise()                       { f.minimiseCalls++ }
-func (f *fakeNative) Close()                          { f.closeCalls++ }
-func (f *fakeNative) WindowState() bool               { return f.maximised }
+func (f *fakeNative) AutostartEnabled() (bool, error)     { return f.autostart, nil }
+func (f *fakeNative) SetAutostart(enable bool) error      { f.autostart = enable; return nil }
+func (f *fakeNative) WindowSizeRemembered() (bool, error) { return f.rememberSize, nil }
+func (f *fakeNative) SetWindowSizeRemembered(enable bool) error {
+	f.rememberSize = enable
+	return nil
+}
+func (f *fakeNative) ToggleMaximise()   { f.toggleMaxCalls++ }
+func (f *fakeNative) Minimise()         { f.minimiseCalls++ }
+func (f *fakeNative) Close()            { f.closeCalls++ }
+func (f *fakeNative) WindowState() bool { return f.maximised }
 func (f *fakeNative) OpenExternal(url string) error {
 	f.openCalls++
 	f.gotOpenURL = url
@@ -96,7 +102,7 @@ func (f *fakeNative) Print() error {
 	f.printCalls++
 	return f.printErr
 }
-func (f *fakeNative) Heartbeat(frameAgeMS int64, hidden bool) {
+func (f *fakeNative) Heartbeat(frameAgeMS int64, hidden bool, focused ...bool) {
 	f.heartbeatCalls++
 	f.gotFrameAgeMS = frameAgeMS
 	f.gotHidden = hidden

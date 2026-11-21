@@ -80,6 +80,7 @@
     void api.getMusicOpenMode().then(v => { musicOpenSystem = v }).catch(() => {})
   })
   let autostart     = $state(false) // desktop shell only
+  let rememberWindowSize = $state(false) // desktop shell only
   let serverOs      = $state('')    // /api/version's os — gates the experimental tab
   let computerUse   = $state(false) // tools.computer.enabled toggle (experimental tab)
   const computerPlatform = $derived(serverOs === 'darwin' || serverOs === 'windows')
@@ -142,10 +143,10 @@
     } catch {
       // Keep the panel usable if the sections call fails.
       backupCatalog = [
-        { id: 'user', label: '设置与凭据', hint: 'API Key、模型配置、登录态、主题、上传附件' },
-        { id: 'records', label: '会话与记忆', hint: '聊天记录、项目记忆、定时任务、工作流日志' },
-        { id: 'tools', label: '技能与智能体', hint: '技能、子智能体、MCP 配置与令牌' },
-        { id: 'work', label: '工作目录', hint: 'Work 下的项目文件，可能很大' },
+        { id: 'user', label: tr('backup.section_user'), hint: tr('backup.section_user_hint') },
+        { id: 'records', label: tr('backup.section_records'), hint: tr('backup.section_records_hint') },
+        { id: 'tools', label: tr('backup.section_tools'), hint: tr('backup.section_tools_hint') },
+        { id: 'work', label: tr('backup.section_work'), hint: tr('backup.section_work_hint') },
       ]
     }
   }
@@ -156,18 +157,18 @@
 
   async function runExport(): Promise<void> {
     const ids = Object.keys(exportSel).filter(id => exportSel[id])
-    if (ids.length === 0) { showToast('至少选择一项要导出的数据', 'error'); return }
-    if (exportPwd.length < 6) { showToast('密码至少 6 位', 'error'); return }
-    if (exportPwd !== exportPwd2) { showToast('两次输入的密码不一致', 'error'); return }
+    if (ids.length === 0) { showToast(tr('backup.pick_section'), 'error'); return }
+    if (exportPwd.length < 6) { showToast(tr('backup.pwd_short'), 'error'); return }
+    if (exportPwd !== exportPwd2) { showToast(tr('backup.pwd_mismatch'), 'error'); return }
     exportBusy = true
     exportDone = null
     try {
       exportDone = await exportBackup(ids, exportPwd)
       exportPwd = ''
       exportPwd2 = ''
-      showToast('加密备份已导出', 'success')
+      showToast(tr('backup.exported_toast'), 'success')
     } catch (e: any) {
-      showToast(e?.message || '导出失败', 'error')
+      showToast(e?.message || tr('backup.export_failed'), 'error')
     } finally {
       exportBusy = false
     }
@@ -176,7 +177,7 @@
   /** Accept a picked or dropped package and jump straight to the import form. */
   function acceptPackage(file: File | null | undefined): void {
     if (!file) return
-    if (!isBackupFile(file)) { showToast('这不是 ATLR 备份包（.atlrbak）', 'error'); return }
+    if (!isBackupFile(file)) { showToast(tr('backup.not_package'), 'error'); return }
     importFile = file
     importPwd = ''
     importSummary = null
@@ -189,8 +190,8 @@
   }
 
   async function runPreview(): Promise<void> {
-    if (!importFile) { showToast('请选择备份包', 'error'); return }
-    if (!importPwd) { showToast('请输入备份密码', 'error'); return }
+    if (!importFile) { showToast(tr('backup.pick_file'), 'error'); return }
+    if (!importPwd) { showToast(tr('backup.need_pwd'), 'error'); return }
     importBusy = true
     importError = ''
     try {
@@ -201,7 +202,7 @@
       importSel = sel
     } catch (e: any) {
       importSummary = null
-      importError = e?.message || '解析失败'
+      importError = e?.message || tr('backup.parse_failed')
     } finally {
       importBusy = false
     }
@@ -210,19 +211,17 @@
   async function runImport(): Promise<void> {
     if (!importFile || !importSummary) return
     const ids = Object.keys(importSel).filter(id => importSel[id])
-    if (ids.length === 0) { showToast('至少选择一项要恢复的数据', 'error'); return }
+    if (ids.length === 0) { showToast(tr('backup.pick_section'), 'error'); return }
     const personal = ids.some(id => id !== 'work')
-    const warning = personal
-      ? '⚠️ 你正在导入个人数据（设置 / 会话 / 技能）。这会直接替换并删除现有的重要数据，且不会生成任何备份，无法恢复。\n\n确定继续吗？'
-      : '将用备份包替换当前的 Work 工作目录，现有文件会被删除。确定继续吗？'
+    const warning = personal ? tr('backup.confirm_personal') : tr('backup.confirm_work')
     if (!(await confirmDialog(warning))) return
     importBusy = true
     try {
       importDone = await applyBackup(importFile, importPwd, ids)
-      showToast('数据已恢复，3 秒后自动重启', 'success')
+      showToast(tr('backup.restored_toast'), 'success')
       scheduleRestart()
     } catch (e: any) {
-      showToast(e?.message || '恢复失败', 'error')
+      showToast(e?.message || tr('backup.restore_failed'), 'error')
     } finally {
       importBusy = false
     }
@@ -444,7 +443,10 @@
       if (target) settingsTarget.set(null)
       loadConfig()
       loadVersion()
-      if (get(nativeShell)) api.getAutostart().then(v => (autostart = v)).catch(() => {})
+      if (get(nativeShell)) {
+        api.getAutostart().then(v => (autostart = v)).catch(() => {})
+        api.getRememberWindowSize().then(v => (rememberWindowSize = v)).catch(() => {})
+      }
       theme = modeToThemeLabel[getMode()] ?? 'Light'
       fontSize = storedFontSize()
       // Theme and wallpapers are reconciled with the server after boot, so the
@@ -691,7 +693,7 @@
     {#if dropActive}
       <div class="backup-drop-overlay">
         <iconify-icon icon="lucide:package-open" width="34"></iconify-icon>
-        <span>松开以导入备份包</span>
+        <span>{$t('backup.release_import')}</span>
       </div>
     {/if}
 
@@ -921,6 +923,63 @@
           {/if}
           <div class="setrow">
             <div class="seti">
+              <span class="setl">{$t('settings.viz.lyrics')}</span>
+              <span class="setd">{$t('settings.viz.lyrics_desc')}</span>
+            </div>
+            <Switch checked={$vizSettings.lyrics} onchange={(v) => patchVizSettings({ lyrics: v })} />
+          </div>
+          {#if $vizSettings.lyrics}
+            <div class="setrow">
+              <div class="seti">
+                <span class="setl">{$t('settings.viz.lyrics_gap')}</span>
+                <span class="setd">{$vizSettings.lyricsGap}px</span>
+              </div>
+              <input
+                class="bgrange" type="range" min="4" max="48" step="1"
+                value={$vizSettings.lyricsGap}
+                oninput={(e) => patchVizSettings({ lyricsGap: Number(e.currentTarget.value) })}
+              />
+            </div>
+            <div class="setrow">
+              <div class="seti">
+                <span class="setl">{$t('settings.viz.lyrics_size')}</span>
+                <span class="setd">{$vizSettings.lyricsSize}px</span>
+              </div>
+              <input
+                class="bgrange" type="range" min="24" max="72" step="2"
+                value={$vizSettings.lyricsSize}
+                oninput={(e) => patchVizSettings({ lyricsSize: Number(e.currentTarget.value) })}
+              />
+            </div>
+            <div class="setrow">
+              <div class="seti">
+                <span class="setl">{$t('settings.viz.lyrics_color')}</span>
+                <span class="setd">
+                  {$vizSettings.lyricsColor || $t('settings.viz.follow_viz')}
+                </span>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px">
+                <button class="link-btn" onclick={() => patchVizSettings({ lyricsColor: '' })}>
+                  {$t('settings.viz.follow_viz')}
+                </button>
+                <input
+                  type="color"
+                  value={$vizSettings.lyricsColor || '#4aa3ff'}
+                  oninput={(e) => patchVizSettings({ lyricsColor: e.currentTarget.value })}
+                  style="width:34px;height:24px;padding:0;border:1px solid var(--border);border-radius:6px;background:transparent"
+                />
+              </div>
+            </div>
+          {/if}
+          <div class="setrow">
+            <div class="seti">
+              <span class="setl">{$t('settings.viz.capsule')}</span>
+              <span class="setd">{$t('settings.viz.capsule_desc')}</span>
+            </div>
+            <Switch checked={$vizSettings.capsule} onchange={(v) => patchVizSettings({ capsule: v })} />
+          </div>
+          <div class="setrow">
+            <div class="seti">
               <span class="setl">{$t('settings.viz.enabled')}</span>
               <span class="setd">{$t('settings.viz.enabled_desc')}</span>
             </div>
@@ -933,6 +992,19 @@
                 <span class="setd">{$t('settings.autostart_desc')}</span>
               </div>
               <Switch checked={autostart} onchange={(v) => toggleAutostart(v)} />
+            </div>
+            <div class="setrow">
+              <div class="seti">
+                <span class="setl">{$t('settings.remember_window_size')}</span>
+                <span class="setd">{$t('settings.remember_window_size_desc')}</span>
+              </div>
+              <Switch
+                checked={rememberWindowSize}
+                onchange={(v) => {
+                  rememberWindowSize = v
+                  void api.setRememberWindowSize(v).catch(() => { rememberWindowSize = !v })
+                }}
+              />
             </div>
           {/if}
           <div class="setrow">
@@ -1029,7 +1101,7 @@
             <div class="data-row">
               <div class="data-row-main">
                 <iconify-icon icon="lucide:package-open" width="15"></iconify-icon>
-                <span class="setl">数据备份</span>
+                <span class="setl">{$t('backup.title')}</span>
               </div>
               <button class="link-btn" onclick={() => { dataSubView = 'backup'; void loadBackupCatalog() }}>{$t('settings.data.manage')}</button>
             </div>
@@ -1068,18 +1140,18 @@
                 <iconify-icon icon="ant-design:left-outlined" width="14"></iconify-icon>
               </button>
               <span class="data-subtitle">
-                {dataSubView === 'backup' ? '数据备份' : dataSubView === 'archived' ? $t('settings.data.archived') : dataSubView === 'memory' ? $t('nav.memory') : dataSubView === 'profiles' ? $t('settings.profiles.title') : $t('nav.file_recall')}
+                {dataSubView === 'backup' ? $t('backup.title') : dataSubView === 'archived' ? $t('settings.data.archived') : dataSubView === 'memory' ? $t('nav.memory') : dataSubView === 'profiles' ? $t('settings.profiles.title') : $t('nav.file_recall')}
               </span>
             </div>
             {#if dataSubView === 'backup'}
               <div class="backup-panel">
                 <div class="backup-tabs">
-                  <button class:on={backupMode === 'export'} onclick={() => { backupMode = 'export'; void loadBackupCatalog() }}>导出数据</button>
-                  <button class:on={backupMode === 'import'} onclick={() => { backupMode = 'import'; void loadBackupCatalog() }}>导入数据</button>
+                  <button class:on={backupMode === 'export'} onclick={() => { backupMode = 'export'; void loadBackupCatalog() }}>{$t('backup.export_tab')}</button>
+                  <button class:on={backupMode === 'import'} onclick={() => { backupMode = 'import'; void loadBackupCatalog() }}>{$t('backup.import_tab')}</button>
                 </div>
 
                 {#if backupMode === 'export'}
-                  <p class="backup-note">备份包使用你输入的密码加密（AES-256-GCM），密码不会被保存，忘记就无法恢复。</p>
+                  <p class="backup-note">{$t('backup.note')}</p>
                   <div class="backup-sections">
                     {#each backupCatalog as s (s.id)}
                       <label class="backup-check">
@@ -1093,20 +1165,20 @@
                     {/each}
                   </div>
                   <div class="backup-fields">
-                    <input class="sinput" type="password" placeholder="设置密码（至少 6 位）" bind:value={exportPwd} />
-                    <input class="sinput" type="password" placeholder="再输入一次密码" bind:value={exportPwd2} />
+                    <input class="sinput" type="password" placeholder={$t('backup.pwd')} bind:value={exportPwd} />
+                    <input class="sinput" type="password" placeholder={$t('backup.pwd2')} bind:value={exportPwd2} />
                   </div>
                   <div class="backup-actions">
                     <button class="link-btn" disabled={exportBusy} onclick={runExport}>
-                      {exportBusy ? '正在打包…' : '加密导出'}
+                      {exportBusy ? $t('backup.packing') : $t('backup.export')}
                     </button>
                   </div>
                   {#if exportDone}
                     <div class="backup-result">
-                      <div>已导出：{exportDone.name}</div>
-                      <div class="backup-dim">{exportDone.files} 个文件 · {formatBytes(exportDone.size)}</div>
+                      <div>{$t('backup.exported')} {exportDone.name}</div>
+                      <div class="backup-dim">{$t('backup.file_meta').replace('{files}', String(exportDone.files)).replace('{size}', formatBytes(exportDone.size))}</div>
                       <div class="backup-dim backup-path">{exportDone.path}</div>
-                      <button class="link-btn" onclick={() => void openBackupFolder(exportDone?.path)}>打开文件夹</button>
+                      <button class="link-btn" onclick={() => void openBackupFolder(exportDone?.path)}>{$t('backup.open_folder')}</button>
                     </div>
                   {/if}
                 {:else}
@@ -1125,23 +1197,23 @@
                     onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') backupInput?.click() }}
                   >
                     <iconify-icon icon="lucide:package-open" width="22"></iconify-icon>
-                    <div class="backup-drop-title">{importFile ? importFile.name : '拖入 .atlrbak 备份包，或点击选择'}</div>
-                    <div class="backup-dim">{importFile ? formatBytes(importFile.size) : '密码只用于解密，不会保存在任何地方'}</div>
+                    <div class="backup-drop-title">{importFile ? importFile.name : $t('backup.drop_title')}</div>
+                    <div class="backup-dim">{importFile ? formatBytes(importFile.size) : $t('backup.import_pwd_hint')}</div>
                   </div>
                   {#if importFile}
                     <div class="backup-fields">
-                      <input class="sinput" type="password" placeholder="备份密码" bind:value={importPwd} />
+                      <input class="sinput" type="password" placeholder={$t('backup.import_pwd')} bind:value={importPwd} />
                     </div>
                     <div class="backup-actions">
                       <button class="link-btn" disabled={importBusy} onclick={runPreview}>
-                        {importBusy ? '正在解析…' : '解析备份包'}
+                        {importBusy ? $t('backup.parsing') : $t('backup.parse')}
                       </button>
                     </div>
                     {#if importError}<div class="backup-error">{importError}</div>{/if}
                     {#if importSummary}
                       <div class="backup-summary">
-                        <div>备份时间：{new Date(importSummary.created_at).toLocaleString()} · {importSummary.app || 'ATLR-Agent'}</div>
-                        <div class="backup-dim">{importSummary.files} 个文件 · {formatBytes(importSummary.bytes)}</div>
+                        <div>{$t('backup.created').replace('{time}', new Date(importSummary.created_at).toLocaleString()).replace('{app}', importSummary.app || 'ATLR-Agent')}</div>
+                        <div class="backup-dim">{$t('backup.file_meta').replace('{files}', String(importSummary.files)).replace('{size}', formatBytes(importSummary.bytes))}</div>
                         <div class="backup-sections">
                           {#each importSummary.restorable as id (id)}
                             <label class="backup-check">
@@ -1154,25 +1226,25 @@
                             </label>
                           {/each}
                         </div>
-                        <p class="backup-note">导入会直接替换并删除所选数据，不生成备份，无法恢复。完成后应用会自动重启。</p>
+                        <p class="backup-note">{$t('backup.import_note')}</p>
                         <div class="backup-actions">
                           <button class="link-btn" disabled={importBusy} onclick={runImport}>
-                            {importBusy ? '正在恢复…' : '开始恢复'}
+                            {importBusy ? $t('backup.restoring') : $t('backup.start_restore')}
                           </button>
                         </div>
                       </div>
                     {/if}
                     {#if importDone}
                       <div class="backup-result">
-                        <div>已恢复：{importDone.sections.map(sectionLabel).join('、')}（{importDone.files} 个文件）</div>
+                        <div>{$t('backup.restored').replace('{sections}', importDone.sections.map(sectionLabel).join('、')).replace('{files}', String(importDone.files))}</div>
                         {#if restartCountdown > 0}
                           <div class="backup-restart">
-                            <span>{restartCountdown} 秒后自动重启…</span>
-                            <button class="link-btn" onclick={cancelRestart}>取消</button>
+                            <span>{$t('backup.restart_in').replace('{n}', String(restartCountdown))}</span>
+                            <button class="link-btn" onclick={cancelRestart}>{$t('backup.cancel')}</button>
                           </div>
                         {:else}
-                          <div class="backup-dim">需要重启应用后才会生效。</div>
-                          <button class="link-btn" onclick={() => void restartApp()}>立即重启</button>
+                          <div class="backup-dim">{$t('backup.restart_needed')}</div>
+                          <button class="link-btn" onclick={() => void restartApp()}>{$t('backup.restart_now')}</button>
                         {/if}
                       </div>
                     {/if}

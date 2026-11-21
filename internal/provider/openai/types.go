@@ -210,25 +210,32 @@ type apiUsage struct {
 
 	// Cache accounting. DeepSeek reports prompt_cache_hit_tokens /
 	// prompt_cache_miss_tokens at the top level; OpenAI reports cached input
-	// under prompt_tokens_details.cached_tokens. We read whichever is present.
+	// under prompt_tokens_details.cached_tokens. Some compatible servers emit
+	// a flat cached_tokens or an Anthropic-shaped cache_read_input_tokens, so
+	// those are read too — whichever is present wins.
 	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
 	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+	CachedTokens          int `json:"cached_tokens"`
+	CacheReadInputTokens  int `json:"cache_read_input_tokens"`
 	PromptTokensDetails   *struct {
 		CachedTokens int `json:"cached_tokens"`
 	} `json:"prompt_tokens_details,omitempty"`
 }
 
 // cachedTokens returns the number of cached (read-hit) prompt tokens this
-// usage block reports, preferring DeepSeek's explicit hit count and falling
-// back to OpenAI's prompt_tokens_details.cached_tokens.
+// usage block reports, preferring DeepSeek's explicit hit count, then the
+// OpenAI nested shape, then the flat variants some compatible servers use.
 func (u apiUsage) cachedTokens() int {
 	if u.PromptCacheHitTokens > 0 {
 		return u.PromptCacheHitTokens
 	}
-	if u.PromptTokensDetails != nil {
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 {
 		return u.PromptTokensDetails.CachedTokens
 	}
-	return 0
+	if u.CachedTokens > 0 {
+		return u.CachedTokens
+	}
+	return u.CacheReadInputTokens
 }
 
 // nonCachedInput returns prompt tokens excluding the cached (read-hit) portion.

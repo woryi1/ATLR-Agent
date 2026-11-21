@@ -6,7 +6,8 @@
   import { prefersReducedMotion } from 'svelte/motion'
   import {
     running, activeSessionId, chatStreaming, sessions, sessionGroups,
-    chatContextUsage, chatWorkingDir, chatPermMode, chatReasoningEffort, chatShowReasoning, showToast, chatGoal, chatModel,
+    chatContextUsage, chatWorkingDir, chatPermMode, chatReasoningEffort, chatShowReasoning, showToast, chatGoal, chatModel, chatCachePct,
+    autoScrollOn, setAutoScrollOn,
     globalPermissionMode, globalReasoningEffort, nativeShell, localAccess, activeAgent, pendingModel, view, openSettingsAt,
     pendingAgent, pendingWorkingDir, pendingGroupId, pendingReasoningEffort, pendingPermissionMode, pendingShowReasoning,
     normalizeDir, dirLeaf, projectsClaimingDir, composerFocusRequest, superMode,
@@ -806,6 +807,9 @@
   // (landing page only) pendingShowReasoning > default true.
   let showReasoning = $derived($chatShowReasoning[sid] ?? currentSession?.show_reasoning ?? (sid ? true : ($pendingShowReasoning ?? true)))
   let ctxUsage = $derived(Number($chatContextUsage[sid] ?? currentSession?.context_usage ?? 0))
+  // Prompt-cache hit rate of the last completed turn, straight from the
+  // provider's usage block. undefined hides the chip (no cache evidence yet).
+  let cachePct = $derived<number | undefined>($chatCachePct[sid])
   // Session goal chip: usage while active, status label otherwise. null/absent
   // hides the chip entirely.
   let goal = $derived($chatGoal[sid] ?? null)
@@ -1776,6 +1780,28 @@
         >
           <iconify-icon icon={voiceOn ? 'lucide:square' : 'lucide:mic'} width="14"></iconify-icon>
         </button>
+        <!-- Status order, left to right: voice, auto-scroll, cache, context.
+             Auto-scroll stays a toggle; the 5s idle logic lives in ChatView and
+             reads the same store, so the chip is the single source of truth. -->
+        <button
+          type="button"
+          class="meta-chip"
+          class:on={$autoScrollOn}
+          title={$t('chat.autoscroll_hint')}
+          aria-pressed={$autoScrollOn}
+          onclick={(e) => { e.stopPropagation(); setAutoScrollOn(!$autoScrollOn) }}
+        >
+          <iconify-icon icon="lucide:arrow-down-to-line" width="13"></iconify-icon>
+          <span>{$t('chat.autoscroll')}</span>
+        </button>
+        <span
+          class="meta-chip static"
+          title={typeof cachePct === 'number' ? $t('chat.cache') : $t('chat.cache_unknown')}
+        >
+          <iconify-icon icon="lucide:database" width="13"></iconify-icon>
+          <span>{$t('chat.cache')}</span>
+          <span class="mono ctx-pct">{typeof cachePct === 'number' ? `${cachePct}%` : '—'}</span>
+        </span>
         <span class="meta-chip static" title={$t('chat.context')}>
           <iconify-icon icon="lucide:clock" width="13"></iconify-icon>
           <span>{$t('chat.context')}</span>
@@ -1990,6 +2016,8 @@ textarea {
   white-space: nowrap;
 }
 .meta-chip:hover { color: var(--text); background: var(--hover-neutral); }
+.meta-chip.on { color: #0a84ff; }
+.meta-chip.on:hover { color: #0a84ff; }
 .meta-chip.static { cursor: default; }
 .meta-chip.static:hover { color: var(--text-secondary); background: transparent; }
 .ctx-pct { color: var(--text); font-weight: 600; }

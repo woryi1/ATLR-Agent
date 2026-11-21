@@ -48,6 +48,12 @@ type NativeBridge interface {
 	// SetAutostart registers (enable) or unregisters the app from launch-at-login.
 	SetAutostart(enable bool) error
 
+	// WindowSizeRemembered reports whether the desktop shell restores the last
+	// windowed size on the next launch (opt-in, off by default).
+	WindowSizeRemembered() (bool, error)
+	// SetWindowSizeRemembered enables or disables that restore.
+	SetWindowSizeRemembered(enable bool) error
+
 	// ToggleMaximise maximises the window if it isn't, or restores it if it is —
 	// the double-click-the-titlebar zoom the frontend's draggable header can't do
 	// itself (the page is octo-served, so it has no Wails runtime to call).
@@ -121,7 +127,7 @@ type NativeBridge interface {
 	// A visible page that beats without ever producing a frame is the black-
 	// window signature — conflating that with "hidden" would make the failure
 	// this whole mechanism exists for undetectable.
-	Heartbeat(frameAgeMS int64, hidden bool)
+	Heartbeat(frameAgeMS int64, hidden bool, focused ...bool)
 }
 
 type nativePickFolderRequest struct {
@@ -292,6 +298,47 @@ func (s *Server) handleNativeAutostartSet(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{"enabled": req.Enabled})
 }
 
+// GET /api/native/remember-window-size — report the opt-in window-size restore
+// (desktop only).
+func (s *Server) handleNativeRememberSizeGet(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	enabled, err := s.cfg.Native.WindowSizeRemembered()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": enabled})
+}
+
+// PUT /api/native/remember-window-size — set the opt-in window-size restore.
+func (s *Server) handleNativeRememberSizeSet(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeError(w, http.StatusForbidden, "available only from the local machine")
+		return
+	}
+	if s.cfg.Native == nil {
+		writeError(w, http.StatusNotFound, "native bridge not available")
+		return
+	}
+	var req nativeAutostartRequest
+	if err := readBodyJSON(r, &req); err != nil {
+		writeInvalidJSONBody(w, err)
+		return
+	}
+	if err := s.cfg.Native.SetWindowSizeRemembered(req.Enabled); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": req.Enabled})
+}
+
 // POST /api/native/window/toggle-maximise — maximise/restore the desktop window
 // (the double-click-titlebar zoom). Desktop only, loopback-gated.
 func (s *Server) handleNativeToggleMaximise(w http.ResponseWriter, r *http.Request) {
@@ -325,6 +372,7 @@ func (s *Server) handleNativeMinimise(w http.ResponseWriter, r *http.Request) {
 type nativeHeartbeatRequest struct {
 	FrameAgeMS int64 `json:"frame_age_ms"`
 	Hidden     bool  `json:"hidden"`
+	Focused    bool  `json:"focused"`
 }
 
 // POST /api/native/heartbeat — liveness beat from the page inside the desktop
@@ -345,7 +393,7 @@ func (s *Server) handleNativeHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// letting a malformed beat mask a black window.
 	req := nativeHeartbeatRequest{FrameAgeMS: -1}
 	_ = readBodyJSON(r, &req)
-	s.cfg.Native.Heartbeat(req.FrameAgeMS, req.Hidden)
+	s.cfg.Native.Heartbeat(req.FrameAgeMS, req.Hidden, req.Focused)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

@@ -773,7 +773,11 @@
 .mono { font-family: var(--font-mono); }
 .tool-item {
   border: 1px solid var(--border); border-radius: 10px;
-  background: var(--bg-container); box-shadow: var(--card-shadow);
+  /* Let the wallpaper / spectrum / lyrics behind the transcript show through
+     the tool card instead of being painted over. */
+  background: color-mix(in srgb, var(--bg-container) 84%, transparent);
+  backdrop-filter: blur(10px) saturate(1.05);
+  box-shadow: var(--card-shadow);
   overflow: hidden; transition: 0.12s;
 }
 .tool-summary {
@@ -801,7 +805,7 @@
 /* Body regions are capped at ~10 text lines; longer content scrolls. */
 .tool-output {
   margin: 0; padding: 10px 14px; border-top: 1px solid var(--border-table);
-  background: var(--bg-sidebar); font-size: 12px; line-height: 1.7;
+  background: color-mix(in srgb, var(--bg-sidebar) 82%, transparent); font-size: 12px; line-height: 1.7;
   font-family: var(--font-mono);
   color: var(--text-secondary); overflow-x: auto; white-space: pre-wrap; word-break: break-word;
   max-height: 224px; overflow-y: auto;
@@ -835,7 +839,7 @@ details[open] > summary .chev { transform: rotate(90deg); }
 .cmd-block {
   display: flex; align-items: flex-start; gap: 8px;
   padding: 10px 14px; border-top: 1px solid var(--border-table);
-  background: var(--terminal-bg); color: var(--terminal-text);
+  background: color-mix(in srgb, var(--terminal-bg) 88%, transparent); color: var(--terminal-text);
   font-size: 12px; line-height: 1.6;
   font-family: var(--font-mono);
 }
@@ -893,7 +897,7 @@ details[open] > summary .chev { transform: rotate(90deg); }
 .diff-line.add { background: var(--success-bg); color: var(--success-text); border-left: 2px solid var(--success); }
 .terminal-output {
   margin: 0; padding: 12px 14px; border-top: 1px solid var(--border-table);
-  background: var(--terminal-bg); color: var(--terminal-text); font-size: 12px; line-height: 1.6;
+  background: color-mix(in srgb, var(--terminal-bg) 88%, transparent); color: var(--terminal-text); font-size: 12px; line-height: 1.6;
   font-family: var(--font-mono); overflow-x: auto;
   max-height: 216px; overflow-y: auto;
 }

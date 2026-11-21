@@ -19,6 +19,13 @@ func TestApiUsage_CachedTokens(t *testing.T) {
 	if got := (apiUsage{}).cachedTokens(); got != 0 {
 		t.Errorf("no cache info = %d, want 0", got)
 	}
+	// Flat variants some compatible servers emit.
+	if got := (apiUsage{CachedTokens: 42}).cachedTokens(); got != 42 {
+		t.Errorf("flat cached_tokens = %d, want 42", got)
+	}
+	if got := (apiUsage{CacheReadInputTokens: 43}).cachedTokens(); got != 43 {
+		t.Errorf("cache_read_input_tokens = %d, want 43", got)
+	}
 	// DeepSeek hit takes precedence when both somehow present.
 	u2 := apiUsage{PromptCacheHitTokens: 200}
 	u2.PromptTokensDetails = &struct {

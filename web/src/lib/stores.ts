@@ -454,6 +454,27 @@ export const chatContextUsage = writable<Record<string, any>>({})
 // Absolute context-window occupancy in tokens (the uplink size), per session.
 // Distinct from chatContextUsage, which is the 0–100% fill.
 export const chatContextTokens = writable<Record<string, number>>({})
+// Prompt-cache hit rate (%) of the last completed turn, as reported by the
+// provider's usage block. Absent for backends that report no cache activity.
+export const chatCachePct = writable<Record<string, number>>({})
+
+// Auto-scroll toggle for the transcript. Off by default; persisted locally so
+// the composer's chip and the scroll logic agree across reloads.
+const AUTO_SCROLL_KEY = 'atlr.autoScroll'
+function readAutoScroll(): boolean {
+  try {
+    return localStorage.getItem(AUTO_SCROLL_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+export const autoScrollOn = writable<boolean>(readAutoScroll())
+export function setAutoScrollOn(on: boolean): void {
+  autoScrollOn.set(on)
+  try {
+    localStorage.setItem(AUTO_SCROLL_KEY, on ? '1' : '0')
+  } catch { /* storage blocked: the in-memory flag still works */ }
+}
 export const chatWorkingDir = writable<Record<string, string>>({})
 export const chatPermMode = writable<Record<string, string>>({})
 
@@ -506,6 +527,26 @@ export interface QuestionModalEntry {
 // session's entry; other sessions' pending state surfaces via the sidebar
 // badge (Session.pending_question) instead.
 export const questionModals = writable<Record<string, QuestionModalEntry>>({})
+
+// Capsule reminder. App.svelte posts one when a turn finishes or a session
+// starts waiting for the user's confirmation; the dynamic capsule turns it into
+// a foreground alert and clears it when the user acts on it.
+export interface CapsuleNotice {
+  kind: 'done' | 'confirm'
+  sessionId: string
+  at: number
+}
+export const capsuleNotice = writable<CapsuleNotice | null>(null)
+export function postCapsuleNotice(kind: 'done' | 'confirm', sessionId: string): void {
+  capsuleNotice.set({ kind, sessionId, at: Date.now() })
+}
+export function clearCapsuleNotice(sessionId?: string): void {
+  if (!sessionId) {
+    capsuleNotice.set(null)
+    return
+  }
+  capsuleNotice.update(n => (n && n.sessionId === sessionId ? null : n))
+}
 export const feedbackModal = writable<any | null>(null)
 
 // Admin data (loaded by views)

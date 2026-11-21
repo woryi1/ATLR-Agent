@@ -43,18 +43,14 @@ func TestSelectDesktopProfile(t *testing.T) {
 	}
 }
 
-// TestDesktopSettings_WindowGeometryRoundTrip guards the on-disk contract for
-// the remembered window geometry. A typo'd json tag would silently reset the
-// window to its default size on every launch — the exact kind of quiet
-// regression this test exists to catch.
-func TestDesktopSettings_WindowGeometryRoundTrip(t *testing.T) {
+// TestDesktopSettings_PetPositionRoundTrip guards the on-disk contract for the
+// pet position. The window size is deliberately not persisted any more — every
+// launch sizes itself to the current screen.
+func TestDesktopSettings_PetPositionRoundTrip(t *testing.T) {
 	in := desktopSettings{
-		WindowWidth:     1600,
-		WindowHeight:    1000,
-		WindowMaximised: true,
-		PetX:            42,
-		PetY:            900,
-		PetPositionSet:  true,
+		PetX:           42,
+		PetY:           900,
+		PetPositionSet: true,
 	}
 	data, err := json.Marshal(in)
 	if err != nil {
@@ -64,27 +60,16 @@ func TestDesktopSettings_WindowGeometryRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &out); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if out.WindowWidth != in.WindowWidth || out.WindowHeight != in.WindowHeight {
-		t.Errorf("size not preserved: got %dx%d, want %dx%d",
-			out.WindowWidth, out.WindowHeight, in.WindowWidth, in.WindowHeight)
-	}
-	if out.WindowMaximised != in.WindowMaximised {
-		t.Errorf("maximised not preserved: got %v, want %v", out.WindowMaximised, in.WindowMaximised)
-	}
 	if !out.PetPositionSet || out.PetX != in.PetX || out.PetY != in.PetY {
 		t.Errorf("pet position not preserved: got (%d,%d,set=%v), want (%d,%d,set=true)",
 			out.PetX, out.PetY, out.PetPositionSet, in.PetX, in.PetY)
 	}
 }
 
-// TestDefaultDesktopSettings_NoGeometry documents that a fresh install carries
-// zero geometry, which showWindowAt reads as "use the built-in default size",
-// and no pet position, which showPet reads as "use the bottom-right default".
-func TestDefaultDesktopSettings_NoGeometry(t *testing.T) {
+// TestDefaultDesktopSettings_NoPetPosition documents that a fresh install carries
+// no pet position, which showPet reads as "use the bottom-right default".
+func TestDefaultDesktopSettings_NoPetPosition(t *testing.T) {
 	s := defaultDesktopSettings()
-	if s.WindowWidth != 0 || s.WindowHeight != 0 || s.WindowMaximised {
-		t.Errorf("defaults should carry no saved geometry, got %+v", s)
-	}
 	if s.PetPositionSet || s.PetX != 0 || s.PetY != 0 {
 		t.Errorf("defaults should carry no pet position, got %+v", s)
 	}
